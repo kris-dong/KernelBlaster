@@ -1,15 +1,11 @@
 # KernelBlaster
 
 ## Paper
-
 Corresponding paper: [arXiv:2602.14293](http://arxiv.org/abs/2602.14293)
 
 **Authors**  
 [Kris Shengjun Dong](https://people.eecs.berkeley.edu/~chrisdong/), [Sahil Modi](https://www.linkedin.com/in/sahil-modi), [Dima Nikiforov](https://www.linkedin.com/in/dima-n/), [Sana Damani](https://sanadamani.com/), Edward Lin, [Siva Kumar Sastry Hari](https://sivahari.github.io/), [Christos Kozyrakis](https://web.stanford.edu/~kozyraki/)
 
-**Affiliation:** NVIDIA, University of California, Berkeley
-
-***Note:** This repository hosts an archival release of KernelBlaster. The initial commit in this repository does not reflect the original authorship; Most of the original work was contributed to by Kris Shengjun Dong during her 2025 summer internship at NVIDIA.
 
 ## Contributors
 
