@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
+import sys
 import requests
 import subprocess
 from pathlib import Path
@@ -171,6 +173,97 @@ def initialize_gpu_server(
         f"Starting the GPU command server at {gpu_server_url}: {' '.join(gpu_server_cmd)}"
     )
     config.set_gpu_server_url(gpu, gpu_server_url)
+    return gpu_server_process, gpu_server_url
+
+
+def initialize_opencl_compiler_server(
+    log_file: TextIOWrapper,
+    compile_server_url: str | None,
+    artifacts_dir: Path,
+    board_host: str | None = None,
+    port: int | None = None,
+):
+    """Initialize the OpenCL compilation server for Adreno targets."""
+    if compile_server_url is not None:
+        logger.info(f"Using existing OpenCL compile server at {compile_server_url}")
+        return None, compile_server_url
+
+    if port is None:
+        port = find_free_port(start_port=2003)
+        logger.info(f"🎯 Auto-assigned OpenCL compiler server port: {port}")
+
+    if board_host is None:
+        board_host = os.getenv("KERNELBLASTER_ADRENO_BOARD_HOST", "root@10.44.120.201")
+
+    compiler_server_cmd = [
+        sys.executable,
+        "-m",
+        "src.kernelblaster.servers.compile_opencl",
+        "--port",
+        str(port),
+        "--num-workers",
+        str(int(os.getenv("KERNELBLASTER_OPENCL_COMPILE_WORKERS", "4"))),
+        "--board-host",
+        board_host,
+        "--artifacts-dir",
+        str(artifacts_dir),
+    ]
+
+    compiler_server_process = subprocess.Popen(
+        compiler_server_cmd,
+        stdout=log_file,
+        stderr=log_file,
+        start_new_session=True,
+    )
+
+    compile_server_url = f"http://localhost:{port}"
+    logger.info(
+        f"Starting OpenCL compilation server at {compile_server_url} "
+        f"(board={board_host}): {' '.join(compiler_server_cmd)}"
+    )
+    return compiler_server_process, compile_server_url
+
+
+def initialize_adreno_gpu_server(
+    log_file: TextIOWrapper,
+    board_host: str | None = None,
+    port: int | None = None,
+):
+    """Initialize the Adreno GPU execution server (SSH-based)."""
+    gpu_server_url = os.getenv("KERNELBLASTER_ADRENO_GPU_SERVER_URL")
+    if gpu_server_url:
+        logger.info(f"Using existing Adreno GPU server at {gpu_server_url}")
+        return None, gpu_server_url
+
+    if port is None:
+        port = find_free_port(start_port=2004)
+        logger.info(f"🎯 Auto-assigned Adreno GPU server port: {port}")
+
+    if board_host is None:
+        board_host = os.getenv("KERNELBLASTER_ADRENO_BOARD_HOST", "root@10.44.120.201")
+
+    gpu_server_cmd = [
+        sys.executable,
+        "-m",
+        "src.kernelblaster.servers.gpu_adreno",
+        "--port",
+        str(port),
+        "--board-host",
+        board_host,
+    ]
+
+    gpu_server_process = subprocess.Popen(
+        gpu_server_cmd,
+        stdout=log_file,
+        stderr=log_file,
+        start_new_session=True,
+    )
+
+    gpu_server_url = f"http://localhost:{port}"
+    logger.info(
+        f"Starting Adreno GPU server at {gpu_server_url} "
+        f"(board={board_host}): {' '.join(gpu_server_cmd)}"
+    )
     return gpu_server_process, gpu_server_url
 
 
