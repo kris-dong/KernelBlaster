@@ -6,7 +6,7 @@ TEST_DIR="${SCRIPT_DIR}/test"
 BUILD_DIR="${SCRIPT_DIR}/test/build"
 
 # Dev board SSH target
-BOARD_HOST="${BOARD_HOST:-root@10.44.120.201}"
+BOARD_HOST="${BOARD_HOST:-root@192.0.2.201}"
 BOARD_WORK_DIR="/tmp/kernelblaster_test"
 SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10"
 

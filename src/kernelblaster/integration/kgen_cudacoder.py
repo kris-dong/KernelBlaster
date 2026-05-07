@@ -18,7 +18,7 @@ from ..config import GPUType
 
 
 def _kb_repo_root() -> Path:
-    # .../KernelBlasterRelease/src/kernelblaster/integration/kgen_cudacoder.py
+    # .../<repo-root>/src/kernelblaster/integration/kgen_cudacoder.py
     return Path(__file__).resolve().parents[3]
 
 
@@ -28,7 +28,7 @@ def default_cudacoder_parent_on_syspath() -> Path | None:
     Resolution order:
 
     1. ``CUDACODER_SRC`` — parent directory of the ``cudacoder`` package
-       (e.g. ``.../cudacoder-main/src`` or ``.../KernelBlasterRelease/third_party``).
+       (e.g. ``.../cudacoder-main/src`` or ``.../<repo-root>/third_party``).
     2. Vendored copy: ``<repo>/third_party`` (contains ``cudacoder/``).
     3. Sibling checkout: ``../cudacoder-main/src``.
     """

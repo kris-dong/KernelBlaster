@@ -59,7 +59,7 @@ def add_common_arguments(parser: argparse.ArgumentParser):
         "--board-host",
         type=str,
         default=None,
-        help="SSH target for Adreno board (e.g., root@10.44.120.201)",
+        help="SSH target for Adreno board (e.g., root@192.0.2.201)",
     )
     parser.add_argument(
         "--benchmark",

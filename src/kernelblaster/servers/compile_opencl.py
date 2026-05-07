@@ -33,7 +33,7 @@ ENV_VARS = os.environ.copy()
 
 # Module-level variables set during startup
 _ARTIFACTS_DIR = None
-_BOARD_HOST = None  # SSH target for remote compilation (e.g., "root@10.44.120.201")
+_BOARD_HOST = None  # SSH target for remote compilation (e.g., "root@192.0.2.201")
 
 
 class OpenCLCompilationRequest(BaseModel):
@@ -382,7 +382,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument(
         "--board-host", type=str,
-        default=os.getenv("KERNELBLASTER_ADRENO_BOARD_HOST", "root@10.44.120.201"),
+        default=os.getenv("KERNELBLASTER_ADRENO_BOARD_HOST", "root@192.0.2.201"),
         help="SSH target for remote compilation on Adreno board",
     )
     parser.add_argument(

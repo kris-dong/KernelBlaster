@@ -60,7 +60,7 @@ if [ "$CMD" = "serve" ]; then
         docker rm "${CONTAINER_NAME}" >/dev/null
     fi
 
-    BOARD_HOST="${BOARD_HOST:-root@10.44.120.201}"
+    BOARD_HOST="${BOARD_HOST:-root@192.0.2.201}"
     COMPILE_PORT="${COMPILE_PORT:-6003}"
     GPU_PORT="${GPU_PORT:-6004}"
 

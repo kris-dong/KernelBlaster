@@ -13,7 +13,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 IMAGE_NAME="${IMAGE_NAME:-kernelblaster-qualcomm}"
 CONTAINER_NAME="${CONTAINER_NAME:-kernelblaster-qualcomm-test}"
-BOARD_HOST="${BOARD_HOST:-root@10.44.120.201}"
+BOARD_HOST="${BOARD_HOST:-root@192.0.2.201}"
 CMD="${1:-test}"
 
 LOCAL_USER="$(whoami)"

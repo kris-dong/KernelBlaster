@@ -527,7 +527,7 @@ async def async_main():
         help=(
             "Override CudaCoder location: full repo root (uses …/src) or a directory "
             "that already contains the ``cudacoder`` package (e.g. …/third_party). "
-            "Default: vendored copy under <KernelBlasterRelease>/third_party/cudacoder "
+            "Default: vendored copy under <repo-root>/third_party/cudacoder "
             "when present."
         ),
     )

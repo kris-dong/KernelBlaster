@@ -361,7 +361,7 @@ class RLOpenCLAgent(FeedbackAgent):
 
         self.agent_logger.info("Generating cached CPU reference (one-time, may take ~2 min)...")
 
-        board_host = os.getenv("KERNELBLASTER_ADRENO_BOARD_HOST", "root@10.44.120.201")
+        board_host = os.getenv("KERNELBLASTER_ADRENO_BOARD_HOST", "root@192.0.2.201")
         ssh_opts = "-o StrictHostKeyChecking=no -o ConnectTimeout=10"
         remote_dir = f"/tmp/kernelblaster_refgen_{os.getpid()}"
 

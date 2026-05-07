@@ -332,7 +332,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=1)
     parser.add_argument(
         "--board-host", type=str,
-        default=os.getenv("KERNELBLASTER_ADRENO_BOARD_HOST", "root@10.44.120.201"),
+        default=os.getenv("KERNELBLASTER_ADRENO_BOARD_HOST", "root@192.0.2.201"),
         help="SSH target for the Adreno dev board",
     )
     parser.add_argument(

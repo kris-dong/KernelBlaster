@@ -18,7 +18,7 @@ echo "=========================================="
 
 # Defaults
 GPU_TYPE="${GPU_TYPE:-adreno650}"
-BOARD_HOST="${BOARD_HOST:-root@10.44.120.201}"
+BOARD_HOST="${BOARD_HOST:-root@192.0.2.201}"
 OPENCL_COMPILE_PORT="${OPENCL_COMPILE_PORT:-6003}"
 OPENCL_GPU_PORT="${OPENCL_GPU_PORT:-6004}"
 SUBSET="${SUBSET:-L1}"

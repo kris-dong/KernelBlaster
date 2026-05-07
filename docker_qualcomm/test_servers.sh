@@ -13,7 +13,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-BOARD_HOST="${BOARD_HOST:-root@10.44.120.201}"
+BOARD_HOST="${BOARD_HOST:-root@192.0.2.201}"
 COMPILE_PORT=6003
 GPU_PORT=6004
 ARTIFACTS_DIR="/tmp/kernelblaster_test_opencl"

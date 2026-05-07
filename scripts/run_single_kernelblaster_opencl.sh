@@ -18,7 +18,7 @@ DATASET="${DATASET:-kernelbench-opencl}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-opencl_rl}"
 # MODEL="${MODEL:-gpt-5-mini-2025-08-07}"
 GPU_TYPE="${GPU_TYPE:-adreno650}"
-BOARD_HOST="${BOARD_HOST:-root@10.44.120.201}"
+BOARD_HOST="${BOARD_HOST:-root@192.0.2.201}"
 # Default ports moved to 6013/6014 to avoid colliding with the long-running
 # kernelblaster-qualcomm-test container which publishes 6003/6004 to the host
 # (and ``kernelblaster`` is on host network mode, so binding 6003/6004 fails

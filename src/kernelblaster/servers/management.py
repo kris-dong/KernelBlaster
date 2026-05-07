@@ -205,7 +205,7 @@ def initialize_opencl_compiler_server(
         logger.info(f"🎯 Auto-assigned OpenCL compiler server port: {port}")
 
     if board_host is None:
-        board_host = os.getenv("KERNELBLASTER_ADRENO_BOARD_HOST", "root@10.44.120.201")
+        board_host = os.getenv("KERNELBLASTER_ADRENO_BOARD_HOST", "root@192.0.2.201")
 
     compiler_server_cmd = [
         sys.executable,
@@ -252,7 +252,7 @@ def initialize_adreno_gpu_server(
         logger.info(f"🎯 Auto-assigned Adreno GPU server port: {port}")
 
     if board_host is None:
-        board_host = os.getenv("KERNELBLASTER_ADRENO_BOARD_HOST", "root@10.44.120.201")
+        board_host = os.getenv("KERNELBLASTER_ADRENO_BOARD_HOST", "root@192.0.2.201")
 
     gpu_server_cmd = [
         sys.executable,
