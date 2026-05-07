@@ -14,6 +14,20 @@
 # limitations under the License.
 from .optimization_rl_ncu import optimization_rl_ncu
 
+# OpenCL/Adreno nodes are imported defensively: their dependencies (board
+# servers, OpenCL agents) may not be available in NVIDIA-only environments.
+try:
+    from .kgen_opencl import kgen_opencl
+except Exception:
+    kgen_opencl = None
+
+try:
+    from .optimization_rl_opencl import optimization_rl_opencl
+except Exception:
+    optimization_rl_opencl = None
+
 __all__ = [
     "optimization_rl_ncu",
+    "kgen_opencl",
+    "optimization_rl_opencl",
 ]

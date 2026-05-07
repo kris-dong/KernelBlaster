@@ -107,3 +107,50 @@ class GPUServer(ManagedServer):
             gpu,
             port,
         )
+
+
+class OpenCLCompileServer(ManagedServer):
+    # The OpenCL compile server cold-starts a worker pool and SSH connection;
+    # 5s is too tight when starting fresh against a remote board.
+    _STARTUP_TIMEOUT_SEC = 60
+
+    def __init__(
+        self,
+        logger,
+        experiment_dir: Path,
+        board_host: str = None,
+        artifacts_dir: str = config.TEMP_DIRECTORY,
+        port: int = None,
+    ):
+        from ..servers.management import initialize_opencl_compiler_server
+        super().__init__(logger, experiment_dir / "opencl_compile_server.log")
+        self.artifacts_dir = artifacts_dir
+        self.process, self.url = initialize_opencl_compiler_server(
+            self.log_file_handle,
+            None,
+            Path(self.artifacts_dir),
+            board_host=board_host,
+            port=port,
+        )
+
+    def wait_for_connection(self, timeout: int | None = None):
+        if timeout is None:
+            timeout = self._STARTUP_TIMEOUT_SEC
+        super().wait_for_connection(timeout)
+
+
+class AdrenoGPUServer(ManagedServer):
+    def __init__(
+        self,
+        logger,
+        experiment_dir: Path,
+        board_host: str = None,
+        port: int = None,
+    ):
+        from ..servers.management import initialize_adreno_gpu_server
+        super().__init__(logger, experiment_dir / "adreno_gpu_server.log")
+        self.process, self.url = initialize_adreno_gpu_server(
+            self.log_file_handle,
+            board_host=board_host,
+            port=port,
+        )

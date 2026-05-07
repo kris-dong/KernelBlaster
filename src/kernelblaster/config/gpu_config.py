@@ -38,6 +38,15 @@ _SM_MAP = {
     "b200": "sm_100",
 }
 
+# Qualcomm Adreno GPU targets, mapped to their OpenCL version.
+_ADRENO_MAP = {
+    "adreno650": "opencl_2.0",
+    "adreno660": "opencl_2.0",
+    "adreno730": "opencl_3.0",
+    "adreno740": "opencl_3.0",
+    "adreno750": "opencl_3.0",
+}
+
 
 class GPUType(StrEnum):
     A100 = "a100"
@@ -51,11 +60,39 @@ class GPUType(StrEnum):
     B200 = "b200"
     RTX5000 = "rtx5000"
     RTX6000 = "rtx6000"
+    # Qualcomm Adreno targets
+    ADRENO_650 = "adreno650"
+    ADRENO_660 = "adreno660"
+    ADRENO_730 = "adreno730"
+    ADRENO_740 = "adreno740"
+    ADRENO_750 = "adreno750"
+
+    @property
+    def is_nvidia(self) -> bool:
+        return self.value in _SM_MAP
+
+    @property
+    def is_adreno(self) -> bool:
+        return self.value in _ADRENO_MAP
 
     @property
     def sm(self):
-        assert self.value in _SM_MAP, f"Unknown GPU type: {self.value}"
+        assert self.value in _SM_MAP, f"Not an NVIDIA GPU: {self.value}"
         return _SM_MAP[self.value]
+
+    @property
+    def opencl_version(self) -> str:
+        assert self.value in _ADRENO_MAP, f"Not an Adreno GPU: {self.value}"
+        return _ADRENO_MAP[self.value]
+
+    @property
+    def target_lang(self) -> str:
+        """Return 'cuda' for NVIDIA, 'opencl' for Adreno."""
+        if self.is_nvidia:
+            return "cuda"
+        elif self.is_adreno:
+            return "opencl"
+        raise ValueError(f"Unknown GPU vendor for: {self.value}")
 
     @staticmethod
     def current():
@@ -65,16 +102,37 @@ class GPUType(StrEnum):
         """
         global _current_gpu
         if _current_gpu is None:
-            name = (
-                subprocess.check_output(
-                    "nvidia-smi --query-gpu=gpu_name --format=csv,noheader", shell=True
+            try:
+                name = (
+                    subprocess.check_output(
+                        "nvidia-smi --query-gpu=gpu_name --format=csv,noheader", shell=True
+                    )
+                    .decode("utf-8")
+                    .strip()
                 )
-                .decode("utf-8")
-                .strip()
-            )
-            name = name.replace(" ", "").lower()
-            _current_gpu = _parse_gpu_name(name)
+                name = name.replace(" ", "").lower()
+                _current_gpu = _parse_gpu_name(name)
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                _current_gpu = _detect_adreno_gpu()
         return _current_gpu
+
+
+def _detect_adreno_gpu() -> "GPUType":
+    """Detect Adreno GPU by querying OpenCL device name on the board."""
+    import os
+    if os.path.exists("/dev/kgsl-3d0"):
+        try:
+            output = subprocess.check_output(
+                "clinfo 2>/dev/null | grep 'Device Name' | head -1",
+                shell=True,
+            ).decode("utf-8").strip().lower()
+            for adreno_key in sorted(_ADRENO_MAP.keys(), key=len, reverse=True):
+                if adreno_key.replace("adreno", "adreno ") in output or adreno_key.replace("adreno", "adreno(tm) ") in output:
+                    return GPUType(adreno_key)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            pass
+        return GPUType.ADRENO_650
+    raise ValueError("No NVIDIA or Adreno GPU detected")
 
 
 def _parse_gpu_name(nvidia_smi_name: str) -> GPUType:
@@ -85,8 +143,9 @@ def _parse_gpu_name(nvidia_smi_name: str) -> GPUType:
 
     # Sort the gpu types in descending order of lengths to match the longest possible name.
     # This covers the case where the gpu name is a substring of a different gpu name like l40 and l40s.
+    # Restrict to NVIDIA-mapped values so Adreno enum entries can't accidentally match nvidia-smi output.
     avail_types = sorted(
-        [gpu.value for gpu in GPUType], key=lambda x: len(x), reverse=True
+        [gpu.value for gpu in GPUType if gpu.value in _SM_MAP], key=lambda x: len(x), reverse=True
     )
     for gpu in avail_types:
         if gpu.lower() in nvidia_smi_name:

@@ -46,6 +46,22 @@ def add_common_arguments(parser: argparse.ArgumentParser):
         help="Run the NCU agent to optimize the CUDA code",
     )
     parser.add_argument(
+        "--kgen-opencl",
+        action="store_true",
+        help="Run the OpenCL kgen agent to translate PyTorch reference into driver.c + kernel.cl",
+    )
+    parser.add_argument(
+        "--opencl-perf",
+        action="store_true",
+        help="Run the OpenCL RL agent to optimize kernels for Adreno GPUs",
+    )
+    parser.add_argument(
+        "--board-host",
+        type=str,
+        default=None,
+        help="SSH target for Adreno board (e.g., root@10.44.120.201)",
+    )
+    parser.add_argument(
         "--benchmark",
         action="store_true",
         help="Run benchmark agent to augment generated code with benchmarking harness.",
@@ -63,6 +79,7 @@ def add_common_arguments(parser: argparse.ArgumentParser):
         default="kernelbench-cuda",
         choices=[
             "kernelbench-cuda",
+            "kernelbench-opencl",
         ],
     )
     parser.add_argument(
@@ -100,7 +117,21 @@ def add_common_arguments(parser: argparse.ArgumentParser):
         "--subset",
         type=str,
         default=None,
-        choices=["cub", "thrust", "cuda", "level1", "level2", "level3", "A", "B", "H"],
+        choices=[
+            "cub",
+            "thrust",
+            "cuda",
+            "level1",
+            "level2",
+            "level3",
+            # OpenCL/Adreno benchmark levels (kernelbench-opencl dataset).
+            "L1",
+            "L2",
+            "L3",
+            "A",
+            "B",
+            "H",
+        ],
         help="Run on a subset of the dataset",
     )
     parser.add_argument(
@@ -110,10 +141,17 @@ def add_common_arguments(parser: argparse.ArgumentParser):
         choices=["train", "test"],
         help="Run on a subset of the dataset",
     )
+    # GPUType.current() is wrapped because OpenCL flows may run on hosts
+    # without nvidia-smi (e.g. inside the Qualcomm docker harness on a host
+    # that only has an Adreno board reachable via SSH).
+    try:
+        _default_gpu = GPUType.current().value
+    except (ValueError, Exception):
+        _default_gpu = None
     parser.add_argument(
         "--gpu",
         type=str,
-        default=GPUType.current().value,
+        default=_default_gpu,
         choices=[gpu.value for gpu in GPUType],
         help="GPU to use for generation.",
     )

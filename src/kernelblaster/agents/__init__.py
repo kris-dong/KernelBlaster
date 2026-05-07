@@ -13,6 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from .opt_ncu_rl import RLNCUAgent
+
+# OpenCL/Adreno agents are imported defensively: their dependencies (e.g.
+# anthropic SDK, board-side compile/gpu server URLs) may not be available
+# in NVIDIA-only environments, but the rest of the package should still load.
+try:
+    from .opt_opencl_rl import RLOpenCLAgent
+except ImportError:
+    RLOpenCLAgent = None
+
+try:
+    from .kgen_opencl import OpenCLKgenAgent
+except ImportError:
+    OpenCLKgenAgent = None
+
 from .utils.error import FeedbackError
 from .feedback import FeedbackConfig, FeedbackError
 from .database import OptimizationDatabase

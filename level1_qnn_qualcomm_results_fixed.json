@@ -1,0 +1,346 @@
+{
+  "1": {
+    "name": "1_Square_matrix_multiplication_",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 5039.71814,
+    "avg_ms_gpu_kernel": 712.7922,
+    "note": ""
+  },
+  "2": {
+    "name": "2_Standard_matrix_multiplication_",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 1260.5817074000001,
+    "avg_ms_gpu_kernel": 1129.7162,
+    "note": ""
+  },
+  "3": {
+    "name": "3_Batched_matrix_multiplication",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 594.54865905,
+    "avg_ms_gpu_kernel": 122.9157,
+    "note": ""
+  },
+  "4": {
+    "name": "4_Matrix_vector_multiplication_",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 184.5517944,
+    "avg_ms_gpu_kernel": 51.1098,
+    "note": ""
+  },
+  "5": {
+    "name": "5_Matrix_scalar_multiplication",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 60.015902000000004,
+    "avg_ms_gpu_kernel": 1.1657,
+    "note": ""
+  },
+  "6": {
+    "name": "6_Matmul_with_large_K_dimension_",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 765.62002775,
+    "avg_ms_gpu_kernel": 955.2161,
+    "note": ""
+  },
+  "12": {
+    "name": "12_Matmul_with_diagonal_matrices_",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 861.4465187,
+    "avg_ms_gpu_kernel": 130.8731,
+    "note": ""
+  },
+  "13": {
+    "name": "13_Matmul_for_symmetric_matrices",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 10125.29523355,
+    "avg_ms_gpu_kernel": 18531.5499,
+    "note": ""
+  },
+  "14": {
+    "name": "14_Matmul_for_upper_triangular_matrices",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 9991.131190099999,
+    "avg_ms_gpu_kernel": 18230.7957,
+    "note": ""
+  },
+  "15": {
+    "name": "15_Matmul_for_lower_triangular_matrices",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 10443.5122884,
+    "avg_ms_gpu_kernel": 19148.6404,
+    "note": ""
+  },
+  "16": {
+    "name": "16_Matmul_with_transposed_A",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 704.90206855,
+    "avg_ms_gpu_kernel": 1068.5534,
+    "note": ""
+  },
+  "17": {
+    "name": "17_Matmul_with_transposed_B",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 191.39350385,
+    "avg_ms_gpu_kernel": 186.3584,
+    "note": ""
+  },
+  "18": {
+    "name": "18_Matmul_with_transposed_both",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 749.0179353000001,
+    "avg_ms_gpu_kernel": 1157.3169,
+    "note": ""
+  },
+  "19": {
+    "name": "19_ReLU",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 29.4354979,
+    "avg_ms_gpu_kernel": 2.4658,
+    "note": ""
+  },
+  "20": {
+    "name": "20_LeakyReLU",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 25.971325200000003,
+    "avg_ms_gpu_kernel": 0.1588,
+    "note": ""
+  },
+  "21": {
+    "name": "21_Sigmoid",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 27.43402365,
+    "avg_ms_gpu_kernel": 2.4316,
+    "note": ""
+  },
+  "22": {
+    "name": "22_Tanh",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 26.1268304,
+    "avg_ms_gpu_kernel": 2.6611,
+    "note": ""
+  },
+  "23": {
+    "name": "23_Softmax",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 27.26978055,
+    "avg_ms_gpu_kernel": 0.3274,
+    "note": ""
+  },
+  "24": {
+    "name": "24_LogSoftmax",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 27.111763500000002,
+    "avg_ms_gpu_kernel": 0.3308,
+    "note": ""
+  },
+  "25": {
+    "name": "25_Swish",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 28.33895225,
+    "avg_ms_gpu_kernel": 2.5871,
+    "note": ""
+  },
+  "26": {
+    "name": "26_GELU_",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 25.3978131,
+    "avg_ms_gpu_kernel": 3.4182,
+    "note": ""
+  },
+  "27": {
+    "name": "27_SELU_",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 29.836318749999997,
+    "avg_ms_gpu_kernel": 2.6653,
+    "note": ""
+  },
+  "29": {
+    "name": "29_Softplus",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 32.50840875,
+    "avg_ms_gpu_kernel": 4.2784,
+    "note": ""
+  },
+  "30": {
+    "name": "30_Softsign",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 30.62738855,
+    "avg_ms_gpu_kernel": 0.2523,
+    "note": ""
+  },
+  "31": {
+    "name": "31_ELU",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 25.748729750000003,
+    "avg_ms_gpu_kernel": 2.4266,
+    "note": ""
+  },
+  "32": {
+    "name": "32_HardTanh",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 28.32502275,
+    "avg_ms_gpu_kernel": 2.4833,
+    "note": ""
+  },
+  "33": {
+    "name": "33_BatchNorm",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 3115.46313745,
+    "avg_ms_gpu_kernel": 32.1053,
+    "note": ""
+  },
+  "34": {
+    "name": "34_InstanceNorm",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 3039.3305327,
+    "avg_ms_gpu_kernel": 46.2461,
+    "note": ""
+  },
+  "35": {
+    "name": "35_GroupNorm_",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 3043.550813,
+    "avg_ms_gpu_kernel": 117.3383,
+    "note": ""
+  },
+  "36": {
+    "name": "36_RMSNorm_",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 3144.0657788,
+    "avg_ms_gpu_kernel": 151.2249,
+    "note": ""
+  },
+  "37": {
+    "name": "37_FrobeniusNorm_",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 94.885825,
+    "avg_ms_gpu_kernel": 45.0496,
+    "note": ""
+  },
+  "38": {
+    "name": "38_L1Norm_",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 41.6475619,
+    "avg_ms_gpu_kernel": 3.5004,
+    "note": ""
+  },
+  "39": {
+    "name": "39_L2Norm_",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 40.16387755,
+    "avg_ms_gpu_kernel": 3.544,
+    "note": ""
+  },
+  "40": {
+    "name": "40_LayerNorm",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 40.410254800000004,
+    "avg_ms_gpu_kernel": 10.4227,
+    "note": ""
+  },
+  "47": {
+    "name": "47_Sum_reduction_over_a_dimension",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 15.347100399999999,
+    "avg_ms_gpu_kernel": 0.6882,
+    "note": ""
+  },
+  "48": {
+    "name": "48_Mean_reduction_over_a_dimension",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 17.85018085,
+    "avg_ms_gpu_kernel": 1.7858,
+    "note": ""
+  },
+  "49": {
+    "name": "49_Max_reduction_over_a_dimension",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 18.008308500000002,
+    "avg_ms_gpu_kernel": 1.7492,
+    "note": ""
+  },
+  "50": {
+    "name": "50_Product_reduction_over_a_dimension",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 30.292821500000002,
+    "avg_ms_gpu_kernel": 1.2898,
+    "note": ""
+  },
+  "51": {
+    "name": "51_Argmax_over_a_dimension",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 14.029830200000001,
+    "avg_ms_gpu_kernel": 1.3104,
+    "note": ""
+  },
+  "52": {
+    "name": "52_Argmin_over_a_dimension",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 11.908193950000001,
+    "avg_ms_gpu_kernel": 1.309,
+    "note": ""
+  },
+  "100": {
+    "name": "100_HingeLoss",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 27.38958735,
+    "avg_ms_gpu_kernel": 0.0664,
+    "note": ""
+  },
+  "53": {
+    "name": "53_Min_reduction_over_a_dimension",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 18.2969838,
+    "avg_ms_gpu_kernel": 1.7621,
+    "note": ""
+  },
+  "94": {
+    "name": "94_MSELoss",
+    "status": "ok",
+    "stage": "run",
+    "avg_ms_wallclock": 32.5130075,
+    "avg_ms_gpu_kernel": 8.457,
+    "note": ""
+  }
+}
