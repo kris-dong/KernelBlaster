@@ -24,7 +24,14 @@ from .error import FeedbackError
 from ...config import config, GPUType
 from ...resources import TCPClient
 
-__all__ = ["run_gpu_executable", "compile_cu", "compile_and_run_cu_file"]
+__all__ = [
+    "run_gpu_executable",
+    "compile_cu",
+    "compile_and_run_cu_file",
+    "compile_opencl",
+    "run_adreno_executable",
+    "compile_and_run_opencl",
+]
 
 
 async def _run_gpu_binary(
@@ -364,6 +371,214 @@ async def compile_and_run_cu_file(
 
     logger.info(
         f"{len(stdout_list)} kernel executions completed in {duration:0.2f} seconds. Success: {success}"
+    )
+
+    return stdout_list, stderr_list, compiled_path, success
+
+
+# ---------------------------------------------------------------------------
+# Qualcomm Adreno / OpenCL compilation and execution
+# ---------------------------------------------------------------------------
+
+
+async def compile_opencl(
+    main_filepath: Path,
+    kernel_filepath: Path,
+    gpu: GPUType,
+    timeout: float = 120,
+    job_name: str = "",
+    remote: bool = True,
+) -> str:
+    """Compile an OpenCL kernel + host driver via the OpenCL compilation server.
+
+    When remote=True, the compile server SSH's to the Adreno board and produces
+    an ARM64 binary there.
+    """
+    opencl_compile_url = os.getenv(
+        "KERNELBLASTER_OPENCL_COMPILE_SERVER_URL",
+        config.get("OPENCL_COMPILE_SERVER_URL", "http://localhost:2003"),
+    ) if hasattr(config, 'get') else os.getenv(
+        "KERNELBLASTER_OPENCL_COMPILE_SERVER_URL", "http://localhost:2003"
+    )
+
+    try:
+        main_filepath_abs = main_filepath.resolve()
+        kernel_filepath_abs = kernel_filepath.resolve()
+
+        logger.info(f"OpenCL compile request - job_name: {job_name}")
+        logger.info(f"  main_filepath: {main_filepath_abs}")
+        logger.info(f"  kernel_filepath: {kernel_filepath_abs}")
+        logger.info(f"  opencl_version: {gpu.opencl_version}")
+        logger.info(f"  remote: {remote}")
+
+        # The HTTP client timeout must be larger than the per-execution timeout
+        # passed in the params, to account for queue wait time on the server.
+        client_timeout = aiohttp.ClientTimeout(total=timeout + 3600)
+        async with TCPClient.get_session().get(
+            f"{opencl_compile_url}/compile_opencl",
+            params={
+                "job_name": job_name,
+                "main_file": str(main_filepath_abs),
+                "kernel_file": str(kernel_filepath_abs),
+                "opencl_version": gpu.opencl_version,
+                "remote": int(remote),
+            },
+            timeout=client_timeout,
+        ) as response:
+            if response.status != 200:
+                response_text = await response.text()
+                raise FeedbackError(
+                    f"OpenCL compilation failed for {job_name}: {response_text}"
+                )
+            result = await response.json()
+            if not result["success"]:
+                raise FeedbackError(
+                    f"OpenCL compilation failed for {job_name}: {result['message']}"
+                )
+            return result["output_path"]
+    except aiohttp.ClientError as e:
+        raise FeedbackError(f"Error connecting to OpenCL compilation server: {e}")
+    except asyncio.TimeoutError:
+        raise FeedbackError(
+            f"Timeout: failed to compile OpenCL {job_name} after {timeout} seconds"
+        )
+
+
+async def run_adreno_executable(
+    executable_path: Path,
+    gpu: GPUType,
+    timeout: float,
+    job_name: str,
+    kernel_files: list[str] = None,
+    extra_files: list[str] = None,
+    n_runs: int = 1,
+    profile: bool = False,
+    extra_args: str = "",
+) -> tuple[list[str], list[str]]:
+    """Execute a compiled binary on the Adreno GPU board via the Adreno GPU server."""
+    adreno_gpu_url = os.getenv(
+        "KERNELBLASTER_ADRENO_GPU_SERVER_URL", "http://localhost:2004"
+    )
+
+    try:
+        with open(executable_path, "rb") as f:
+            binary_data = f.read()
+
+        logger.info(
+            f"Adreno execution - job_name: {job_name}, binary_size: {len(binary_data)} bytes, "
+            f"n_runs: {n_runs}, profile: {profile}, extra_args: {extra_args}"
+        )
+
+        data = aiohttp.FormData()
+        data.add_field(
+            "binary", binary_data,
+            filename=os.path.basename(executable_path),
+            content_type="application/octet-stream",
+        )
+        data.add_field("n_runs", str(n_runs))
+        data.add_field("timeout", str(timeout))
+        data.add_field("profile", str(profile).lower())
+        if extra_args:
+            data.add_field("args", extra_args)
+        all_files = list(kernel_files or []) + list(extra_files or [])
+        if all_files:
+            data.add_field("kernel_files", json.dumps(all_files))
+
+        # The server enforces the per-execution timeout (passed in the form
+        # data).  The HTTP client timeout must be larger to account for time
+        # the request spends waiting in the server's execution queue.
+        client_timeout = aiohttp.ClientTimeout(total=timeout + 3600)
+        async with TCPClient.get_session().post(
+            f"{adreno_gpu_url}/gpu/binary", data=data, timeout=client_timeout
+        ) as response:
+            if response.status != 200:
+                response_text = await response.text()
+                raise FeedbackError(
+                    f"Adreno GPU execution failed for {job_name}: {response_text}"
+                )
+            result = await response.json()
+            if not result.get("success", False):
+                error_message = result.get("message", "Unknown error")
+                raise FeedbackError(
+                    f"Adreno execution failed for {job_name}: {error_message}"
+                )
+            return result.get("stdout", ""), result.get("stderr", "")
+    except aiohttp.ClientError as e:
+        raise FeedbackError(f"Error connecting to Adreno GPU server: {e}")
+    except asyncio.TimeoutError:
+        raise FeedbackError(
+            f"Timeout: Adreno execution for {job_name} after {timeout} seconds"
+        )
+
+
+async def compile_and_run_opencl(
+    main_filepath: Path,
+    kernel_filepath: Path,
+    gpu: GPUType,
+    timer,
+    logger,
+    timeout=1200,
+    num_runs=5,
+    passed_keyword=None,
+    profile: bool = False,
+    extra_files: list[str] = None,
+    extra_args: str = "",
+) -> tuple[list[str], list[str], str, bool]:
+    """Compile and run an OpenCL kernel on Adreno; analogous to compile_and_run_cu_file."""
+    job_name = str(kernel_filepath)
+    timer.start("compilation")
+
+    compiled_path = await compile_opencl(
+        main_filepath, kernel_filepath, gpu, timeout, job_name, remote=True
+    )
+
+    duration = timer.stop("compilation")
+    logger.info(f"OpenCL compilation completed in {duration:0.2f} seconds")
+
+    success = True
+    timer.start("kernel_executions")
+
+    kernel_files = [str(kernel_filepath.resolve())]
+
+    if num_runs == 1:
+        stdout, stderr = await run_adreno_executable(
+            executable_path=Path(compiled_path),
+            gpu=gpu,
+            timeout=timeout,
+            job_name=job_name,
+            kernel_files=kernel_files,
+            extra_files=extra_files,
+            n_runs=num_runs,
+            profile=profile,
+            extra_args=extra_args,
+        )
+        stdout_list = [stdout]
+        stderr_list = [stderr]
+    else:
+        stdout_list, stderr_list = await run_adreno_executable(
+            executable_path=Path(compiled_path),
+            gpu=gpu,
+            timeout=timeout,
+            job_name=job_name,
+            kernel_files=kernel_files,
+            extra_files=extra_files,
+            n_runs=num_runs,
+            profile=profile,
+            extra_args=extra_args,
+        )
+
+    duration = timer.stop("kernel_executions")
+
+    for i, stdout in enumerate(stdout_list):
+        if passed_keyword is not None and passed_keyword.lower() not in stdout.lower():
+            logger.info(
+                f"Keyword '{passed_keyword}' not found in run {i+1}, stopping further runs"
+            )
+            success = False
+            break
+
+    logger.info(
+        f"{len(stdout_list)} OpenCL kernel executions completed in {duration:0.2f} seconds. Success: {success}"
     )
 
     return stdout_list, stderr_list, compiled_path, success
