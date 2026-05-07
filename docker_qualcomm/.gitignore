@@ -1,0 +1,7 @@
+# Adreno SDK zip — user downloads from Qualcomm Developer site.
+# See README.md "Prerequisites" for the URL and expected file name.
+sdk/Adreno_OpenCL_SDK*.zip
+sdk/*.zip
+
+# CMake build artifacts from running test.sh on a host
+test/build/
