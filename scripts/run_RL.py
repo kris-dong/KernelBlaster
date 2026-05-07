@@ -36,6 +36,9 @@ from utils.arguments import *
 
 COMPILE_SERVER = None
 GPU_SERVER = None
+# OpenCL/Adreno servers, populated only when --gpu is an Adreno target.
+OPENCL_COMPILE_SERVER = None
+ADRENO_GPU_SERVER = None
 CLEANUP_IN_PROGRESS = False
 SIGNAL_COUNT = 0
 COMPREHENSIVE_ANALYSIS_CACHE = None
@@ -216,34 +219,30 @@ Consider implementing similar optimization techniques in your solution, particul
 
 def cleanup_servers():
     """Clean up servers on exit."""
-    global COMPILE_SERVER, GPU_SERVER, CLEANUP_IN_PROGRESS
-    
+    global COMPILE_SERVER, GPU_SERVER, OPENCL_COMPILE_SERVER, ADRENO_GPU_SERVER, CLEANUP_IN_PROGRESS
+
     if CLEANUP_IN_PROGRESS:
         return
-    
+
     CLEANUP_IN_PROGRESS = True
-    
+
     try:
-        if COMPILE_SERVER is not None:
-            logger.info("Cleaning up compiler server...")
-            # Add timeout to prevent hanging
-            import threading
-            cleanup_thread = threading.Thread(target=COMPILE_SERVER.cleanup)
+        import threading
+        for name, server in [
+            ("compiler", COMPILE_SERVER),
+            ("GPU", GPU_SERVER),
+            ("OpenCL compiler", OPENCL_COMPILE_SERVER),
+            ("Adreno GPU", ADRENO_GPU_SERVER),
+        ]:
+            if server is None:
+                continue
+            logger.info(f"Cleaning up {name} server...")
+            cleanup_thread = threading.Thread(target=server.cleanup)
             cleanup_thread.daemon = True
             cleanup_thread.start()
             cleanup_thread.join(timeout=5.0)  # 5 second timeout
             if cleanup_thread.is_alive():
-                logger.warning("Compiler server cleanup timed out")
-        
-        if GPU_SERVER is not None:
-            logger.info("Cleaning up GPU server...")
-            # Add timeout to prevent hanging
-            cleanup_thread = threading.Thread(target=GPU_SERVER.cleanup)
-            cleanup_thread.daemon = True
-            cleanup_thread.start()
-            cleanup_thread.join(timeout=5.0)  # 5 second timeout
-            if cleanup_thread.is_alive():
-                logger.warning("GPU server cleanup timed out")
+                logger.warning(f"{name} server cleanup timed out")
     except Exception as e:
         logger.error(f"Error during cleanup: {e}")
     finally:
@@ -436,26 +435,50 @@ async def async_main():
 
     # initialize resources
     try:
-        global COMPILE_SERVER, GPU_SERVER
-        COMPILE_SERVER = CompileServer(logger, OUT_DIR, port=args.compiler_port)
-        
-        # Use existing GPU server if URL provided, otherwise create new one
-        if args.gpu_server_url:
-            logger.info(f"Using existing GPU server at {args.gpu_server_url}")
-            config.set_gpu_server_url(GPUType.current(), args.gpu_server_url)
-            GPU_SERVER = None  # No need to manage our own server
+        global COMPILE_SERVER, GPU_SERVER, OPENCL_COMPILE_SERVER, ADRENO_GPU_SERVER
+        gpu_type = GPUType(args.gpu) if args.gpu else GPUType.current()
+        is_opencl = gpu_type.is_adreno
+
+        if is_opencl:
+            board_host = getattr(args, "board_host", None)
+            if args.gpu_server_url:
+                logger.info(f"Using existing Adreno GPU server at {args.gpu_server_url}")
+                os.environ["KERNELBLASTER_ADRENO_GPU_SERVER_URL"] = args.gpu_server_url
+                ADRENO_GPU_SERVER = None
+            else:
+                ADRENO_GPU_SERVER = AdrenoGPUServer(
+                    logger, OUT_DIR, board_host=board_host, port=args.gpu_port
+                )
+                ADRENO_GPU_SERVER.wait_for_connection()
+                os.environ["KERNELBLASTER_ADRENO_GPU_SERVER_URL"] = ADRENO_GPU_SERVER.url
+                logger.info(f"Adreno GPU server started at {ADRENO_GPU_SERVER.url}")
+
+            OPENCL_COMPILE_SERVER = OpenCLCompileServer(
+                logger, OUT_DIR, board_host=board_host, port=args.compiler_port
+            )
+            OPENCL_COMPILE_SERVER.wait_for_connection()
+            os.environ["KERNELBLASTER_OPENCL_COMPILE_SERVER_URL"] = OPENCL_COMPILE_SERVER.url
+            logger.info(f"OpenCL compile server started at {OPENCL_COMPILE_SERVER.url}")
         else:
-            GPU_SERVER = GPUServer(logger, OUT_DIR, gpu=args.gpu, port=args.gpu_port)
-            GPU_SERVER.wait_for_connection()
-            if GPU_SERVER.is_managed:
-                assert (
-                    args.gpu is None or args.gpu == GPUType.current().value
-                ), f"GPU type mismatch: {args.gpu} != {GPUType.current().value}. Please supply your own GPU_SERVER_URL_<GPU_TYPE> since --gpu differs from the current GPU type."
-                config.set_gpu_server_url(GPUType.current(), GPU_SERVER.url)
-        
-        COMPILE_SERVER.wait_for_connection()
-        if COMPILE_SERVER.is_managed:
-            config.set_compile_server_url(COMPILE_SERVER.url)
+            COMPILE_SERVER = CompileServer(logger, OUT_DIR, port=args.compiler_port)
+
+            # Use existing GPU server if URL provided, otherwise create new one
+            if args.gpu_server_url:
+                logger.info(f"Using existing GPU server at {args.gpu_server_url}")
+                config.set_gpu_server_url(GPUType.current(), args.gpu_server_url)
+                GPU_SERVER = None  # No need to manage our own server
+            else:
+                GPU_SERVER = GPUServer(logger, OUT_DIR, gpu=args.gpu, port=args.gpu_port)
+                GPU_SERVER.wait_for_connection()
+                if GPU_SERVER.is_managed:
+                    assert (
+                        args.gpu is None or args.gpu == GPUType.current().value
+                    ), f"GPU type mismatch: {args.gpu} != {GPUType.current().value}. Please supply your own GPU_SERVER_URL_<GPU_TYPE> since --gpu differs from the current GPU type."
+                    config.set_gpu_server_url(GPUType.current(), GPU_SERVER.url)
+
+            COMPILE_SERVER.wait_for_connection()
+            if COMPILE_SERVER.is_managed:
+                config.set_compile_server_url(COMPILE_SERVER.url)
     except Exception as e:
         logger.error(f"Failed to initialize resources: {e}")
         return
