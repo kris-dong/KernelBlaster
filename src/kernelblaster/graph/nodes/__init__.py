@@ -14,6 +14,13 @@
 # limitations under the License.
 from .optimization_rl_ncu import optimization_rl_ncu
 
+# CUDA kgen node — graph-runtime entry around the kgen LLM call. Defensive
+# import keeps the package loadable when integration deps are missing.
+try:
+    from .kgen_cudacoder import kgen_cudacoder
+except Exception:
+    kgen_cudacoder = None
+
 # OpenCL/Adreno nodes are imported defensively: their dependencies (board
 # servers, OpenCL agents) may not be available in NVIDIA-only environments.
 try:
@@ -28,6 +35,7 @@ except Exception:
 
 __all__ = [
     "optimization_rl_ncu",
+    "kgen_cudacoder",
     "kgen_opencl",
     "optimization_rl_opencl",
 ]
