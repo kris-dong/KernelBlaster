@@ -27,21 +27,125 @@ SCRIPT_DIR = Path(__file__).parent
 ROOT_DIR = SCRIPT_DIR.parent
 sys.path.insert(0, str(ROOT_DIR))
 
+# `aiohttp` imports `ssl` contexts at import-time and can fail if the runtime
+# has no default CA bundle. Ensure a CA bundle is available before importing
+# anything that may import `aiohttp`.
+if not os.environ.get("SSL_CERT_FILE") and not os.environ.get("REQUESTS_CA_BUNDLE"):
+    _cert_file = None
+    try:
+        import certifi  # type: ignore
+
+        _cert_file = certifi.where()
+    except Exception:
+        _cert_file = None
+    if _cert_file and Path(_cert_file).exists():
+        os.environ["SSL_CERT_FILE"] = _cert_file
+if os.environ.get("SSL_CERT_FILE") and not os.environ.get("REQUESTS_CA_BUNDLE"):
+    os.environ["REQUESTS_CA_BUNDLE"] = os.environ["SSL_CERT_FILE"]
+elif not os.environ.get("SSL_CERT_FILE") and Path("/etc/ssl/certs/ca-certificates.crt").exists():
+    os.environ["SSL_CERT_FILE"] = "/etc/ssl/certs/ca-certificates.crt"
+    os.environ["REQUESTS_CA_BUNDLE"] = os.environ["SSL_CERT_FILE"]
+
 from src.kernelblaster.config import config, GPUType
-from src.kernelblaster.resources import *
+from src.kernelblaster.resources import CompileServer, GPUServer, OpenCLCompileServer, AdrenoGPUServer
 from src.kernelblaster.workflow import run_workflow
+from src.kernelblaster.agents.database import GPUOptimizationDatabase, LLMInterface
 
 from data import get_dataset
 from utils.arguments import *
 
 COMPILE_SERVER = None
 GPU_SERVER = None
-# OpenCL/Adreno servers, populated only when --gpu is an Adreno target.
 OPENCL_COMPILE_SERVER = None
 ADRENO_GPU_SERVER = None
 CLEANUP_IN_PROGRESS = False
 SIGNAL_COUNT = 0
 COMPREHENSIVE_ANALYSIS_CACHE = None
+
+
+def _normalize_http_service_url(url: str | None) -> str | None:
+    """Fix common typos like ``http localhost:2002`` → ``http://localhost:2002``."""
+    if not url:
+        return None
+    u = url.strip()
+    if "://" in u:
+        return u
+    low = u.lower()
+    if low.startswith("http ") and not low.startswith("http://"):
+        return "http://" + u[5:].lstrip()
+    if low.startswith("https ") and not low.startswith("https://"):
+        return "https://" + u[6:].lstrip()
+    return u
+
+
+def resolve_reference_code_for_entry(entry: dict) -> str | None:
+    """
+    Prefer packaged reference code, then ``data/benchmark/<L*|level*>/<problem>/reference.py``,
+    then ``data/kernelbench-cuda/sol-level{1,2}/...`` for those subsets, then legacy
+    KernelBench ``.py`` samples under ``data/kernelbench/...``.
+    """
+    if entry.get("reference_code"):
+        return entry["reference_code"]
+    ref_fp = entry.get("reference_py_fp")
+    if ref_fp:
+        p = Path(ref_fp)
+        if p.is_file():
+            try:
+                return p.read_text()
+            except OSError:
+                pass
+    level = entry.get("level")
+    problem_name = entry.get("problem_name")
+    if level and problem_name:
+        bench_ref = ROOT_DIR / "data" / "benchmark" / level / problem_name / "reference.py"
+        if bench_ref.is_file():
+            try:
+                return bench_ref.read_text()
+            except OSError:
+                pass
+        if level in {"sol-level1", "sol-level2"}:
+            bench_port = (
+                ROOT_DIR
+                / "data"
+                / "kernelbench-cuda"
+                / level
+                / problem_name
+                / "reference.py"
+            )
+            if bench_port.is_file():
+                try:
+                    return bench_port.read_text()
+                except OSError:
+                    pass
+            fallback_level = "L1" if level == "sol-level1" else "L2"
+            bench_fallback = (
+                ROOT_DIR / "data" / "benchmark" / fallback_level / problem_name / "reference.py"
+            )
+            if bench_fallback.is_file():
+                try:
+                    return bench_fallback.read_text()
+                except OSError:
+                    pass
+    prob_num = entry.get("problem_num")
+    if prob_num is None or not level:
+        return None
+    legacy_level = {
+        "L1": "level1",
+        "L2": "level2",
+        "L3": "level3",
+        "sol-level1": "level1",
+        "sol-level2": "level2",
+    }.get(level, level)
+    kb_dir = ROOT_DIR / "data" / "kernelbench" / "kernelbench" / legacy_level
+    if not kb_dir.is_dir():
+        return None
+    matches = sorted(kb_dir.glob(f"{int(prob_num):03d}_*.py"))
+    if not matches:
+        return None
+    try:
+        return matches[0].read_text()
+    except OSError:
+        return None
 
 
 def load_comprehensive_analysis_results():
@@ -234,15 +338,14 @@ def cleanup_servers():
             ("OpenCL compiler", OPENCL_COMPILE_SERVER),
             ("Adreno GPU", ADRENO_GPU_SERVER),
         ]:
-            if server is None:
-                continue
-            logger.info(f"Cleaning up {name} server...")
-            cleanup_thread = threading.Thread(target=server.cleanup)
-            cleanup_thread.daemon = True
-            cleanup_thread.start()
-            cleanup_thread.join(timeout=5.0)  # 5 second timeout
-            if cleanup_thread.is_alive():
-                logger.warning(f"{name} server cleanup timed out")
+            if server is not None:
+                logger.info(f"Cleaning up {name} server...")
+                cleanup_thread = threading.Thread(target=server.cleanup)
+                cleanup_thread.daemon = True
+                cleanup_thread.start()
+                cleanup_thread.join(timeout=5.0)
+                if cleanup_thread.is_alive():
+                    logger.warning(f"{name} server cleanup timed out")
     except Exception as e:
         logger.error(f"Error during cleanup: {e}")
     finally:
@@ -273,10 +376,13 @@ async def process_problem(
     semaphore,
     workflow_config,
     timeout_minutes,
+    shared_database=None,
 ) -> tuple[dict[str, Path], bool]:
     problem_id = entry["id"]
     user_message = entry.get("user_message", "")
-    reference_code = None
+    reference_code = entry.get("reference_code") or resolve_reference_code_for_entry(
+        entry
+    )
 
     # Extract task information for optimization data lookup
     task_id = entry.get("task_id")
@@ -289,7 +395,17 @@ async def process_problem(
     
     if level_id is None and "level" in entry:
         level_str = entry["level"]
-        if level_str and "level" in level_str:
+        if level_str == "L1":
+            level_id = 1
+        elif level_str == "L2":
+            level_id = 2
+        elif level_str == "L3":
+            level_id = 3
+        elif level_str == "sol-level1":
+            level_id = 1
+        elif level_str == "sol-level2":
+            level_id = 2
+        elif level_str and level_str.startswith("level") and level_str != "sol-level1":
             level_id = int(level_str.replace("level", ""))
     
     if op_name is None and task_id is not None:
@@ -323,30 +439,98 @@ async def process_problem(
             format=config.CUSTOM_LOGGER_FORMAT,
             filter=lambda record: record["extra"].get("problem_id") == problem_id,
         )
-        result = await run_workflow(
-            problem_id,
-            user_message,
-            reference_code,
-            folder,
-            workflow_config,
-            job_logger=job_logger,
-            timeout_seconds=timeout_minutes * 60,
-        )
-        if result.success:
-            logger.info(
-                f"Successfully generated codes for {problem_id}:\n{json.dumps(result.generated_codes, indent=2)}"
+        try:
+            result = await run_workflow(
+                problem_id,
+                user_message,
+                reference_code,
+                folder,
+                workflow_config,
+                job_logger=job_logger,
+                timeout_seconds=timeout_minutes * 60,
+                shared_database=shared_database,
             )
-        else:
-            logger.error(
-                f"❌ Failed to generate codes for {problem_id}: {result.error}"
-            )
-        job_logger.remove(job_logger_id)
-    return result.generated_codes, result.success
+            if result.success:
+                logger.info(
+                    f"Successfully generated codes for {problem_id}:\n{json.dumps(result.generated_codes, indent=2)}"
+                )
+            else:
+                logger.error(
+                    f"❌ Failed to generate codes for {problem_id}: {result.error}"
+                )
+            return result.generated_codes, result.success
+        except Exception:
+            # Keep batch execution alive when a single problem fails (e.g. SSH timeout
+            # during OpenCL reference generation).
+            job_logger.exception(f"Unhandled exception while processing {problem_id}")
+            return {}, False
+        finally:
+            job_logger.remove(job_logger_id)
 
 
 async def async_main():
     parser = argparse.ArgumentParser()
     add_common_arguments(parser)
+    parser.add_argument(
+        "--kgen",
+        action="store_true",
+        help="Force-enable CudaCoder kgen (test driver + CUDA) before RL optimization",
+    )
+    parser.add_argument(
+        "--no-kgen",
+        action="store_true",
+        help="Skip CudaCoder kgen; use curated data/benchmark (or run-folder) CUDA/driver only",
+    )
+    parser.add_argument(
+        "--kgen-max-attempts",
+        type=int,
+        default=8,
+        help="CudaCoder max attempts per kgen stage",
+    )
+    parser.add_argument(
+        "--kgen-num-coders",
+        type=int,
+        default=4,
+        help="CudaCoder parallel coders per kgen attempt",
+    )
+    parser.add_argument(
+        "--kgen-llm-client",
+        type=str,
+        default="openai",
+        choices=["openai", "nim", "perflab", "local"],
+        help="LLM backend for kgen (OpenAI uses OPENAI_API_KEY)",
+    )
+    parser.add_argument(
+        "--kgen-stream",
+        action="store_true",
+        help="Stream LLM output during kgen",
+    )
+    parser.add_argument(
+        "--kgen-retry-on-llm-error",
+        action="store_true",
+        help="Retry kgen LLM calls on transient errors",
+    )
+    parser.add_argument(
+        "--openai-api-key",
+        type=str,
+        default=None,
+        help=(
+            "If set, assigns OPENAI_API_KEY for this process (for kgen with "
+            "--kgen-llm-client openai). Prefer setting OPENAI_API_KEY in the "
+            "environment instead of passing on the command line."
+        ),
+    )
+    parser.add_argument(
+        "--cudacoder-root",
+        type=str,
+        default=None,
+        help=(
+            "Override CudaCoder location: full repo root (uses …/src) or a directory "
+            "that already contains the ``cudacoder`` package (e.g. …/third_party). "
+            "Default: vendored copy under <KernelBlasterRelease>/third_party/cudacoder "
+            "when present."
+        ),
+    )
     parser.add_argument(
         "--concurrency",
         type=int,
@@ -379,6 +563,15 @@ async def async_main():
     args = parser.parse_args()
     validate_common_arguments(parser, args)
 
+    args.gpu_server_url = _normalize_http_service_url(args.gpu_server_url)
+    if args.gpu_server_url and "://" not in args.gpu_server_url:
+        parser.error(
+            f"Invalid --gpu-server-url {args.gpu_server_url!r}; use e.g. http://localhost:2002"
+        )
+
+    if getattr(args, "openai_api_key", None):
+        os.environ["OPENAI_API_KEY"] = args.openai_api_key
+
     dataset_str = args.dataset
 
     dataset, dataset_iter = get_dataset(
@@ -394,6 +587,11 @@ async def async_main():
     # Append precision to dataset string when provided (avoid dataset-specific special-casing)
     if getattr(args, "precision", None):
         dataset_str += "/" + args.precision
+    if args.subset in {"sol-level1", "sol-level2"} and args.dataset in (
+        "kernelbench",
+        "kernelbench-cuda",
+    ):
+        dataset_str += f"/{args.subset}"
 
     # set output directory
     model_name = (
@@ -441,20 +639,23 @@ async def async_main():
 
         if is_opencl:
             board_host = getattr(args, "board_host", None)
+            opencl_compile_port = args.compiler_port
+            opencl_gpu_port = args.gpu_port
+
             if args.gpu_server_url:
                 logger.info(f"Using existing Adreno GPU server at {args.gpu_server_url}")
                 os.environ["KERNELBLASTER_ADRENO_GPU_SERVER_URL"] = args.gpu_server_url
                 ADRENO_GPU_SERVER = None
             else:
                 ADRENO_GPU_SERVER = AdrenoGPUServer(
-                    logger, OUT_DIR, board_host=board_host, port=args.gpu_port
+                    logger, OUT_DIR, board_host=board_host, port=opencl_gpu_port
                 )
                 ADRENO_GPU_SERVER.wait_for_connection()
                 os.environ["KERNELBLASTER_ADRENO_GPU_SERVER_URL"] = ADRENO_GPU_SERVER.url
                 logger.info(f"Adreno GPU server started at {ADRENO_GPU_SERVER.url}")
 
             OPENCL_COMPILE_SERVER = OpenCLCompileServer(
-                logger, OUT_DIR, board_host=board_host, port=args.compiler_port
+                logger, OUT_DIR, board_host=board_host, port=opencl_compile_port
             )
             OPENCL_COMPILE_SERVER.wait_for_connection()
             os.environ["KERNELBLASTER_OPENCL_COMPILE_SERVER_URL"] = OPENCL_COMPILE_SERVER.url
@@ -462,11 +663,10 @@ async def async_main():
         else:
             COMPILE_SERVER = CompileServer(logger, OUT_DIR, port=args.compiler_port)
 
-            # Use existing GPU server if URL provided, otherwise create new one
             if args.gpu_server_url:
                 logger.info(f"Using existing GPU server at {args.gpu_server_url}")
                 config.set_gpu_server_url(GPUType.current(), args.gpu_server_url)
-                GPU_SERVER = None  # No need to manage our own server
+                GPU_SERVER = None
             else:
                 GPU_SERVER = GPUServer(logger, OUT_DIR, gpu=args.gpu, port=args.gpu_port)
                 GPU_SERVER.wait_for_connection()
@@ -489,6 +689,14 @@ async def async_main():
     logger.info("Loading comprehensive analysis results...")
     load_comprehensive_analysis_results()
 
+    # Create a shared optimization database so all concurrent problems
+    # read from and write to the same in-memory instance.
+    database_path = OUT_DIR.parent / "optimization_database.md"
+    gpu_report_path = Path(__file__).resolve().parent.parent / "algo-sol-modeling" / "algo-space" / "gpu_optimization_report.md"
+    llm_interface = LLMInterface(config.MODEL, logger)
+    shared_database = GPUOptimizationDatabase(database_path, gpu_report_path, llm_interface)
+    logger.info("Created shared optimization database for all problems")
+
     # Create a semaphore to limit concurrency
     semaphore = asyncio.Semaphore(args.concurrency)
 
@@ -501,13 +709,14 @@ async def async_main():
     for entry in dataset_iter:
         problem_id = entry["id"]
         folder = OUT_DIR / problem_id
-        if workflow_config.should_skip_folder(folder):
-            continue
-        elif args.no_resume:
+        if args.no_resume:
             logger.warning(
                 f"Retrying {problem_id} from scratch because --no-resume flag is set."
             )
-            os.system(f"rm -r {folder}/*")
+            if folder.exists():
+                os.system(f"rm -rf {folder}/*")
+        elif workflow_config.should_skip_folder(folder):
+            continue
         elif folder.exists():
             logger.debug(f"Resuming {problem_id}")
 
@@ -519,6 +728,7 @@ async def async_main():
                 semaphore,
                 workflow_config,
                 args.timeout,
+                shared_database=shared_database,
             )
         )
         logger.debug(f"Created task for {problem_id}")
@@ -530,7 +740,16 @@ async def async_main():
         logger.info(
             f"Processing {len(tasks)} problems with concurrency {args.concurrency}"
         )
-        await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        failed_tasks = 0
+        for idx, result in enumerate(results):
+            if isinstance(result, Exception):
+                failed_tasks += 1
+                logger.error(
+                    f"Task {idx} raised unexpectedly outside process_problem boundary: {result!r}"
+                )
+        if failed_tasks:
+            logger.warning(f"{failed_tasks} task(s) failed with unexpected exceptions")
     else:
         logger.info("No problems to process")
 

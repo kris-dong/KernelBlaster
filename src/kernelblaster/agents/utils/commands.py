@@ -83,8 +83,12 @@ async def _run_gpu_binary(
             headers = {"Authorization": f"Bearer {os.getenv('NVCF_API_KEY')}"}
         else:
             headers = {}
+        # The server enforces the per-execution timeout (passed in the form
+        # data). The HTTP client timeout must be larger to account for time
+        # the request spends waiting in the server's execution queue.
+        client_timeout = aiohttp.ClientTimeout(total=timeout + 3600)
         async with TCPClient.get_session().post(
-            f"{url}/gpu/binary", data=data, timeout=timeout, headers=headers
+            f"{url}/gpu/binary", data=data, timeout=client_timeout, headers=headers
         ) as response:
             if response.status != 200:
                 response_text = await response.text()
@@ -218,6 +222,7 @@ async def _compile_cu(
         logger.info(f"  sm_version: {gpu.sm}")
         
         logger.info(f"Submitted {job_name} to {url}/compile")
+        client_timeout = aiohttp.ClientTimeout(total=timeout + 3600)
         async with TCPClient.get_session().get(
             f"{url}/compile",
             params={
@@ -227,7 +232,7 @@ async def _compile_cu(
                 "persistent_artifacts": int(persistent_artifacts),
                 "sm_version": gpu.sm,
             },
-            timeout=timeout,
+            timeout=client_timeout,
         ) as response:
             if response.status != 200:
                 response_text = await response.text()

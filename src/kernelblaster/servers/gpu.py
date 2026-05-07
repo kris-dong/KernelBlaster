@@ -536,7 +536,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", type=str, default="0.0.0.0")
+    parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=2002)
     parser.add_argument(
         "--log_path", type=Path, default=Path("/tmp/kernelblaster/gpu_server.log")

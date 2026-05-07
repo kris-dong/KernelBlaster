@@ -27,6 +27,7 @@ import uvicorn
 import uvicorn.config
 import re
 import sysconfig
+import time
 from torch.utils import cmake_prefix_path
 
 from .server_logging import get_log_config
@@ -82,6 +83,16 @@ def write_compilation_files(
     main_fp_out.write_text(main_file_text)
     header_fp_out.write_text(header_file_text)
     cuda_fp_out.write_text(cuda_file_text)
+
+    logger.info(
+        "Prepared compilation units: main.cpp lines=%d chars=%d | cuda_model.cuh lines=%d chars=%d | cuda_model.cu lines=%d chars=%d",
+        len(main_file_text.splitlines()),
+        len(main_file_text),
+        len(header_file_text.splitlines()),
+        len(header_file_text),
+        len(cuda_file_text.splitlines()),
+        len(cuda_file_text),
+    )
 
     return main_fp_out, header_fp_out, cuda_fp_out
 
@@ -224,6 +235,65 @@ class CompilationError(Exception):
         self.message = message
         super().__init__(self.message)
 
+def _tail(s: bytes, limit: int = 8192) -> str:
+    """Decode and tail bytes for logging/error messages."""
+    if not s:
+        return ""
+    try:
+        txt = s.decode(errors="replace")
+    except Exception:
+        txt = repr(s)
+    if len(txt) <= limit:
+        return txt
+    return txt[-limit:]
+
+
+async def _run_subprocess_shell(
+    *,
+    stage: str,
+    cmd: str,
+    cwd: Path,
+    timeout_s: float,
+    env: dict | None = None,
+) -> tuple[bytes, bytes]:
+    """Run a subprocess command and return (stdout, stderr) or raise CompilationError.
+
+    This centralizes timeout handling so we always capture useful diagnostics.
+    """
+    logger.info(f"[{stage}] starting (timeout={timeout_s}s) cwd={cwd} cmd={cmd}")
+    start = asyncio.get_running_loop().time()
+    proc = await asyncio.subprocess.create_subprocess_shell(
+        cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=str(cwd),
+        start_new_session=True,
+        env=env,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        await safe_kill_process(proc, logger)
+        elapsed = asyncio.get_running_loop().time() - start
+        raise CompilationError(
+            f"[{stage}] Timeout after {timeout_s}s (elapsed={elapsed:.2f}s)\n"
+            f"cmd: {cmd}\n"
+            f"cwd: {cwd}\n"
+            "stdout/stderr unavailable (process killed on timeout)\n"
+        )
+    elapsed = asyncio.get_running_loop().time() - start
+    rc = proc.returncode
+    logger.info(f"[{stage}] finished rc={rc} elapsed={elapsed:.2f}s")
+    if rc != 0:
+        raise CompilationError(
+            f"[{stage}] Non-zero exit (rc={rc})\n"
+            f"cmd: {cmd}\n"
+            f"cwd: {cwd}\n"
+            f"stdout_tail:\n{_tail(stdout)}\n"
+            f"stderr_tail:\n{_tail(stderr)}\n"
+        )
+    return stdout, stderr
+
 
 async def exec_compilation(
     job_name: str,
@@ -234,7 +304,7 @@ async def exec_compilation(
     output_path: Path,
     persistent_artifacts: bool,
     debug=False,
-    timeout=360,
+    timeout: int | None = None,
 ):
     """
     This function is used to compile a CUDA program.
@@ -260,6 +330,9 @@ async def exec_compilation(
 
     arch_version = extract_arch_version(sm_version)
 
+    if timeout is None:
+        timeout = int(getattr(args, "compile_timeout", 360))
+
     # this call is expensive, so only regenerate if the sm version is different
     sm_build_dir = work_dir / f"build_{sm_version}"
     if not sm_build_dir.exists():
@@ -269,39 +342,24 @@ async def exec_compilation(
             arch_version,
             build_type,
         )
-        logger.info(f"Running cmake command: {cmd}")
-        proc = await asyncio.subprocess.create_subprocess_shell(
-            cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        # Note: use central runner to capture stderr/stdout and handle timeouts.
+        # CMake can hang when CUDA/toolchain discovery misbehaves.
+        await _run_subprocess_shell(
+            stage=f"cmake_config:{sm_version}",
+            cmd=cmd,
             cwd=work_dir,
+            timeout_s=timeout,
+            env=ENV_VARS,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        assert (
-            proc.returncode == 0
-        ), f"Failed to run cmake config for {work_dir}: stderr:\n{stderr.decode()}"
 
-    proc = await asyncio.create_subprocess_shell(
-        "make -j8",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    # Build step (make). Use central runner to ensure timeouts are debuggable.
+    await _run_subprocess_shell(
+        stage=f"make:{sm_version}",
+        cmd="make -j8",
         cwd=sm_build_dir,
-        start_new_session=True,
+        timeout_s=timeout,
         env=ENV_VARS,
     )
-    try:
-        # Wait for the process with timeout
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        if proc.returncode != 0:
-            raise CompilationError(
-                f"stdout:\n{stdout.decode()}\nstderr:\n{stderr.decode()}"
-            )
-    except asyncio.TimeoutError:
-        # Kill the process if it times out
-        await safe_kill_process(proc, logger)
-        raise CompilationError(
-            f"Timeout: Compilation process timed out after {timeout} seconds"
-        )
 
     return sm_build_dir / "main"
 
@@ -317,13 +375,29 @@ async def compilation_worker(worker_id: int, debug: bool = False):
             persistent_artifacts,
             output_path,
             completion_future,
+            enqueue_ts,
         ) = await QUEUE.get()
         try:
+            queue_wait_s = time.time() - enqueue_ts
+            logger.info(
+                f"[Worker {worker_id}]: dequeued {job_name} after queue_wait={queue_wait_s:.2f}s (backlog_now={QUEUE.qsize()})"
+            )
             logger.info(f"[Worker {worker_id}]: Compiling {job_name}")
             if persistent_artifacts:
                 logger.info(
                     f"[Worker {worker_id}]: Using persistent_artifacts mode for {job_name}"
                 )
+            try:
+                main_sz = Path(main_file).stat().st_size
+            except Exception:
+                main_sz = -1
+            try:
+                cuda_sz = Path(cuda_file).stat().st_size if cuda_file else -1
+            except Exception:
+                cuda_sz = -1
+            logger.info(
+                f"[Worker {worker_id}]: input file sizes bytes main={main_sz} cuda={cuda_sz} sm={sm_version}"
+            )
 
             tmp_path = await exec_compilation(
                 job_name,
@@ -415,6 +489,7 @@ async def process_compilation_request(
                 bool(persistent_artifacts),
                 output_path,
                 completion_future,
+                time.time(),
             )
         )
 
@@ -512,9 +587,15 @@ def main():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", type=str, default="0.0.0.0")
+    parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=2001)
     parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument(
+        "--compile-timeout",
+        type=int,
+        default=int(os.getenv("KERNELBLASTER_COMPILE_TIMEOUT_S", "360")),
+        help="Per-compile timeout in seconds (default: env KERNELBLASTER_COMPILE_TIMEOUT_S or 360).",
+    )
     parser.add_argument("--compile-debug", action="store_true")
     parser.add_argument(
         "--artifacts-dir",
@@ -531,5 +612,8 @@ if __name__ == "__main__":
     # Store artifacts_dir in module-level variable for use in endpoint handlers
     import src.kernelblaster.servers.compile as compile_module
     compile_module._ARTIFACTS_DIR = args.artifacts_dir
+    logger.info(
+        f"Compile server config: host={args.host} port={args.port} workers={args.num_workers} compile_timeout={args.compile_timeout}s artifacts_dir={args.artifacts_dir}"
+    )
 
     main()

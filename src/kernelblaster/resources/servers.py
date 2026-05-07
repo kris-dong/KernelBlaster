@@ -63,6 +63,10 @@ class ManagedServer:
 
 
 class CompileServer(ManagedServer):
+    # Compile server imports torch at startup and spins up a worker pool;
+    # cold start can exceed 5s, so override the default startup timeout.
+    _STARTUP_TIMEOUT_SEC = 60
+
     def __init__(
         self,
         logger,
@@ -77,6 +81,11 @@ class CompileServer(ManagedServer):
         super().__init__(logger, experiment_dir / "compile_server.log")
         self.artifacts_dir = artifacts_dir
         self.__initialize(port)
+
+    def wait_for_connection(self, timeout: int | None = None):
+        if timeout is None:
+            timeout = self._STARTUP_TIMEOUT_SEC
+        super().wait_for_connection(timeout)
 
     def __initialize(self, port: int = None):
         self.process, self.url = initialize_compiler_server(

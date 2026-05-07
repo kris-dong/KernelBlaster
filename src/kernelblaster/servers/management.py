@@ -23,7 +23,10 @@ except Exception:  # pragma: no cover
     import logging
 
     logger = logging.getLogger(__name__)
-from torch.utils import cmake_prefix_path
+try:
+    from torch.utils import cmake_prefix_path
+except ImportError:
+    cmake_prefix_path = None
 from io import TextIOWrapper
 import time
 import psutil
@@ -98,24 +101,33 @@ def initialize_compiler_server(
 
     # Start the compile server
     compiler_server_process = None
-    # Check that libtorch exists
-    if not Path(cmake_prefix_path).exists():
+    if cmake_prefix_path is None or not Path(cmake_prefix_path).exists():
         logger.error(
             f"Libtorch CMake prefix path {cmake_prefix_path} does not exist! Please install pytorch."
         )
         return False
 
     compiler_server_cmd = [
-        "python",
+        sys.executable,
         "-m",
         "src.kernelblaster.servers.compile",
         "--port",
         str(port),
         "--num-workers",
-        str(psutil.cpu_count(logical=False) - 1),  # physical CPU cores
+        str(
+            int(
+                os.getenv(
+                    "KERNELBLASTER_COMPILE_SERVER_NUM_WORKERS",
+                    str(psutil.cpu_count(logical=False) - 1),
+                )
+            )
+        ),  # physical CPU cores by default
         "--artifacts-dir",
         str(artifacts_dir),
     ]
+    compile_timeout = os.getenv("KERNELBLASTER_COMPILE_TIMEOUT_S")
+    if compile_timeout:
+        compiler_server_cmd.extend(["--compile-timeout", compile_timeout])
 
     # Use a single file for both stdout and stderr
     compiler_server_process = subprocess.Popen(
@@ -153,7 +165,7 @@ def initialize_gpu_server(
         logger.info(f"🎯 Auto-assigned GPU server port: {port}")
 
     gpu_server_cmd = [
-        "python",
+        sys.executable,
         "-m",
         "src.kernelblaster.servers.gpu",
         "--port",
@@ -286,13 +298,13 @@ def start_standalone_gpu_server(port: int = None, log_file_path: str = None) -> 
         port = find_free_port(start_port=2002)
         
     gpu_server_cmd = [
-        "python",
+        sys.executable,
         "-m",
         "src.kernelblaster.servers.gpu",
         "--port",
         str(port),
     ]
-    
+
     # Set up logging
     if log_file_path:
         # Ensure log directory exists
