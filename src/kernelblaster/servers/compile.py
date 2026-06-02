@@ -31,7 +31,8 @@ import time
 from torch.utils import cmake_prefix_path
 
 from .server_logging import get_log_config
-from .utils.process_management import safe_kill_process
+from .utils.queue_server import queue_worker_loop
+from .utils.subprocess import run_subprocess_shell
 from ..agents.utils import find_kernel_launch_header
 
 logger = logging.getLogger("uvicorn")
@@ -112,16 +113,31 @@ def build_cmake_command(
     )
 
 
-# Start worker tasks in the background
+# Lifespan defined at module import time; reads `args` lazily on startup
+# (after __main__ has parsed them).
 @asynccontextmanager
 async def lifespan(app):
     logger.info(
         f"Started compilation server on {args.host}:{args.port} with {args.num_workers} workers"
     )
-    # Start worker tasks on startup
-    _ = asyncio.create_task(start_workers(args.num_workers, args.compile_debug))
-    yield
-    free_cuda_envs()
+    tasks = [
+        asyncio.create_task(
+            queue_worker_loop(
+                worker_id=wid,
+                queue=QUEUE,
+                handler=_cuda_compile_job,
+                domain_error=CompilationError,
+                logger=logger,
+            )
+        )
+        for wid in range(args.num_workers)
+    ]
+    try:
+        yield
+    finally:
+        for t in tasks:
+            t.cancel()
+        free_cuda_envs()
 
 
 APP = FastAPI(lifespan=lifespan)
@@ -235,66 +251,6 @@ class CompilationError(Exception):
         self.message = message
         super().__init__(self.message)
 
-def _tail(s: bytes, limit: int = 8192) -> str:
-    """Decode and tail bytes for logging/error messages."""
-    if not s:
-        return ""
-    try:
-        txt = s.decode(errors="replace")
-    except Exception:
-        txt = repr(s)
-    if len(txt) <= limit:
-        return txt
-    return txt[-limit:]
-
-
-async def _run_subprocess_shell(
-    *,
-    stage: str,
-    cmd: str,
-    cwd: Path,
-    timeout_s: float,
-    env: dict | None = None,
-) -> tuple[bytes, bytes]:
-    """Run a subprocess command and return (stdout, stderr) or raise CompilationError.
-
-    This centralizes timeout handling so we always capture useful diagnostics.
-    """
-    logger.info(f"[{stage}] starting (timeout={timeout_s}s) cwd={cwd} cmd={cmd}")
-    start = asyncio.get_running_loop().time()
-    proc = await asyncio.subprocess.create_subprocess_shell(
-        cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=str(cwd),
-        start_new_session=True,
-        env=env,
-    )
-    try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
-    except asyncio.TimeoutError:
-        await safe_kill_process(proc, logger)
-        elapsed = asyncio.get_running_loop().time() - start
-        raise CompilationError(
-            f"[{stage}] Timeout after {timeout_s}s (elapsed={elapsed:.2f}s)\n"
-            f"cmd: {cmd}\n"
-            f"cwd: {cwd}\n"
-            "stdout/stderr unavailable (process killed on timeout)\n"
-        )
-    elapsed = asyncio.get_running_loop().time() - start
-    rc = proc.returncode
-    logger.info(f"[{stage}] finished rc={rc} elapsed={elapsed:.2f}s")
-    if rc != 0:
-        raise CompilationError(
-            f"[{stage}] Non-zero exit (rc={rc})\n"
-            f"cmd: {cmd}\n"
-            f"cwd: {cwd}\n"
-            f"stdout_tail:\n{_tail(stdout)}\n"
-            f"stderr_tail:\n{_tail(stderr)}\n"
-        )
-    return stdout, stderr
-
-
 async def exec_compilation(
     job_name: str,
     main_file: str,
@@ -344,91 +300,77 @@ async def exec_compilation(
         )
         # Note: use central runner to capture stderr/stdout and handle timeouts.
         # CMake can hang when CUDA/toolchain discovery misbehaves.
-        await _run_subprocess_shell(
+        await run_subprocess_shell(
             stage=f"cmake_config:{sm_version}",
             cmd=cmd,
             cwd=work_dir,
             timeout_s=timeout,
             env=ENV_VARS,
+            error_factory=CompilationError,
+            logger=logger,
         )
 
     # Build step (make). Use central runner to ensure timeouts are debuggable.
-    await _run_subprocess_shell(
+    await run_subprocess_shell(
         stage=f"make:{sm_version}",
         cmd="make -j8",
         cwd=sm_build_dir,
         timeout_s=timeout,
         env=ENV_VARS,
+        error_factory=CompilationError,
+        logger=logger,
     )
 
     return sm_build_dir / "main"
 
 
-async def compilation_worker(worker_id: int, debug: bool = False):
-    """Process files from the compilation queue"""
-    while True:
-        (
-            job_name,
-            main_file,
-            cuda_file,
-            sm_version,
-            persistent_artifacts,
-            output_path,
-            completion_future,
-            enqueue_ts,
-        ) = await QUEUE.get()
-        try:
-            queue_wait_s = time.time() - enqueue_ts
-            logger.info(
-                f"[Worker {worker_id}]: dequeued {job_name} after queue_wait={queue_wait_s:.2f}s (backlog_now={QUEUE.qsize()})"
-            )
-            logger.info(f"[Worker {worker_id}]: Compiling {job_name}")
-            if persistent_artifacts:
-                logger.info(
-                    f"[Worker {worker_id}]: Using persistent_artifacts mode for {job_name}"
-                )
-            try:
-                main_sz = Path(main_file).stat().st_size
-            except Exception:
-                main_sz = -1
-            try:
-                cuda_sz = Path(cuda_file).stat().st_size if cuda_file else -1
-            except Exception:
-                cuda_sz = -1
-            logger.info(
-                f"[Worker {worker_id}]: input file sizes bytes main={main_sz} cuda={cuda_sz} sm={sm_version}"
-            )
+async def _cuda_compile_job(worker_id: int, job_args: tuple) -> bool:
+    """Single CUDA compile job — runs CMake/make and writes the binary.
 
-            tmp_path = await exec_compilation(
-                job_name,
-                main_file,
-                cuda_file,
-                sm_version,
-                worker_id,
-                output_path,
-                persistent_artifacts,
-                debug=debug,
-            )
-            output_path.write_bytes(tmp_path.read_bytes())
-            output_path.chmod(0o755)  # make this file executable
-            logger.info(
-                f"[Worker {worker_id}]: Successfully compiled {job_name} and saved to {output_path}"
-            )
-            completion_future.set_result(True)
-        except CompilationError as e:
-            logger.info(f"[Worker {worker_id}]: Error compiling {job_name}")
-            completion_future.set_exception(e)
-        except FileNotFoundError as e:
-            logger.error(f"[Worker {worker_id}]: File not found: {e}")
-            completion_future.set_exception(e)
-        except Exception as e:
-            error_msg = f"[Worker {worker_id}]: Unhandled exception compiling {job_name}: {str(e)}"
-            logger.error(error_msg, exc_info=True)
-            # Wrap in CompilationError so it's handled properly
-            completion_future.set_exception(CompilationError(error_msg))
-            # Don't re-raise - let the worker continue processing other jobs
-        finally:
-            QUEUE.task_done()
+    Called by ``queue_worker_loop`` for each item dequeued from ``QUEUE``;
+    queue/error scaffolding lives in ``servers/utils/queue_server.py``.
+    """
+    (
+        job_name,
+        main_file,
+        cuda_file,
+        sm_version,
+        persistent_artifacts,
+        output_path,
+    ) = job_args
+    logger.info(f"[Worker {worker_id}]: Compiling {job_name}")
+    if persistent_artifacts:
+        logger.info(
+            f"[Worker {worker_id}]: Using persistent_artifacts mode for {job_name}"
+        )
+    try:
+        main_sz = Path(main_file).stat().st_size
+    except Exception:
+        main_sz = -1
+    try:
+        cuda_sz = Path(cuda_file).stat().st_size if cuda_file else -1
+    except Exception:
+        cuda_sz = -1
+    logger.info(
+        f"[Worker {worker_id}]: input file sizes bytes main={main_sz} cuda={cuda_sz} sm={sm_version}"
+    )
+
+    tmp_path = await exec_compilation(
+        job_name,
+        main_file,
+        cuda_file,
+        sm_version,
+        worker_id,
+        output_path,
+        persistent_artifacts,
+        debug=args.compile_debug,
+    )
+    output_path.write_bytes(tmp_path.read_bytes())
+    output_path.chmod(0o755)  # make this file executable
+    logger.info(
+        f"[Worker {worker_id}]: Successfully compiled {job_name} and saved to {output_path}"
+    )
+    return True
 
 
 @APP.get("/health")
@@ -543,20 +485,6 @@ async def process_compilation_request(
         error_msg = f"Error processing compilation request: {str(e)}"
         logger.error(f"/compile request processing error for {job_name}: {error_msg}", exc_info=True)
         raise HTTPException(status_code=500, detail=error_msg)
-
-
-async def start_workers(num_workers: int, debug: bool = False):
-    """Start the compilation worker tasks"""
-    workers = [
-        asyncio.create_task(compilation_worker(worker_id, debug))
-        for worker_id in range(num_workers)
-    ]
-    try:
-        await asyncio.gather(*workers)
-    except Exception as e:
-        logger.error(f"Worker exception: {e}")
-        # Re-raise the exception to crash the server
-        raise
 
 
 def run_compilation_server(host: str, port: int):

@@ -83,65 +83,93 @@ def test_server_connection(process, url, timeout: int = 5):
     return False
 
 
+def _spawn_compile_server(
+    *,
+    label: str,
+    module: str,
+    log_file: TextIOWrapper,
+    port: int | None,
+    default_port: int,
+    num_workers: int,
+    extra_args: list[str],
+    artifacts_dir: Path,
+    startup_extra_log: str = "",
+):
+    """Spawn a compile-server subprocess and return ``(process, url)``.
+
+    Shared scaffolding for both CUDA and OpenCL compile-server launchers:
+    auto-pick a port if not given, build the ``python -m <module>`` command,
+    spawn detached with logs redirected, and log the launch.
+    """
+    if port is None:
+        port = find_free_port(start_port=default_port)
+        logger.info(f"🎯 Auto-assigned {label} port: {port}")
+
+    cmd = [
+        sys.executable,
+        "-m",
+        module,
+        "--port",
+        str(port),
+        "--num-workers",
+        str(num_workers),
+        "--artifacts-dir",
+        str(artifacts_dir),
+        *extra_args,
+    ]
+
+    process = subprocess.Popen(
+        cmd,
+        stdout=log_file,
+        stderr=log_file,
+        start_new_session=True,
+    )
+
+    url = f"http://localhost:{port}"
+    suffix = f" {startup_extra_log}" if startup_extra_log else ""
+    logger.info(f"Starting the {label} at {url}{suffix}: {' '.join(cmd)}")
+    return process, url
+
+
 def initialize_compiler_server(
     log_file: TextIOWrapper,
     compile_server_url: str | None,
     artifacts_dir: Path,
     port: int | None,
 ):
-    """Initialize the servers and return the URLs."""
-
+    """Initialize the CUDA compile server and return ``(process, url)``."""
     if compile_server_url is not None:
         logger.info(f"Using existing compile server at {compile_server_url}")
         return None, compile_server_url
 
-    if port is None:
-        port = find_free_port(start_port=2001)
-        logger.info(f"🎯 Auto-assigned compiler server port: {port}")
-
-    # Start the compile server
-    compiler_server_process = None
     if cmake_prefix_path is None or not Path(cmake_prefix_path).exists():
         logger.error(
             f"Libtorch CMake prefix path {cmake_prefix_path} does not exist! Please install pytorch."
         )
         return False
 
-    compiler_server_cmd = [
-        sys.executable,
-        "-m",
-        "src.kernelblaster.servers.compile",
-        "--port",
-        str(port),
-        "--num-workers",
-        str(
-            int(
-                os.getenv(
-                    "KERNELBLASTER_COMPILE_SERVER_NUM_WORKERS",
-                    str(psutil.cpu_count(logical=False) - 1),
-                )
-            )
-        ),  # physical CPU cores by default
-        "--artifacts-dir",
-        str(artifacts_dir),
-    ]
+    num_workers = int(
+        os.getenv(
+            "KERNELBLASTER_COMPILE_SERVER_NUM_WORKERS",
+            str(psutil.cpu_count(logical=False) - 1),
+        )
+    )
+
+    extra_args: list[str] = []
     compile_timeout = os.getenv("KERNELBLASTER_COMPILE_TIMEOUT_S")
     if compile_timeout:
-        compiler_server_cmd.extend(["--compile-timeout", compile_timeout])
+        extra_args.extend(["--compile-timeout", compile_timeout])
 
-    # Use a single file for both stdout and stderr
-    compiler_server_process = subprocess.Popen(
-        compiler_server_cmd,
-        stdout=log_file,
-        stderr=log_file,
-        start_new_session=True,
+    return _spawn_compile_server(
+        label="compilation server",
+        module="src.kernelblaster.servers.compile",
+        log_file=log_file,
+        port=port,
+        default_port=2001,
+        num_workers=num_workers,
+        extra_args=extra_args,
+        artifacts_dir=artifacts_dir,
     )
-
-    compile_server_url = f"http://localhost:{port}"
-    logger.info(
-        f"Starting the compilation server at {compile_server_url}: {' '.join(compiler_server_cmd)}"
-    )
-    return compiler_server_process, compile_server_url
 
 
 def initialize_gpu_server(
@@ -195,45 +223,27 @@ def initialize_opencl_compiler_server(
     board_host: str | None = None,
     port: int | None = None,
 ):
-    """Initialize the OpenCL compilation server for Adreno targets."""
+    """Initialize the OpenCL compile server (Adreno target) and return ``(process, url)``."""
     if compile_server_url is not None:
         logger.info(f"Using existing OpenCL compile server at {compile_server_url}")
         return None, compile_server_url
 
-    if port is None:
-        port = find_free_port(start_port=2003)
-        logger.info(f"🎯 Auto-assigned OpenCL compiler server port: {port}")
-
     if board_host is None:
         board_host = os.getenv("KERNELBLASTER_ADRENO_BOARD_HOST", "root@192.0.2.201")
 
-    compiler_server_cmd = [
-        sys.executable,
-        "-m",
-        "src.kernelblaster.servers.compile_opencl",
-        "--port",
-        str(port),
-        "--num-workers",
-        str(int(os.getenv("KERNELBLASTER_OPENCL_COMPILE_WORKERS", "4"))),
-        "--board-host",
-        board_host,
-        "--artifacts-dir",
-        str(artifacts_dir),
-    ]
+    num_workers = int(os.getenv("KERNELBLASTER_OPENCL_COMPILE_WORKERS", "4"))
 
-    compiler_server_process = subprocess.Popen(
-        compiler_server_cmd,
-        stdout=log_file,
-        stderr=log_file,
-        start_new_session=True,
+    return _spawn_compile_server(
+        label="OpenCL compilation server",
+        module="src.kernelblaster.servers.compile_opencl",
+        log_file=log_file,
+        port=port,
+        default_port=2003,
+        num_workers=num_workers,
+        extra_args=["--board-host", board_host],
+        artifacts_dir=artifacts_dir,
+        startup_extra_log=f"(board={board_host})",
     )
-
-    compile_server_url = f"http://localhost:{port}"
-    logger.info(
-        f"Starting OpenCL compilation server at {compile_server_url} "
-        f"(board={board_host}): {' '.join(compiler_server_cmd)}"
-    )
-    return compiler_server_process, compile_server_url
 
 
 def initialize_adreno_gpu_server(
