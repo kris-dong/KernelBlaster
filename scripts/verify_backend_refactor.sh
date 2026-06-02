@@ -466,9 +466,11 @@ if [ "${SKIP_T3:-0}" != "1" ]; then
         fi
 
         # Verify the remote binary exists on the board
+        LOCAL_BIN=""
         if [ -n "$REMOTE_BIN" ]; then
             if ssh -o BatchMode=yes -o ConnectTimeout=5 "$KERNELBLASTER_ADRENO_BOARD_HOST" "test -x '$REMOTE_BIN'" 2>/dev/null; then
                 record "T3.d remote binary exists + is executable" PASS
+                LOCAL_BIN="$("$PY" -c "import json,sys; print(json.load(open(sys.argv[1])).get('output_path','') or '')" "$OCL_COMPILE_RESP")"
             else
                 echo "  remote binary check failed at $REMOTE_BIN"
                 record "T3.d remote binary exists + is executable" FAIL
@@ -476,6 +478,92 @@ if [ "${SKIP_T3:-0}" != "1" ]; then
         else
             echo "  skipping remote check — no remote_binary_path"
             record "T3.d remote binary exists + is executable" FAIL
+        fi
+
+        # T3.e — execute binary via gpu_adreno.py /gpu/binary endpoint, no profile.
+        # This is the most direct exercise of Phase 5's actual code changes:
+        # upload_and_exec_binary's scp invocations now go through
+        # run_subprocess_shell with AdrenoExecutionError on non-zero rc, and
+        # exec_remote_command is fully migrated. The binary's CPU fallback for
+        # the missing reference_output.bin means a single fresh run does
+        # compile-on-CPU-reference + GPU kernel + tolerance check end-to-end.
+        if [ -n "$LOCAL_BIN" ] && [ -f "$LOCAL_BIN" ]; then
+            OCL_EXEC_RESP="$TMPDIR/ocl_exec_resp.json"
+            if curl -sf --max-time 120 -X POST "http://localhost:2203/gpu/binary" \
+                -F "binary=@$LOCAL_BIN" \
+                -F "args=" \
+                -F "n_runs=1" \
+                -F "timeout=60" \
+                -F "kernel_files=[\"$OCL_PROBLEM_DIR/kernel.cl\"]" \
+                -F "profile=false" \
+                >"$OCL_EXEC_RESP" 2>"$TMPDIR/ocl_exec_curl.err"; then
+                if "$PY" -c "
+import json, sys
+r = json.load(open(sys.argv[1]))
+if not r.get('success'):
+    print('exec returned success=false:', r.get('message', '')); sys.exit(1)
+out = r.get('stdout', '')
+if isinstance(out, list): out = ''.join(out)
+print('stdout snippet:', repr(out[-200:]))
+sys.exit(0 if 'passed' in out.lower() else 2)
+                " "$OCL_EXEC_RESP"; then
+                    record "T3.e adreno binary execute via /gpu/binary -> 'passed'" PASS
+                else
+                    echo "  exec didn't print 'passed' — response tail:"
+                    cat "$OCL_EXEC_RESP" | tail -3
+                    record "T3.e adreno binary execute via /gpu/binary -> 'passed'" FAIL
+                fi
+            else
+                echo "  curl /gpu/binary failed; stderr:"
+                cat "$TMPDIR/ocl_exec_curl.err"
+                record "T3.e adreno binary execute via /gpu/binary -> 'passed'" FAIL
+            fi
+
+            # T3.f — execute with profile=true, verify [PROFILE] marker is present
+            # and OpenCLBackend.parse_profile extracts the kernel timing.
+            OCL_PROF_RESP="$TMPDIR/ocl_prof_resp.json"
+            if curl -sf --max-time 120 -X POST "http://localhost:2203/gpu/binary" \
+                -F "binary=@$LOCAL_BIN" \
+                -F "args=" \
+                -F "n_runs=1" \
+                -F "timeout=60" \
+                -F "kernel_files=[\"$OCL_PROBLEM_DIR/kernel.cl\"]" \
+                -F "profile=true" \
+                >"$OCL_PROF_RESP" 2>"$TMPDIR/ocl_prof_curl.err"; then
+                if "$PY" -c "
+import json, sys
+sys.path.insert(0, '.')
+r = json.load(open(sys.argv[1]))
+if not r.get('success'):
+    print('exec returned success=false:', r.get('message', '')); sys.exit(1)
+out = r.get('stdout', '')
+if isinstance(out, list): out = ''.join(out)
+print('stdout snippet:', repr(out[-300:]))
+# Verify [PROFILE] marker present
+if '[PROFILE]' not in out:
+    print('no [PROFILE] marker in stdout'); sys.exit(2)
+# Verify OpenCLBackend.parse_profile picks it up
+from src.kernelblaster.backends import get_backend
+pr = get_backend('opencl').parse_profile(out)
+if not pr.per_kernel_ms:
+    print('parse_profile produced empty per_kernel_ms'); sys.exit(3)
+print('parse_profile result:', dict(pr.per_kernel_ms), 'total_ms:', pr.total_time_ms)
+                " "$OCL_PROF_RESP"; then
+                    record "T3.f adreno binary execute with profile -> [PROFILE] parsed" PASS
+                else
+                    echo "  profile run failed; response tail:"
+                    cat "$OCL_PROF_RESP" | tail -3
+                    record "T3.f adreno binary execute with profile -> [PROFILE] parsed" FAIL
+                fi
+            else
+                echo "  curl /gpu/binary (profile) failed; stderr:"
+                cat "$TMPDIR/ocl_prof_curl.err"
+                record "T3.f adreno binary execute with profile -> [PROFILE] parsed" FAIL
+            fi
+        else
+            echo "  no local binary available — skipping T3.e/T3.f"
+            record "T3.e adreno binary execute via /gpu/binary -> 'passed'" SKIP
+            record "T3.f adreno binary execute with profile -> [PROFILE] parsed" SKIP
         fi
     fi
 else
