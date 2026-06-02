@@ -28,6 +28,7 @@ import asyncio
 import sys
 from ..config import config
 from .feedback import FeedbackAgent, Feedback, FeedbackConfig
+from .opt_rl_base import RLAgentBase
 from .database import OptimizationDatabase, OptimizationEntry, CompositeOptimization
 from .rl_agents import (
     ReplayBuffer, Trajectory, TrajectoryStep,
@@ -300,7 +301,7 @@ class RLNCUFeedback(Feedback):
     state: Optional[str] = None
 
 
-class RLNCUAgent(FeedbackAgent):
+class RLNCUAgent(RLAgentBase):
     """
     RL-based CUDA optimization agent implementing strategy-guided rollouts.
     """
@@ -1159,22 +1160,7 @@ class RLNCUAgent(FeedbackAgent):
     # ------------------------------------------------------------------
     # Helper to find an optimisation entry by its technique/composite ID
     # ------------------------------------------------------------------
-    def _lookup_optim_entry_by_name(
-        self, technique_name: str
-    ) -> Optional[OptimizationEntry | CompositeOptimization]:
-        # Search individual techniques
-        for state_data in self.database.optimization_strategies.values():
-            for opt in state_data.get("optimizations", []):
-                if opt.technique == technique_name:
-                    return opt
-
-        # Search composite optimisations
-        for comps in self.database.composite_optimizations.values():
-            for comp in comps:
-                if comp.get_composite_id() == technique_name:
-                    return comp
-
-        return None
+    # _lookup_optim_entry_by_name lifted to RLAgentBase in Phase 4f.
 
     async def apply_optimization(
         self,
@@ -1422,34 +1408,7 @@ class RLNCUAgent(FeedbackAgent):
         new_state = None  # TODO: Temp Disable state update
         return optimized_code, new_cycles, new_state, new_ncu_log
 
-    def calculate_reward(self, predicted_improvement: Optional[float], actual_improvement: float, 
-                        is_faster: bool) -> float:
-        """Calculate reward based on prediction accuracy and actual performance.
-        Safely handles None/zero predicted_improvement by skipping accuracy bonus.
-        """
-        
-        # Base reward for improvement
-        base_reward = actual_improvement / 100.0  # Convert percentage to fraction
-        
-        # Bonus for prediction accuracy
-        try:
-            safe_predicted = float(predicted_improvement) if predicted_improvement is not None else 0.0
-        except (TypeError, ValueError):
-            safe_predicted = 0.0
-        
-        if safe_predicted > 0.0:
-            accuracy = min(actual_improvement / safe_predicted, 2.0)
-            if 0.8 <= accuracy <= 1.2:  # Good prediction
-                accuracy_bonus = 0.2
-            else:  # Poor prediction
-                accuracy_bonus = -0.1 * abs(accuracy - 1.0)
-        else:
-            accuracy_bonus = 0.0
-        
-        # Penalty for making things worse
-        penalty = -0.5 if not is_faster else 0.0
-        
-        return base_reward + accuracy_bonus + penalty
+    # calculate_reward lifted to RLAgentBase in Phase 4f.
 
     async def policy_update_cycle(self):
         """Run the policy evaluation and update cycle."""
@@ -1604,36 +1563,12 @@ The optimization process is learning and adapting. Continue with further optimiz
                 feedback=e.feedback if hasattr(e, 'feedback') else str(e)
             )
 
-    def _try_add_default_optimizations(self, current_state: str) -> bool:
-        """Fallback when no optimizations are recorded for a discovered state.
+    # _try_add_default_optimizations lifted to RLAgentBase in Phase 4f.
 
-        The catalog (bottleneck -> [(technique, predicted_pct), ...]) lives on
-        the backend — see ``CUDABackend.get_default_optimizations``.
-        """
-        try:
-            defaults = self.backend.get_default_optimizations()
-            primary_bottleneck = next(
-                (b for b in defaults if b in current_state), None
-            )
-            if primary_bottleneck is not None:
-                for technique, improvement in defaults[primary_bottleneck]:
-                    self.database.add_new_optimization(current_state, technique, improvement)
-                self.agent_logger.info(
-                    f"Added {len(defaults[primary_bottleneck])} default optimizations for state: {current_state}"
-                )
-                return True
-        except Exception as e:
-            self.agent_logger.error(f"Error adding default optimizations: {e}")
-        return False
-
-    def get_performance_summary(self) -> Dict[str, Any]:
-        """Get comprehensive performance summary."""
+    # get_performance_summary skeleton lifted to RLAgentBase in Phase 4f;
+    # this override only contributes the CUDA-named metric keys.
+    def _perf_summary_extras(self) -> Dict[str, Any]:
         return {
-            'total_trajectories': self.total_trajectories,
-            'iteration_count': self.iteration_count,
-            'initial_cycles': self.initial_metric,
-            'best_cycles': self.best_metric,
-            'overall_improvement': ((self.initial_metric - self.best_metric) / self.initial_metric * 100) if self.initial_metric else 0,
-            'buffer_stats': self.replay_buffer.get_statistics(),
-            'database_stats': self.database.get_database_stats()
-        } 
+            "initial_cycles": self.initial_metric,
+            "best_cycles": self.best_metric,
+        }

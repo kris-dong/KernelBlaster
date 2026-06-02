@@ -15,6 +15,7 @@ import math
 
 from ..config import config
 from .feedback import FeedbackAgent, Feedback, FeedbackConfig
+from .opt_rl_base import RLAgentBase
 from .database import OptimizationDatabase, OptimizationEntry, CompositeOptimization
 from .rl_agents import (
     ReplayBuffer, Trajectory, TrajectoryStep,
@@ -201,7 +202,7 @@ class RLOpenCLFeedback(Feedback):
     state: Optional[str] = None
 
 
-class RLOpenCLAgent(FeedbackAgent):
+class RLOpenCLAgent(RLAgentBase):
     """
     RL-based OpenCL optimization agent for Qualcomm Adreno GPUs.
     Mirrors RLNCUAgent but uses OpenCL event profiling instead of NCU.
@@ -736,18 +737,7 @@ class RLOpenCLAgent(FeedbackAgent):
 
         return trajectory
 
-    def _lookup_optim_entry_by_name(
-        self, technique_name: str
-    ) -> Optional[OptimizationEntry | CompositeOptimization]:
-        for state_data in self.database.optimization_strategies.values():
-            for opt in state_data.get("optimizations", []):
-                if opt.technique == technique_name:
-                    return opt
-        for comps in self.database.composite_optimizations.values():
-            for comp in comps:
-                if comp.get_composite_id() == technique_name:
-                    return comp
-        return None
+    # _lookup_optim_entry_by_name lifted to RLAgentBase in Phase 4f.
 
     # ------------------------------------------------------------------
     # Apply a single optimisation step
@@ -874,45 +864,8 @@ class RLOpenCLAgent(FeedbackAgent):
     # ------------------------------------------------------------------
     # Reward
     # ------------------------------------------------------------------
-    def calculate_reward(self, predicted_improvement: Optional[float],
-                         actual_improvement: float, is_faster: bool) -> float:
-        base_reward = actual_improvement / 100.0
-        try:
-            safe_predicted = float(predicted_improvement) if predicted_improvement is not None else 0.0
-        except (TypeError, ValueError):
-            safe_predicted = 0.0
-
-        if safe_predicted > 0.0:
-            accuracy = min(actual_improvement / safe_predicted, 2.0)
-            accuracy_bonus = 0.2 if 0.8 <= accuracy <= 1.2 else -0.1 * abs(accuracy - 1.0)
-        else:
-            accuracy_bonus = 0.0
-
-        penalty = -0.5 if not is_faster else 0.0
-        return base_reward + accuracy_bonus + penalty
-
-    # ------------------------------------------------------------------
-    # Default optimisations fallback
-    # ------------------------------------------------------------------
-    def _try_add_default_optimizations(self, current_state: str) -> bool:
-        """Fallback when no optimisations are recorded for a discovered state.
-
-        The catalog (bottleneck -> [(technique, predicted_pct), ...]) lives on
-        the backend — see ``OpenCLBackend.get_default_optimizations``.
-        """
-        try:
-            defaults = self.backend.get_default_optimizations()
-            for bottleneck, opts in defaults.items():
-                if bottleneck in current_state:
-                    for technique, improvement in opts:
-                        self.database.add_new_optimization(current_state, technique, improvement)
-                    self.agent_logger.info(
-                        f"Added {len(opts)} default optimisations for state: {current_state}"
-                    )
-                    return True
-        except Exception as e:
-            self.agent_logger.error(f"Error adding default optimisations: {e}")
-        return False
+    # calculate_reward and _try_add_default_optimizations lifted to
+    # RLAgentBase in Phase 4f.
 
     # ------------------------------------------------------------------
     # Feedback (for use via the base FeedbackAgent run loop)
@@ -1018,16 +971,10 @@ class RLOpenCLAgent(FeedbackAgent):
                 feedback=e.feedback if hasattr(e, 'feedback') else str(e),
             )
 
-    def get_performance_summary(self) -> Dict[str, Any]:
+    # get_performance_summary skeleton lifted to RLAgentBase in Phase 4f;
+    # this override only contributes the OpenCL-named metric keys.
+    def _perf_summary_extras(self) -> Dict[str, Any]:
         return {
-            'total_trajectories': self.total_trajectories,
-            'iteration_count': self.iteration_count,
-            'initial_time_ms': self.initial_metric,
-            'best_time_ms': self.best_metric,
-            'overall_improvement': (
-                ((self.initial_metric - self.best_metric) / self.initial_metric * 100)
-                if self.initial_metric else 0
-            ),
-            'buffer_stats': self.replay_buffer.get_statistics(),
-            'database_stats': self.database.get_database_stats(),
+            "initial_time_ms": self.initial_metric,
+            "best_time_ms": self.best_metric,
         }
