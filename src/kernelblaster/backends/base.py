@@ -92,6 +92,48 @@ class ProfileResult:
         return cls.from_dict(json.loads(_Path(path).read_text()))
 
 
+@dataclass
+class RLNodeConfig:
+    """Per-backend configuration consumed by the unified RL-optimization graph node.
+
+    Carries the bits that genuinely diverge between the CUDA and OpenCL
+    optimization-graph nodes (curated-artifact root, state-dict keys, agent
+    class wiring, final filename, etc.). Each backend produces one of these
+    so ``graph/nodes/_rl_node.py`` can drive both flows from a single
+    function body — Phase 4e of the backend abstraction refactor.
+    """
+
+    # Curated artifact resolution (state-driven, with sensible defaults).
+    curated_root_state_key: str          # state.get(this) overrides curated_root_default
+    curated_root_default: "Path"
+
+    # On-disk filenames inside a curated <root>/<tier>/<problem>/ directory.
+    kernel_filename: str                 # e.g. "init.cu" / "kernel.cl"
+    # ``driver_filename`` reuses ``Backend.driver_filename``.
+
+    # State dict keys consumed/produced by the node.
+    state_kernel_fp_input: str           # state[key] -> kernel-source path
+    state_perf_fp_output: str            # node return dict key
+    state_test_code_fp_key: str = "test_code_fp"
+
+    # Agent wiring.
+    agent_class: "type | None" = None     # RLNCUAgent or RLOpenCLAgent
+    agent_kernel_fp_kwarg: str = "code_to_optimize_fp"
+    fb_config_agent_name: str = "rl_ncu"
+    num_pgen: int = 4
+
+    # Output.
+    final_filename: str = "final.cu"
+    # ``best_filename`` (e.g. global_best_rl_optimization.cl) is read off
+    # ``Backend.best_filename()`` directly.
+    use_global_best_preference: bool = False  # OpenCL prefers global_best over per-traj best
+
+    # Tier mapping: maps base_folder.parent.name to the directory under
+    # ``curated_root_default`` that holds the problem. CUDA: identity
+    # (level1/level2/...); OpenCL: tier-aware (sol-level2 -> L2 etc.).
+    tier_resolver: "Callable[[str], str] | None" = None
+
+
 class Backend(ABC):
     """Contract every hardware backend satisfies.
 
@@ -199,3 +241,9 @@ class Backend(ABC):
         CUDA: ``profile_result.raw_metrics["elapsed_cycles"]``.
         OpenCL: ``profile_result.total_time_ms``.
         """
+
+    # ---- RL graph-node config ----
+    @abstractmethod
+    def rl_node_config(self) -> "RLNodeConfig":
+        """Return the per-backend config consumed by the unified RL-optimization
+        graph node — see ``RLNodeConfig`` and ``graph/nodes/_rl_node.py``."""

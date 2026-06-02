@@ -189,6 +189,52 @@ class OpenCLBackend(Backend):
     def extract_primary_metric(self, profile_result: ProfileResult) -> float:
         return float(profile_result.total_time_ms)
 
+    # ---- RL graph-node config ----
+    def rl_node_config(self):
+        """Per-backend wiring for the unified RL-optimization graph node.
+
+        OpenCL curated layout: ``<root>/<bench_tier>/<problem>/{driver.c, kernel.cl}``.
+        ``bench_tier`` is derived from the run-output parent folder name via
+        ``data.kernelbench_opencl.run_output_parent_to_benchmark_dir`` (e.g.
+        ``sol-level2 -> L2``).
+
+        The OpenCL flow also prefers ``global_best_rl_optimization.cl`` over
+        per-trajectory best when it exists — a verification-pool optimization
+        that CUDA doesn't currently use.
+        """
+        from .base import RLNodeConfig
+        from ..agents.opt_opencl_rl import RLOpenCLAgent
+
+        # Lazy import — kernelbench_opencl pulls dataset helpers that may not
+        # be on the import path for every consumer (e.g. server-only imports).
+        try:
+            from data.kernelbench_opencl import (
+                default_benchmark_opencl_root,
+                run_output_parent_to_benchmark_dir,
+            )
+            default_root = default_benchmark_opencl_root()
+            tier_fn = run_output_parent_to_benchmark_dir
+        except Exception:
+            # Fallback if data.kernelbench_opencl isn't importable.
+            repo_root = Path(__file__).resolve().parents[3]
+            default_root = repo_root / "data" / "kernelbench-opencl"
+            tier_fn = lambda parent_name: parent_name
+
+        return RLNodeConfig(
+            curated_root_state_key="kernelbench_opencl_root",
+            curated_root_default=default_root,
+            kernel_filename="kernel.cl",
+            state_kernel_fp_input="kernel_cl_fp",
+            state_perf_fp_output="rl_opencl_perf_fp",
+            agent_class=RLOpenCLAgent,
+            agent_kernel_fp_kwarg="kernel_to_optimize_fp",
+            fb_config_agent_name="rl_opencl",
+            num_pgen=1,
+            final_filename="final_rl_opencl_perf.cl",
+            use_global_best_preference=True,
+            tier_resolver=tier_fn,
+        )
+
     # ---- LLM response handling ----
     def extract_code_from_response(self, response_text: str) -> str | None:
         """OpenCL: prefer ```c, fall back to ```opencl."""

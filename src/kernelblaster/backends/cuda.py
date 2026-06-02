@@ -192,6 +192,33 @@ class CUDABackend(Backend):
     def extract_primary_metric(self, profile_result: ProfileResult) -> float:
         return float(profile_result.raw_metrics.get("elapsed_cycles", 0))
 
+    # ---- RL graph-node config ----
+    def rl_node_config(self):
+        """Per-backend wiring for the unified RL-optimization graph node.
+
+        CUDA curated layout: ``<root>/<level>/<problem>/{driver.cpp, init.cu}``
+        where ``<level>`` is the parent-folder name verbatim
+        (``level1``/``level2``/``level3``).
+        """
+        from .base import RLNodeConfig
+        from ..agents.opt_ncu_rl import RLNCUAgent
+
+        repo_root = Path(__file__).resolve().parents[3]
+        return RLNodeConfig(
+            curated_root_state_key="kernelbench_cuda_root",
+            curated_root_default=repo_root / "data" / "kernelbench-cuda",
+            kernel_filename="init.cu",
+            state_kernel_fp_input="cuda_fp",
+            state_perf_fp_output="rl_ncu_cuda_fp",
+            agent_class=RLNCUAgent,
+            agent_kernel_fp_kwarg="code_to_optimize_fp",
+            fb_config_agent_name="rl_ncu",
+            num_pgen=4,
+            final_filename="final_rl_cuda_perf.cu",
+            use_global_best_preference=False,
+            tier_resolver=lambda parent_name: parent_name,  # identity
+        )
+
     # ---- LLM response handling ----
     def extract_code_from_response(self, response_text: str) -> str | None:
         """CUDA uses the ```cpp tag."""
