@@ -344,9 +344,10 @@ if __name__ == "__main__":
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=2003)
     parser.add_argument("--num-workers", type=int, default=4)
+    from ..backends.opencl import default_board_host
     parser.add_argument(
         "--board-host", type=str,
-        default=os.getenv("KERNELBLASTER_ADRENO_BOARD_HOST", "root@192.0.2.201"),
+        default=default_board_host(),
         help="SSH target for remote compilation on Adreno board",
     )
     parser.add_argument(

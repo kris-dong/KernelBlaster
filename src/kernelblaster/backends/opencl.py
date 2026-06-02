@@ -73,13 +73,14 @@ _OPENCL_TECHNIQUE_MAP: Mapping[str, str] = {
 }
 
 
-def _default_board_host() -> str:
+def default_board_host() -> str:
     """Canonical source for the Adreno SSH target.
 
-    Audit identified 5 hardcoded copies of this string across the repo
-    (``utils/arguments.py``, ``opt_opencl_rl.py``, ``gpu_adreno.py``,
-    ``compile_opencl.py``, ``run_single_kernelblaster_opencl.sh``). Phase 6
-    will migrate those sites to read through ``OpenCLBackend.board_host``.
+    Resolves ``KERNELBLASTER_ADRENO_BOARD_HOST`` env var or returns the
+    placeholder ``root@192.0.2.201``. Phase 6 made this the single source
+    of truth — modules that previously inlined the same lookup now import
+    and call this. For consumers that have an OpenCLBackend instance, prefer
+    ``backend.board_host`` (which calls this in ``__init__``).
     """
     return os.getenv("KERNELBLASTER_ADRENO_BOARD_HOST", "root@192.0.2.201")
 
@@ -97,7 +98,7 @@ class OpenCLBackend(Backend):
         board_host: str | None = None,
         gpu: "GPUType | None" = None,
     ):
-        self.board_host = board_host or _default_board_host()
+        self.board_host = board_host or default_board_host()
         self.gpu = gpu
 
     # ---- assets ----

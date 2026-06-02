@@ -212,7 +212,8 @@ def initialize_opencl_compiler_server(
         return None, compile_server_url
 
     if board_host is None:
-        board_host = os.getenv("KERNELBLASTER_ADRENO_BOARD_HOST", "root@192.0.2.201")
+        from ..backends.opencl import default_board_host
+        board_host = default_board_host()
 
     num_workers = int(os.getenv("KERNELBLASTER_OPENCL_COMPILE_WORKERS", "4"))
 
@@ -243,7 +244,8 @@ def initialize_adreno_gpu_server(
         return None, gpu_server_url
 
     if board_host is None:
-        board_host = os.getenv("KERNELBLASTER_ADRENO_BOARD_HOST", "root@192.0.2.201")
+        from ..backends.opencl import default_board_host
+        board_host = default_board_host()
 
     return _spawn_server(
         label="Adreno GPU server",
