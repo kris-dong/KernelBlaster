@@ -138,6 +138,143 @@ class LLMInterface:
         return False
 
 
+# ---------------------------------------------------------------------------
+# NCU log -> JSON metric extraction (Phase 3a: lifted from database_optimized)
+# ---------------------------------------------------------------------------
+
+_NCU_METRIC_KEYS = {
+    "sm_throughput_pct": [r"Compute\s*\(SM\)\s*Throughput"],
+    "dram_throughput_pct": [r"Memory\s+Throughput", r"DRAM\s+Throughput"],
+    "l1_hit_rate_pct": [r"L1/TEX\s+Hit\s+Rate"],
+    "l2_hit_rate_pct": [r"L2\s+Cache\s+Hit\s+Rate"],
+    "occupancy_pct": [r"Achieved\s+Occupancy", r"Occupancy"],
+    "registers_per_thread": [r"Registers\s+Per\s+Thread"],
+    "shared_mem_per_block_kb": [r"Shared\s+Memory\s+Per\s+Block"],
+    "elapsed_cycles": [r"Elapsed\s+Cycles"],
+}
+
+
+def extract_metrics_json(
+    ncu_log: str,
+    elapsed_cycles: Optional[int] = None,
+    gpu_time_ns: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Parse a JSON-summary of the NCU Speed-Of-Light section, no ASCII tables.
+
+    Returns a small dict suitable for embedding in an LLM prompt instead of the
+    raw NCU output. Missing metrics are omitted (not zero-filled — that just
+    confuses the LLM into "optimising" a metric the profiler couldn't read).
+
+    Parameters
+    ----------
+    elapsed_cycles : optional bottleneck-kernel cycle count (NCU). Legacy.
+    gpu_time_ns    : wall-clock GPU time in ns from nsys (first solution kernel
+                     start to last solution kernel end). New optimisation reward.
+    """
+    out: Dict[str, Any] = {}
+    if not ncu_log or not ncu_log.strip():
+        if elapsed_cycles:
+            out["elapsed_cycles"] = int(elapsed_cycles)
+        if gpu_time_ns:
+            out["gpu_time_ns"] = int(gpu_time_ns)
+        return out
+
+    for key, patterns in _NCU_METRIC_KEYS.items():
+        for pat in patterns:
+            rx = rf"{pat}.*?([0-9]+(?:\.[0-9]+)?)"
+            m = re.search(rx, ncu_log, re.IGNORECASE | re.MULTILINE)
+            if m:
+                try:
+                    val = float(m.group(1))
+                except ValueError:
+                    continue
+                if key == "elapsed_cycles":
+                    out[key] = int(val)
+                else:
+                    out[key] = val
+                break
+
+    if elapsed_cycles is not None and "elapsed_cycles" not in out:
+        out["elapsed_cycles"] = int(elapsed_cycles)
+    if gpu_time_ns is not None:
+        out["gpu_time_ns"] = int(gpu_time_ns)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Tiered LLM client (Phase 3a: lifted from database_optimized.TieredLLMInterface)
+# ---------------------------------------------------------------------------
+
+class TieredLLMInterface(LLMInterface):
+    """LLM client that routes to a *cheap* model and supports system+user messages.
+
+    The cheap model defaults to ``$MODEL_PLAN`` (env var) → ``$MODEL`` (config).
+    Optionally records token usage into a shared :class:`CostTracker`.
+
+    Used by ``GPUOptimizationDatabase`` when constructed with ``cheap_llm=`` —
+    state-analysis and plan-generation queries route through this client with
+    a cache-stable system prompt so provider-side prefix caching kicks in.
+    """
+
+    def __init__(
+        self,
+        *,
+        model_name: Optional[str] = None,
+        logger=None,
+        cost_tracker=None,
+        role_label: str = "plan",
+    ):
+        super().__init__(model_name=model_name, logger=logger)
+        self.cost_tracker = cost_tracker
+        self.role_label = role_label
+
+    async def query_layered(
+        self,
+        system_prompt: str,
+        user_message: str,
+        *,
+        max_tokens: int = 1000,
+        temperature: float = 0.1,
+        anthropic_cache_control: bool = True,
+    ) -> str:
+        """Send a (system, user) pair using the cheap model.
+
+        The system prompt is meant to be *stable* across calls so that
+        provider-side prefix caches can be exploited. With Anthropic, when
+        ``anthropic_cache_control`` is True we set ``cache_control`` on the
+        system block (this is a no-op on OpenAI; their cache is automatic).
+        """
+        try:
+            from .utils import generate_code_retry
+        except ImportError:
+            return ""
+
+        if anthropic_cache_control:
+            sys_marker = "<!-- cache_control: ephemeral -->\n"
+        else:
+            sys_marker = ""
+        messages = [
+            {"role": "system", "content": sys_marker + system_prompt},
+            {"role": "user", "content": user_message},
+        ]
+        try:
+            response = await generate_code_retry(
+                messages, self.model_name, self.logger, n_tasks=1, max_retries=2
+            )
+            if self.cost_tracker is not None:
+                self.cost_tracker.record(
+                    model=self.model_name,
+                    usage=getattr(response, "usage", None),
+                    role=self.role_label,
+                    logger=self.logger,
+                )
+            return response.generations[0] if response.generations else ""
+        except Exception as e:
+            if self.logger:
+                self.logger.warning(f"TieredLLMInterface.query_layered failed: {e}")
+            return ""
+
+
 @dataclass
 class StateProfile:
     """Qualitative state profile with primary and secondary characteristics."""
@@ -189,10 +326,31 @@ class CompositeOptimization:
 
 
 class GPUOptimizationDatabase:
-    """Enhanced database with LLM-powered qualitative state analysis."""
-    
-    def __init__(self, optimization_db_path: Path, gpu_report_path: Path, llm_interface=None):
+    """Enhanced database with LLM-powered qualitative state analysis.
+
+    Phase 3a unified ``OptimizationDatabase`` and ``OptimizedOptimizationDatabase``
+    into one class. The optional ``cheap_llm`` / ``cost_tracker`` parameters
+    enable the tiered-model dispatch and prefix-cache-friendly layered prompts
+    that previously lived in the optimized subclass; consumers that don't pass
+    them get exactly the legacy behavior. The optional ``backend`` parameter
+    plumbs the per-backend asset paths (database footer markdown) so OpenCL
+    runs no longer accidentally pick up the CUDA footer template.
+    """
+
+    def __init__(
+        self,
+        optimization_db_path: Path,
+        gpu_report_path: Path,
+        llm_interface=None,
+        *,
+        backend=None,           # Phase 3a: optional Backend for asset paths
+        cheap_llm=None,         # Phase 3a: optional tiered LLM for state/plan
+        cost_tracker=None,      # Phase 3a: optional CostTracker
+    ):
         import os
+        self.backend = backend
+        self.cheap_llm = cheap_llm
+        self.cost_tracker = cost_tracker
         self.optimization_db_path = optimization_db_path
         self.optimization_db_header_path = optimization_db_path.with_name(f"{optimization_db_path.stem}_header{optimization_db_path.suffix}") 
         self.optimization_db_footer_path = optimization_db_path.with_name(f"{optimization_db_path.stem}_footer{optimization_db_path.suffix}") 
@@ -265,6 +423,22 @@ class GPUOptimizationDatabase:
         print(f"Persisted database to {self._persist_json_fp}")
 
         # exit(0)
+
+        # ---------- Phase 3a: tiered-LLM opt-in setup ----------
+        # When ``cheap_llm`` is provided, pre-build the cache-stable system
+        # prompts + technique index so ``analyze_performance_state`` /
+        # ``generate_optimization_plan`` can route to the cheap model with
+        # prefix-cache-friendly layered messages. When ``cheap_llm`` is None,
+        # this whole block is skipped and we behave exactly like the legacy
+        # base class (the merged code preserves back-compat behavior).
+        if self.cheap_llm is not None:
+            self._system_prompt_state = self._build_state_system_prompt()
+            self._system_prompt_plan = self._build_plan_system_prompt()
+            self._technique_index = self._build_technique_index()
+        else:
+            self._system_prompt_state = None
+            self._system_prompt_plan = None
+            self._technique_index = None
 
     # ------------------------------------------------------------------
     # Helper: persist LLM prompt / response pairs for debugging
@@ -380,9 +554,15 @@ class GPUOptimizationDatabase:
         # Repo root is the project root (e.g. /path/to/KernelBlaster)
         repo_root = Path(__file__).resolve().parents[3]
         default_json_path = repo_root / "data" / "kernelblaster" / "optimization_database.json"
-        # Default header/footer live alongside the JSON template
+        # Default header/footer live alongside the JSON template.
+        # Footer is per-backend (CUDA vs OpenCL technique catalog); pick from
+        # backend if provided, else fall back to the historical CUDA default.
+        # (Phase 3a — fixes the silent OpenCL-uses-CUDA-footer bug.)
         default_header_path = repo_root / "data" / "kernelblaster" / "optimization_database_header.md"
-        default_footer_path = repo_root / "data" / "kernelblaster" / "optimization_database_footer.md"
+        if self.backend is not None:
+            default_footer_path = self.backend.database_footer_path
+        else:
+            default_footer_path = repo_root / "data" / "kernelblaster" / "optimization_database_footer.md"
         
         # Load current optimization database
         # Priority: 1) persisted JSON in output dir, 2) markdown in output dir,
@@ -745,8 +925,19 @@ class GPUOptimizationDatabase:
         """
         LLM Agent 1: State Summarizer
         Analyzes NCU report and extracts qualitative performance characteristics.
+
+        When ``cheap_llm`` was provided at construction time, this dispatches
+        to the tiered path (cache-stable system prompt + cheap model). The
+        legacy frontier-model path below runs only when ``cheap_llm`` is None.
         """
-        
+        # Phase 3a: tiered dispatch.
+        if self.cheap_llm is not None:
+            return await self._analyze_performance_state_tiered(
+                ncu_report, metrics, code_implementation, elapsed_cycles
+            )
+
+        # Legacy path follows.
+
         # If ncu_report is empty but we have cycles, construct a minimal report
         # Only show cycles if they're > 0 (0 usually indicates parsing failure)
         if not ncu_report.strip() and elapsed_cycles is not None and elapsed_cycles > 0:
@@ -1279,6 +1470,10 @@ AVAILABLE OPTIMISATIONS:
     ) -> List[Dict[str, Any]]:
         """Ask the LLM to pick the *top_n* most relevant optimisation techniques.
 
+        When ``cheap_llm`` was provided at construction time, this dispatches
+        to the tiered path (cache-stable system prompt + cheap model). On
+        tiered-path failure, falls through to the legacy implementation below.
+
         Parameters
         ----------
         state_analysis_response:
@@ -1298,7 +1493,23 @@ AVAILABLE OPTIMISATIONS:
             A list with length *top_n* where every element is a dictionary with the
             keys ``technique``, ``relevance_score`` and ``reasoning``.
         """
+        # Phase 3a: tiered dispatch. Try cheap-LLM path first when available;
+        # on any failure (LLM unreachable, parsing failed, etc.) fall through
+        # to the legacy frontier-model implementation below.
+        if self.cheap_llm is not None and self.cheap_llm.is_available():
+            try:
+                tiered_plan = await self._generate_optimization_plan_tiered(
+                    state_analysis_response, code_implementation, top_n
+                )
+                if tiered_plan:
+                    return tiered_plan
+            except Exception as e:
+                if self.cheap_llm.logger:
+                    self.cheap_llm.logger.warning(
+                        f"Optimised plan generation failed; falling through to legacy: {e}"
+                    )
 
+        # Legacy path follows.
         # ------------------------- LLM prompt -------------------------
         prompt = f"""
 You are a world-class GPU optimisation expert.  Based on the kernel implementation
@@ -1382,6 +1593,241 @@ CODE IMPLEMENTATION:
                 }
             )
         return fallback_plan
+
+    # ==================================================================
+    # Phase 3a: tiered-LLM path (lifted from OptimizedOptimizationDatabase)
+    # ==================================================================
+    # The methods in this block were previously in ``database_optimized.py``.
+    # They're available on the unified class but only ACTIVATE when
+    # ``cheap_llm`` is provided at construction time — analyze_performance_state
+    # and generate_optimization_plan dispatch to ``_tiered`` variants first
+    # and fall through to the legacy implementations otherwise.
+
+    def _build_state_system_prompt(self) -> str:
+        return (
+            "You are a GPU performance analysis expert.\n"
+            "Given a kernel source and a JSON of NCU Speed-Of-Light metrics, return a "
+            "qualitative state summary in this EXACT shape:\n\n"
+            "PERFORMANCE_SIGNATURE: <one sentence: what limits performance>\n"
+            "PRIMARY_BOTTLENECK: memory_bound | compute_bound | latency_bound | hybrid_bound\n"
+            "RELATIVE_PATTERNS:\n"
+            "- memory_pressure: very_low|low|moderate|high|very_high\n"
+            "- compute_utilization: very_low|low|moderate|high|very_high\n"
+            "- access_patterns: excellent|good|moderate|poor|very_poor\n"
+            "- cache_efficiency: excellent|good|moderate|poor|very_poor\n"
+            "- occupancy_level: very_low|low|moderate|high|very_high\n"
+            "- parallelism_utilization: very_low|low|moderate|high|very_high\n"
+            "- specialised_hw_usage: very_low|low|moderate|high|very_high\n"
+            "CONTEXT_DESCRIPTION: <one short paragraph about workload characteristics>\n\n"
+            "Stay qualitative. Do not echo numbers from the JSON. Do not include any "
+            "commentary outside the labelled fields."
+        )
+
+    def _build_plan_system_prompt(self) -> str:
+        avail = self._build_available_optimisations_summary()
+        return (
+            "You are a GPU optimisation expert. Given a kernel and a state summary, "
+            "return the top-N optimisation techniques most likely to improve "
+            "performance. Output strict JSON only — a list of length N — with keys: "
+            "`technique` (must match an entry in the AVAILABLE OPTIMISATIONS list "
+            "below), `relevance_score` (float in [0,1]), `description` (one short "
+            "sentence). Do not wrap in markdown fences.\n\n"
+            "Heuristics:\n"
+            "- Memory-bound or bandwidth-bound: prefer SIMD packed types (half2, "
+            "float4) and coalesced access first.\n"
+            "- Compute-bound on sm_70+: prefer tensor-core / wmma when the matrix "
+            "math can be expressed in 16x16 tiles.\n"
+            "- Latency-bound or low-occupancy: prefer occupancy/register-pressure "
+            "techniques before kernel-fusion / tiling.\n\n"
+            "AVAILABLE OPTIMISATIONS:\n"
+            + avail
+        )
+
+    def _build_technique_index(self) -> Dict[str, str]:
+        """Return {technique_name: short description string}."""
+        idx: Dict[str, str] = {}
+        for state_data in self.optimization_strategies.values():
+            for opt in state_data.get("optimizations", []):
+                if opt.technique not in idx:
+                    idx[opt.technique] = (opt.description or "").strip()
+        for comps in self.composite_optimizations.values():
+            for c in comps:
+                cid = c.get_composite_id()
+                if cid not in idx:
+                    idx[cid] = (c.reason or "").strip()
+        return idx
+
+    def get_technique_description(self, name: str) -> str:
+        """Return ~1 KB of technique description, with a short index of siblings."""
+        if self._technique_index is None:
+            # cheap_llm path not active — fall back to building on demand.
+            self._technique_index = self._build_technique_index()
+        desc = self._technique_index.get(name) or ""
+        siblings = [n for n in self._technique_index if n != name][:12]
+        sib_str = ", ".join(siblings)
+        return (
+            f"SELECTED TECHNIQUE: {name}\n"
+            f"DESCRIPTION: {desc or '(no description on file)'}\n\n"
+            f"OTHER AVAILABLE TECHNIQUES: {sib_str}"
+        )
+
+    async def _analyze_performance_state_tiered(
+        self,
+        ncu_report: str,
+        metrics: dict,
+        code_implementation: str,
+        elapsed_cycles: Optional[int] = None,
+    ) -> "StateProfile":
+        """Cheap-LLM dispatch for state analysis. Falls back to deterministic
+        ``_fallback_state_analysis`` if the cheap client is unavailable."""
+        merged_metrics = dict(metrics or {})
+        json_metrics = extract_metrics_json(ncu_report, elapsed_cycles=elapsed_cycles)
+        merged_metrics.update(json_metrics)
+        if elapsed_cycles is not None:
+            merged_metrics.setdefault("elapsed_cycles", int(elapsed_cycles))
+
+        if not self.cheap_llm or not self.cheap_llm.is_available():
+            return self._fallback_state_analysis(ncu_report, metrics)
+
+        user_msg = (
+            "KERNEL SOURCE:\n```cpp\n"
+            f"{code_implementation}\n```\n\n"
+            "NCU METRICS (Speed-Of-Light, JSON):\n"
+            f"{json.dumps(merged_metrics, sort_keys=True)}\n"
+        )
+        try:
+            analysis = await self.cheap_llm.query_layered(
+                self._system_prompt_state,
+                user_msg,
+                max_tokens=600,
+                temperature=0.1,
+            )
+            self._log_llm_interaction("StateAnalysisOpt", user_msg, analysis)
+            return self._parse_state_analysis(analysis)
+        except Exception as e:
+            if self.cheap_llm.logger:
+                self.cheap_llm.logger.warning(f"Optimised state analysis failed: {e}")
+            return self._fallback_state_analysis(ncu_report, metrics)
+
+    async def _generate_optimization_plan_tiered(
+        self,
+        state_analysis_response: str,
+        code_implementation: str,
+        top_n: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Cheap-LLM dispatch for plan generation. Caller is responsible for
+        deciding whether this path is appropriate; on failure it raises so the
+        outer ``generate_optimization_plan`` can fall back to the legacy path."""
+        user_msg = (
+            f"Pick the {top_n} highest-relevance optimisations for this kernel.\n\n"
+            "STATE ANALYSIS:\n"
+            f"{state_analysis_response}\n\n"
+            "KERNEL SOURCE:\n```cpp\n"
+            f"{code_implementation}\n```\n\n"
+            f"Return a JSON array of {top_n} objects with keys "
+            "`technique`, `relevance_score`, `description`. No prose."
+        )
+        llm_resp = await self.cheap_llm.query_layered(
+            self._system_prompt_plan,
+            user_msg,
+            max_tokens=800,
+            temperature=0.1,
+        )
+        self._log_llm_interaction("OptPlanOpt", user_msg, llm_resp)
+        return self._parse_optimization_plan(llm_resp, top_n)
+
+    def build_codegen_messages(
+        self,
+        *,
+        technique_name: str,
+        kernel_source: str,
+        ncu_metrics_json: Dict[str, Any],
+        strategy_description: str = "",
+        best_so_far_summary: Optional[str] = None,
+    ) -> List[Dict[str, str]]:
+        """Build a system+user message pair for codegen with cache-stable system text.
+
+        Replaces the legacy ~6 KB ``generate_strategy_guided_prompt`` system block —
+        identical across all codegen calls in a run, so prefix caches will charge
+        cached input price for it.
+        """
+        if self._technique_index is None:
+            self._technique_index = self._build_technique_index()
+        system_prompt = (
+            "You are an expert CUDA optimisation engineer. You receive an "
+            "optimisation technique to apply, a kernel source, and a JSON of NCU "
+            "metrics. Apply the technique to the kernel and emit the COMPLETE "
+            "rewritten CUDA file in a single ```cpp``` code block.\n\n"
+            "Hard rules:\n"
+            "- Output ONLY the rewritten CUDA file in one ```cpp``` block. No prose.\n"
+            "- The kernel must compile under nvcc with no extra includes beyond\n"
+            "  `<cuda_runtime.h>`, `<cuda_fp16.h>`, `<cuda_bf16.h>`, `<cstdint>`,\n"
+            "  `<torch/extension.h>` (when the existing file uses it).\n"
+            "- Define every constant before use.\n"
+            "- Preserve the existing `launch_gpu_implementation(...)` signature.\n"
+            "- Preserve the existing `void run(...)` signature when present.\n"
+            "- If the technique cannot be cleanly applied, return the input "
+            "unchanged inside the same ```cpp``` block.\n\n"
+            "AVAILABLE TECHNIQUE INDEX (for reference / fallback choices):\n"
+            + ", ".join(self._technique_index.keys())
+        )
+
+        user_blocks = [
+            self.get_technique_description(technique_name),
+        ]
+        if strategy_description:
+            user_blocks.append(f"STRATEGY NOTE FROM PLAN:\n{strategy_description}")
+        if best_so_far_summary:
+            user_blocks.append(f"PRIOR-STEP CONTEXT:\n{best_so_far_summary}")
+        user_blocks.append(
+            "NCU METRICS (Speed-Of-Light, JSON):\n"
+            f"{json.dumps(ncu_metrics_json, sort_keys=True)}"
+        )
+        user_blocks.append(
+            "CURRENT KERNEL SOURCE:\n```cpp\n" + kernel_source + "\n```"
+        )
+        user_blocks.append(
+            "Apply the SELECTED TECHNIQUE to the source. Return only the rewritten "
+            "CUDA file in a single ```cpp``` code block."
+        )
+
+        return [
+            {"role": "system", "content": "<!-- cache_control: ephemeral -->\n" + system_prompt},
+            {"role": "user", "content": "\n\n".join(user_blocks)},
+        ]
+
+    def build_fix_messages(
+        self,
+        *,
+        broken_kernel: str,
+        compiler_error: str,
+    ) -> List[Dict[str, str]]:
+        """Build a small fix-attempt prompt — bounded payload, no DB injection."""
+        err = compiler_error[:1500]
+        kernel = broken_kernel
+        if len(kernel) > 12000:
+            kernel = kernel[:6000] + "\n// ... [trimmed] ...\n" + kernel[-6000:]
+        system_prompt = (
+            "You are a CUDA compiler-error fixer. Given a kernel that failed to "
+            "compile or run, return the corrected COMPLETE kernel inside a single "
+            "```cpp``` block. Preserve the launcher signature. Do not change the "
+            "intent of the kernel — only fix the error."
+        )
+        user_msg = (
+            "COMPILER / RUNTIME ERROR:\n```\n"
+            f"{err}\n```\n\n"
+            "BROKEN KERNEL:\n```cpp\n"
+            f"{kernel}\n```\n\n"
+            "Return the fixed kernel in one ```cpp``` block."
+        )
+        return [
+            {"role": "system", "content": "<!-- cache_control: ephemeral -->\n" + system_prompt},
+            {"role": "user", "content": user_msg},
+        ]
+
+    # ==================================================================
+    # End Phase 3a tiered-LLM path
+    # ==================================================================
 
     # ------------------------------------------------------------------
     # Helper: parse optimisation plan JSON returned by the LLM

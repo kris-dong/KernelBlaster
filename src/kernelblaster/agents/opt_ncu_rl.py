@@ -335,7 +335,7 @@ class RLNCUAgent(FeedbackAgent):
         if database is not None:
             self.database = database
         else:
-            self.database = OptimizationDatabase(database_path, gpu_report_path, llm_interface)
+            self.database = OptimizationDatabase(database_path, gpu_report_path, llm_interface, backend=self.backend)
         self.replay_buffer = ReplayBuffer(max_size=replay_buffer_size)
         self.max_rollout_steps = max_rollout_steps
         self.update_frequency = update_frequency
