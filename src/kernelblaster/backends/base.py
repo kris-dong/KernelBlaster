@@ -132,3 +132,30 @@ class Backend(ABC):
         ``memory_coalescing_optimization``; OpenCL uses entries from
         ``technique_map`` like ``1.1_coalesced_access``).
         """
+
+    # ---- primary performance metric ----
+    # The "primary metric" is the single number each backend uses to rank
+    # kernels: NCU elapsed-cycles for CUDA, OpenCL-event ms for OpenCL.
+    # ``Backend.parse_profile`` returns a ``ProfileResult`` with both fields
+    # populated; ``extract_primary_metric`` selects the one this backend uses.
+    @property
+    @abstractmethod
+    def metric_name(self) -> str:
+        """Short label for the primary metric (``"cycles"`` / ``"ms"``)."""
+
+    @abstractmethod
+    def format_metric(self, value, *, with_unit: bool = True) -> str:
+        """Format a primary-metric value for logs / artifacts.
+
+        CUDA: ``"12345"`` (or ``"12345 cycles"`` with ``with_unit=True``).
+        OpenCL: ``"0.058"`` (or ``"0.058 ms"`` with ``with_unit=True``).
+        ``value`` can be a number or the string sentinel ``"N/A"``.
+        """
+
+    @abstractmethod
+    def extract_primary_metric(self, profile_result: "ProfileResult") -> float:
+        """Pull the canonical metric out of a ``ProfileResult``.
+
+        CUDA: ``profile_result.raw_metrics["elapsed_cycles"]``.
+        OpenCL: ``profile_result.total_time_ms``.
+        """

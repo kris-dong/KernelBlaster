@@ -190,7 +190,10 @@ APPROACH:
 
 @dataclass
 class RLOpenCLFeedback(Feedback):
-    kernel_time_ms: Optional[float] = None
+    # ``metric`` is the primary backend metric (OpenCL kernel time in ms).
+    # Renamed from ``kernel_time_ms`` in Phase 4d to harmonize with the
+    # CUDA feedback shape.
+    metric: Optional[float] = None
     profile_output: Optional[str] = None
     optimization_technique: Optional[str] = None
     predicted_improvement: Optional[float] = None
@@ -242,8 +245,8 @@ class RLOpenCLAgent(FeedbackAgent):
 
         self.iteration_count = 0
         self.total_trajectories = 0
-        self.best_time_ms = float('inf')
-        self.initial_time_ms = None
+        self.best_metric = float('inf')
+        self.initial_metric = None
 
         self._trajectory_lock: asyncio.Lock = asyncio.Lock()
         self.current_trajectory = None
@@ -286,7 +289,7 @@ class RLOpenCLAgent(FeedbackAgent):
             # when this is serialized, so we just keep the raw body.
             self._global_best_code = text
             self._global_best_source = Path(kernel_filepath)
-            self.best_time_ms = time_ms
+            self.best_metric = time_ms
             self.agent_logger.info(
                 f"[Global best] {time_ms:.3f} ms ({kernel_filepath.name})"
             )
@@ -409,8 +412,8 @@ class RLOpenCLAgent(FeedbackAgent):
         self.agent_logger.info("Gathering initial OpenCL profiling data...")
         try:
             profile_output, _, time_ms = await self.gather_perf_metrics(self.kernel_to_optimize_fp)
-            self.initial_time_ms = time_ms
-            self.best_time_ms = time_ms
+            self.initial_metric = time_ms
+            self.best_metric = time_ms
             self.last_profile_output = profile_output
 
             initial_state = await self._get_state(profile_output, self.kernel_to_optimize, time_ms)
@@ -455,11 +458,11 @@ class RLOpenCLAgent(FeedbackAgent):
 
         # `initialize()` may run on the host before `run()`; the reset above clears
         # session tracking, so re-establish the baseline from disk + recorded ms.
-        if self.initial_time_ms and math.isfinite(self.initial_time_ms) and (self.folder / "init.cl").exists():
-            await self._record_global_best_if_better(self.folder / "init.cl", self.initial_time_ms)
+        if self.initial_metric and math.isfinite(self.initial_metric) and (self.folder / "init.cl").exists():
+            await self._record_global_best_if_better(self.folder / "init.cl", self.initial_metric)
 
         initial_state = await self._get_state(
-            self.last_profile_output, self.kernel_to_optimize, self.initial_time_ms or 0.0
+            self.last_profile_output, self.kernel_to_optimize, self.initial_metric or 0.0
         )
 
         async def _run_single_iteration(idx: int):
@@ -517,12 +520,12 @@ class RLOpenCLAgent(FeedbackAgent):
                 f"Global best (verified): {g_time:.3f} ms -> {gp.name} "
                 f"(per-iter min: {best_time if best_time < float('inf') else 'n/a'})"
             )
-        if g_code is not None and self.initial_time_ms is not None and g_time < self.initial_time_ms:
+        if g_code is not None and self.initial_metric is not None and g_time < self.initial_metric:
             final = self.folder / "success_rl_optimization.cl"
             final.write_text(self._format_global_best_artifact(g_code, g_time), encoding="utf-8")
             return final
 
-        if best_filename is not None and self.initial_time_ms is not None and best_time < self.initial_time_ms:
+        if best_filename is not None and self.initial_metric is not None and best_time < self.initial_metric:
             # Fallback: global tracking unavailable but iteration picked a true improvement.
             final = self.folder / "success_rl_optimization.cl"
             final.write_text(best_filename.read_text(encoding="utf-8"), encoding="utf-8")
@@ -530,7 +533,7 @@ class RLOpenCLAgent(FeedbackAgent):
 
         if best_filename is not None or g_code is not None:
             failure_file = self.folder / "failure_rl_optimization.cl"
-            baseline_str = f"{self.initial_time_ms:.3f} ms" if self.initial_time_ms is not None else "N/A"
+            baseline_str = f"{self.initial_metric:.3f} ms" if self.initial_metric is not None else "N/A"
             failure_file.write_text(
                 self.kernel_to_optimize + f"\n\n// Baseline: {baseline_str}\n"
             )
@@ -538,7 +541,7 @@ class RLOpenCLAgent(FeedbackAgent):
             return failure_file
 
         failure_file = self.folder / "failure_rl_optimization.cl"
-        baseline_str = f"{self.initial_time_ms:.3f} ms" if self.initial_time_ms is not None else "N/A"
+        baseline_str = f"{self.initial_metric:.3f} ms" if self.initial_metric is not None else "N/A"
         failure_file.write_text(
             self.kernel_to_optimize + f"\n\n// Baseline: {baseline_str}\n"
         )
@@ -564,7 +567,7 @@ class RLOpenCLAgent(FeedbackAgent):
         trajectory = Trajectory()
         current_code = initial_code
         current_state = initial_state
-        current_time_ms = self.initial_time_ms
+        current_time_ms = self.initial_metric
         last_profile = getattr(self, "last_profile_output", "")
 
         self.agent_logger.info(f"Starting rollout from state: {current_state}")
@@ -895,7 +898,7 @@ class RLOpenCLAgent(FeedbackAgent):
     # Feedback (for use via the base FeedbackAgent run loop)
     # ------------------------------------------------------------------
     async def get_feedback(self, response, attempt_id, task_id, logger) -> Feedback:
-        if self.initial_time_ms is None:
+        if self.initial_metric is None:
             await self.initialize()
 
         logger.info(f"Starting RL optimisation trajectory for task {task_id}")
@@ -934,8 +937,8 @@ class RLOpenCLAgent(FeedbackAgent):
                     best_kernel = best_step.code
                     best_action = best_step.action
 
-                if self.initial_time_ms and self.initial_time_ms > 0:
-                    improvement_pct = ((self.initial_time_ms - best_ms) / self.initial_time_ms) * 100
+                if self.initial_metric and self.initial_metric > 0:
+                    improvement_pct = ((self.initial_metric - best_ms) / self.initial_metric) * 100
                 else:
                     improvement_pct = 0.0
                 bstep = min(trajectory.steps, key=lambda s: s.cycles) if trajectory.steps else None
@@ -943,7 +946,7 @@ class RLOpenCLAgent(FeedbackAgent):
                 feedback_msg = (
                     f"Optimisation trajectory completed with {len(trajectory.steps)} steps.\n\n"
                     f"BEST RESULT (fastest verified kernel this session):\n"
-                    f"- Time: {best_ms:.3f} ms (vs initial: {self.initial_time_ms:.3f} ms)\n"
+                    f"- Time: {best_ms:.3f} ms (vs initial: {self.initial_metric:.3f} ms)\n"
                     f"- Improvement: {improvement_pct:.1f}%\n"
                     f"- Best technique (in-trajectory min): {bstep.action if bstep else 'n/a'}\n"
                     f"- Total reward: {trajectory.total_reward:.2f}\n\n"
@@ -965,7 +968,7 @@ class RLOpenCLAgent(FeedbackAgent):
                     success=True,
                     filename=str(best_file),
                     contents=best_kernel,
-                    kernel_time_ms=best_ms,
+                    metric=best_ms,
                     profile_output=profile_output,
                     optimization_technique=best_action,
                     predicted_improvement=bstep.predicted_improvement if bstep else 0.0,
@@ -979,7 +982,7 @@ class RLOpenCLAgent(FeedbackAgent):
                         {"role": "user", "content": "No successful optimisation steps completed. Try a different approach."},
                     ],
                     success=False,
-                    kernel_time_ms=time_ms,
+                    metric=time_ms,
                     profile_output=profile_output,
                     state=initial_state,
                 )
@@ -999,11 +1002,11 @@ class RLOpenCLAgent(FeedbackAgent):
         return {
             'total_trajectories': self.total_trajectories,
             'iteration_count': self.iteration_count,
-            'initial_time_ms': self.initial_time_ms,
-            'best_time_ms': self.best_time_ms,
+            'initial_time_ms': self.initial_metric,
+            'best_time_ms': self.best_metric,
             'overall_improvement': (
-                ((self.initial_time_ms - self.best_time_ms) / self.initial_time_ms * 100)
-                if self.initial_time_ms else 0
+                ((self.initial_metric - self.best_metric) / self.initial_metric * 100)
+                if self.initial_metric else 0
             ),
             'buffer_stats': self.replay_buffer.get_statistics(),
             'database_stats': self.database.get_database_stats(),

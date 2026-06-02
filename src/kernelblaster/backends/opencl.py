@@ -173,6 +173,21 @@ class OpenCLBackend(Backend):
     def get_default_optimizations(self) -> Mapping[str, list[tuple[str, float]]]:
         return _OPENCL_DEFAULT_OPTIMIZATIONS
 
+    # ---- primary metric ----
+    @property
+    def metric_name(self) -> str:
+        return "ms"
+
+    def format_metric(self, value, *, with_unit: bool = True) -> str:
+        if isinstance(value, (int, float)):
+            s = f"{float(value):.3f}"
+        else:
+            s = str(value)
+        return f"{s} ms" if with_unit else s
+
+    def extract_primary_metric(self, profile_result: ProfileResult) -> float:
+        return float(profile_result.total_time_ms)
+
     # ---- LLM response handling ----
     def extract_code_from_response(self, response_text: str) -> str | None:
         """OpenCL: prefer ```c, fall back to ```opencl."""

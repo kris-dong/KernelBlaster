@@ -177,6 +177,21 @@ class CUDABackend(Backend):
     def get_default_optimizations(self) -> Mapping[str, list[tuple[str, float]]]:
         return _CUDA_DEFAULT_OPTIMIZATIONS
 
+    # ---- primary metric ----
+    @property
+    def metric_name(self) -> str:
+        return "cycles"
+
+    def format_metric(self, value, *, with_unit: bool = True) -> str:
+        if isinstance(value, (int, float)):
+            s = f"{int(value)}"
+        else:
+            s = str(value)
+        return f"{s} cycles" if with_unit else s
+
+    def extract_primary_metric(self, profile_result: ProfileResult) -> float:
+        return float(profile_result.raw_metrics.get("elapsed_cycles", 0))
+
     # ---- LLM response handling ----
     def extract_code_from_response(self, response_text: str) -> str | None:
         """CUDA uses the ```cpp tag."""

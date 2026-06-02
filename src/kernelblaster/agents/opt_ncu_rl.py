@@ -288,7 +288,10 @@ APPROACH:
 
 @dataclass
 class RLNCUFeedback(Feedback):
-    elapsed_cycles: Optional[int] = None
+    # ``metric`` is the primary backend metric (NCU elapsed cycles for CUDA).
+    # Renamed from ``elapsed_cycles`` in Phase 4d to harmonize with the
+    # OpenCL feedback shape.
+    metric: Optional[float] = None
     ncu_log: Optional[str] = None
     annotated_ncu: Optional[str] = None
     optimization_technique: Optional[str] = None
@@ -345,8 +348,8 @@ class RLNCUAgent(FeedbackAgent):
         # Tracking
         self.iteration_count = 0
         self.total_trajectories = 0
-        self.best_cycles = float('inf')
-        self.initial_cycles = None
+        self.best_metric = float('inf')
+        self.initial_metric = None
         
         # Concurrency helpers
         import asyncio as _asyncio
@@ -369,8 +372,8 @@ class RLNCUAgent(FeedbackAgent):
             annotated_ncu, init_ncu_log, _, cycles = await self.gather_perf_metrics(
                 self.code_to_optimize_fp
             )
-            self.initial_cycles = cycles
-            self.best_cycles = cycles
+            self.initial_metric = cycles
+            self.best_metric = cycles
 
             # Persist first NCU log so subsequent steps can perform analysis
             self.last_ncu_log = init_ncu_log
@@ -396,7 +399,7 @@ class RLNCUAgent(FeedbackAgent):
             init_metrics = {}
             initial_state_profile = self.database._fallback_state_analysis("", init_metrics)
             initial_state = initial_state_profile.state_name
-            # Leave self.initial_cycles unchanged (None by default). Keep best_cycles as-is.
+            # Leave self.initial_metric unchanged (None by default). Keep best_cycles as-is.
             # Persist placeholder NCU log for downstream steps
             self.last_ncu_log = ""
 
@@ -425,7 +428,7 @@ class RLNCUAgent(FeedbackAgent):
             self.last_ncu_log,
             parse_ncu_metrics(self.last_ncu_log),
             self.code_to_optimize,
-            elapsed_cycles=self.initial_cycles,
+            elapsed_cycles=self.initial_metric,
         )
 
         async def _run_single_iteration(iteration_idx: int):
@@ -487,26 +490,26 @@ class RLNCUAgent(FeedbackAgent):
         if best_filename is not None:
             # Ensure we have baseline cycles to judge improvement.
             try:
-                if self.initial_cycles is None:
+                if self.initial_metric is None:
                     init_fp = getattr(self, "code_to_optimize_fp", None)
                     if not init_fp or not init_fp.exists():
                         self.code_to_optimize_fp = self.folder / "init.cu"
                         self.code_to_optimize_fp.write_text(self.code_to_optimize)
                     _, _, _, baseline_cycles = await self.gather_perf_metrics(self.code_to_optimize_fp)
-                    self.initial_cycles = baseline_cycles
+                    self.initial_metric = baseline_cycles
             except Exception as e:
                 self.agent_logger.warning(
                     f"Failed to obtain baseline cycles before finalizing result: {e}"
                 )
 
             # Decide success vs failure based on improvement over baseline.
-            if self.initial_cycles is not None and best_cycles < self.initial_cycles:
+            if self.initial_metric is not None and best_cycles < self.initial_metric:
                 final_filename = self.folder / "success_rl_optimization.cu"
                 final_filename.write_text(best_filename.read_text())
                 return final_filename
 
             failure_file = self.folder / "failure_rl_optimization.cu"
-            baseline_str = self.initial_cycles if self.initial_cycles is not None else "N/A"
+            baseline_str = self.initial_metric if self.initial_metric is not None else "N/A"
             try:
                 failure_file.write_text(
                     self.backend.format_result_artifact(self.code_to_optimize, baseline_str)
@@ -527,18 +530,18 @@ class RLNCUAgent(FeedbackAgent):
 
         # No trajectory produced a candidate. Still write a failure file (with baseline if available).
         try:
-            if self.initial_cycles is None:
+            if self.initial_metric is None:
                 init_fp = getattr(self, "code_to_optimize_fp", None)
                 if not init_fp or not init_fp.exists():
                     self.code_to_optimize_fp = self.folder / "init.cu"
                     self.code_to_optimize_fp.write_text(self.code_to_optimize)
                 _, _, _, cycles = await self.gather_perf_metrics(self.code_to_optimize_fp)
-                self.initial_cycles = cycles
-                self.best_cycles = min(self.best_cycles, cycles) if self.best_cycles else cycles
+                self.initial_metric = cycles
+                self.best_metric = min(self.best_metric, cycles) if self.best_metric else cycles
         except Exception as e:
             self.agent_logger.warning(f"Failed to obtain baseline cycles for original code: {e}")
 
-        fallback_cycles = self.initial_cycles if self.initial_cycles is not None else "N/A"
+        fallback_cycles = self.initial_metric if self.initial_metric is not None else "N/A"
         failure_file = self.folder / "failure_rl_optimization.cu"
         try:
             failure_file.write_text(self.backend.format_result_artifact(self.code_to_optimize, fallback_cycles))
@@ -933,7 +936,7 @@ class RLNCUAgent(FeedbackAgent):
 
         current_code: str = initial_code
         current_state: str = initial_state
-        current_cycles: int = self.initial_cycles
+        current_cycles: int = self.initial_metric
         last_ncu_log: str = getattr(self, "last_ncu_log", "")
         
         self.agent_logger.info(f"Starting rollout from state: {current_state}")
@@ -1501,7 +1504,7 @@ class RLNCUAgent(FeedbackAgent):
         """Main feedback loop implementing the RL algorithm."""
         
         # Initialize if this is the first call
-        if self.initial_cycles is None:
+        if self.initial_metric is None:
             await self.initialize()
         
         # Start a new trajectory for this task
@@ -1525,8 +1528,8 @@ class RLNCUAgent(FeedbackAgent):
             self.total_trajectories += 1
             
             # Update best performance
-            if trajectory.final_cycles < self.best_cycles:
-                self.best_cycles = trajectory.final_cycles
+            if trajectory.final_cycles < self.best_metric:
+                self.best_metric = trajectory.final_cycles
                 is_faster = True
             else:
                 is_faster = False
@@ -1534,15 +1537,15 @@ class RLNCUAgent(FeedbackAgent):
             # Prepare feedback messages
             if trajectory.steps:
                 best_step = min(trajectory.steps, key=lambda s: s.cycles)
-                if self.initial_cycles is not None and self.initial_cycles > 0:
-                    improvement_pct = ((self.initial_cycles - best_step.cycles) / self.initial_cycles) * 100
+                if self.initial_metric is not None and self.initial_metric > 0:
+                    improvement_pct = ((self.initial_metric - best_step.cycles) / self.initial_metric) * 100
                 else:
                     improvement_pct = 0.0
                 
                 feedback_msg = f"""Optimization trajectory completed with {len(trajectory.steps)} steps.
 
 BEST RESULT:
-- Cycles: {best_step.cycles} (vs initial: {self.initial_cycles})
+- Cycles: {best_step.cycles} (vs initial: {self.initial_metric})
 - Overall improvement: {improvement_pct:.1f}%
 - Best technique: {best_step.action}
 - Total reward: {trajectory.total_reward:.2f}
@@ -1568,7 +1571,7 @@ The optimization process is learning and adapting. Continue with further optimiz
                     success=True,  # Consider successful if we completed a trajectory
                     filename=str(best_file),
                     contents=best_step.code,
-                    elapsed_cycles=best_step.cycles,
+                    metric=best_step.cycles,
                     ncu_log=ncu_log,
                     annotated_ncu=annotated_ncu,
                     optimization_technique=best_step.action,
@@ -1584,7 +1587,7 @@ The optimization process is learning and adapting. Continue with further optimiz
                         {"role": "user", "content": "No successful optimization steps completed. Please try a different approach."}
                     ],
                     success=False,
-                    elapsed_cycles=cycles,
+                    metric=cycles,
                     ncu_log=ncu_log,
                     annotated_ncu=annotated_ncu,
                     state=initial_state
@@ -1628,9 +1631,9 @@ The optimization process is learning and adapting. Continue with further optimiz
         return {
             'total_trajectories': self.total_trajectories,
             'iteration_count': self.iteration_count,
-            'initial_cycles': self.initial_cycles,
-            'best_cycles': self.best_cycles,
-            'overall_improvement': ((self.initial_cycles - self.best_cycles) / self.initial_cycles * 100) if self.initial_cycles else 0,
+            'initial_cycles': self.initial_metric,
+            'best_cycles': self.best_metric,
+            'overall_improvement': ((self.initial_metric - self.best_metric) / self.initial_metric * 100) if self.initial_metric else 0,
             'buffer_stats': self.replay_buffer.get_statistics(),
             'database_stats': self.database.get_database_stats()
         } 
