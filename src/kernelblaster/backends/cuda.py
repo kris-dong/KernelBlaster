@@ -146,3 +146,35 @@ class CUDABackend(Backend):
 
     def best_filename(self) -> str:
         return "global_best_rl_optimization.cu"
+
+    # ---- LLM response handling ----
+    def extract_code_from_response(self, response_text: str) -> str | None:
+        """CUDA uses the ```cpp tag."""
+        from ..agents.utils import extract_code_from_response as _extract
+        return _extract(response_text, tag="cpp")
+
+    # ---- result artifact formatting ----
+    _CYCLES_FOOTER_RE = None  # lazy-compiled in format_result_artifact
+
+    def format_result_artifact(self, code: str, metric_value) -> str:
+        """Append ``// Elapsed Cycles: <value>`` and strip any prior matching footer.
+
+        ``metric_value`` is typically an int (cycles) but accepts a string
+        sentinel (e.g. ``"N/A"``) for failure-path artifacts — the prior
+        inline call sites stringified directly via f-string, so we preserve
+        that flexibility.
+        """
+        import re
+
+        if CUDABackend._CYCLES_FOOTER_RE is None:
+            # Match "Elapsed Cycles: <digits>" OR "Elapsed Cycles: N/A" (failure path).
+            CUDABackend._CYCLES_FOOTER_RE = re.compile(
+                r"\n*//\s*Elapsed Cycles:\s*(?:\d+|N/A)\s*$",
+                re.IGNORECASE | re.MULTILINE,
+            )
+        body = CUDABackend._CYCLES_FOOTER_RE.sub("", code).rstrip()
+        if isinstance(metric_value, (int, float)):
+            metric_str = f"{int(metric_value)}"
+        else:
+            metric_str = str(metric_value)
+        return f"{body}\n\n// Elapsed Cycles: {metric_str}\n"

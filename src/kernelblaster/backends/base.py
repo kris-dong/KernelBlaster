@@ -98,3 +98,25 @@ class Backend(ABC):
     @abstractmethod
     def best_filename(self) -> str:
         """Filename for the trajectory-best kernel (e.g. ``global_best_rl_optimization.cu``)."""
+
+    # ---- LLM response handling ----
+    @abstractmethod
+    def extract_code_from_response(self, response_text: str) -> str | None:
+        """Pull kernel code out of an LLM response, using the backend's expected
+        code-block tags (CUDA: ``cpp``; OpenCL: ``c`` falling back to ``opencl``).
+
+        Returns ``None`` if no code block matched — callers raise a
+        ``FeedbackError`` so the LLM can be re-prompted.
+        """
+
+    # ---- result artifact formatting ----
+    @abstractmethod
+    def format_result_artifact(self, code: str, metric_value: float) -> str:
+        """Append the backend's canonical performance footer to ``code``.
+
+        Any existing footer of the same shape is stripped first so re-formatting
+        a previously-annotated kernel doesn't produce double footers.
+
+        CUDA footer:  ``// Elapsed Cycles: <int>``
+        OpenCL footer: ``// Kernel time: <float> ms``
+        """

@@ -141,3 +141,27 @@ class OpenCLBackend(Backend):
 
     def best_filename(self) -> str:
         return "global_best_rl_optimization.cl"
+
+    # ---- LLM response handling ----
+    def extract_code_from_response(self, response_text: str) -> str | None:
+        """OpenCL: prefer ```c, fall back to ```opencl."""
+        from ..agents.utils import extract_code_from_response as _extract
+        code = _extract(response_text, tag="c")
+        if code is None:
+            code = _extract(response_text, tag="opencl")
+        return code
+
+    # ---- result artifact formatting ----
+    _KERNEL_TIME_FOOTER_RE = None  # lazy-compiled in format_result_artifact
+
+    def format_result_artifact(self, code: str, metric_value: float) -> str:
+        """Append ``// Kernel time: <float> ms``; strip prior matching footer first."""
+        import re
+
+        if OpenCLBackend._KERNEL_TIME_FOOTER_RE is None:
+            OpenCLBackend._KERNEL_TIME_FOOTER_RE = re.compile(
+                r"\n*//\s*Kernel time:\s*[0-9]+(?:\.[0-9]+)?\s*ms\s*$",
+                re.IGNORECASE | re.MULTILINE,
+            )
+        body = OpenCLBackend._KERNEL_TIME_FOOTER_RE.sub("", code).rstrip()
+        return f"{body}\n\n// Kernel time: {metric_value:.3f} ms\n"

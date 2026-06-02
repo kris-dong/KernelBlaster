@@ -458,7 +458,7 @@ class RLNCUAgent(FeedbackAgent):
                     best_cycles = best_step.cycles
                     best_filename_path = self.folder / f"rl_iter_{iteration_idx}_best.cu"
                     best_filename_path.write_text(
-                        best_step.code + f"\n\n// Elapsed Cycles: {best_step.cycles}\n")
+                        self.backend.format_result_artifact(best_step.code, best_step.cycles))
                     best_filename = best_filename_path
                     self.agent_logger.info(
                         f"[Async] New best result from iter {iteration_idx}: {best_cycles} cycles")
@@ -509,14 +509,14 @@ class RLNCUAgent(FeedbackAgent):
             baseline_str = self.initial_cycles if self.initial_cycles is not None else "N/A"
             try:
                 failure_file.write_text(
-                    self.code_to_optimize + f"\n\n// Elapsed Cycles: {baseline_str}\n"
+                    self.backend.format_result_artifact(self.code_to_optimize, baseline_str)
                 )
             except Exception:
                 try:
                     init_fp = getattr(self, "code_to_optimize_fp", None)
                     if init_fp and init_fp.exists():
                         failure_file.write_text(
-                            init_fp.read_text() + f"\n\n// Elapsed Cycles: {baseline_str}\n"
+                            self.backend.format_result_artifact(init_fp.read_text(), baseline_str)
                         )
                 except Exception:
                     pass
@@ -541,12 +541,12 @@ class RLNCUAgent(FeedbackAgent):
         fallback_cycles = self.initial_cycles if self.initial_cycles is not None else "N/A"
         failure_file = self.folder / "failure_rl_optimization.cu"
         try:
-            failure_file.write_text(self.code_to_optimize + f"\n\n// Elapsed Cycles: {fallback_cycles}\n")
+            failure_file.write_text(self.backend.format_result_artifact(self.code_to_optimize, fallback_cycles))
         except Exception:
             try:
                 init_fp = getattr(self, "code_to_optimize_fp", None)
                 if init_fp and init_fp.exists():
-                    failure_file.write_text(init_fp.read_text() + f"\n\n// Elapsed Cycles: {fallback_cycles}\n")
+                    failure_file.write_text(self.backend.format_result_artifact(init_fp.read_text(), fallback_cycles))
             except Exception:
                 pass
         self.agent_logger.error(

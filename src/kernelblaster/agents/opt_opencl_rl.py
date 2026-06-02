@@ -25,15 +25,11 @@ from .utils import (
     compile_and_run_opencl,
     NamedTimer,
     generate_code_retry,
-    extract_code_from_response,
     write_code_to_file,
 )
 from .database import LLMInterface
 
-# Strip a trailing "Kernel time" footer we add when persisting best kernels.
-_KERNEL_TIME_FOOTER_RE = re.compile(
-    r"\n*//\s*Kernel time:\s*[0-9]+(?:\.[0-9]+)?\s*ms\s*$", re.IGNORECASE | re.MULTILINE
-)
+# Kernel-time footer regex moved to OpenCLBackend.format_result_artifact (Phase 4b).
 
 
 def parse_opencl_profile(stdout: str) -> Dict[str, float]:
@@ -263,8 +259,8 @@ class RLOpenCLAgent(FeedbackAgent):
         self._global_best_source: Optional[Path] = None
 
     def _format_global_best_artifact(self, code: str, time_ms: float) -> str:
-        body = _KERNEL_TIME_FOOTER_RE.sub("", code).rstrip()
-        return f"{body}\n\n// Kernel time: {time_ms:.3f} ms\n"
+        # Backend owns the footer format — see OpenCLBackend.format_result_artifact.
+        return self.backend.format_result_artifact(code, time_ms)
 
     async def _reset_global_best_for_run(self) -> None:
         async with self._global_best_lock:
@@ -285,7 +281,10 @@ class RLOpenCLAgent(FeedbackAgent):
             if time_ms >= self._global_best_time_ms:
                 return
             self._global_best_time_ms = time_ms
-            self._global_best_code = _KERNEL_TIME_FOOTER_RE.sub("", text).rstrip()
+            # Store body without the footer; _format_global_best_artifact
+            # (-> backend.format_result_artifact) will re-strip and re-append
+            # when this is serialized, so we just keep the raw body.
+            self._global_best_code = text
             self._global_best_source = Path(kernel_filepath)
             self.best_time_ms = time_ms
             self.agent_logger.info(
@@ -301,9 +300,8 @@ class RLOpenCLAgent(FeedbackAgent):
     def get_code_from_response(
         self, response, attempt_id, task_id, logger
     ) -> tuple[str, Path]:
-        code = extract_code_from_response(response, tag="c")
-        if code is None:
-            code = extract_code_from_response(response, tag="opencl")
+        # Backend owns tag preferences (OpenCL: ```c -> ```opencl).
+        code = self.backend.extract_code_from_response(response)
         if code is None:
             raise FeedbackError(
                 "Error: The code should be contained within ```c and ``` tags."
@@ -486,7 +484,7 @@ class RLOpenCLAgent(FeedbackAgent):
                 if step_time < best_time:
                     best_time = step_time
                     fp = self.folder / f"rl_iter_{idx}_best.cl"
-                    fp.write_text(best_step.code + f"\n\n// Kernel time: {step_time:.3f} ms\n")
+                    fp.write_text(self.backend.format_result_artifact(best_step.code, step_time))
                     best_filename = fp
                     self.agent_logger.info(f"[Async] New best from iter {idx}: {best_time:.3f} ms")
 
@@ -968,10 +966,10 @@ class RLOpenCLAgent(FeedbackAgent):
                 )
 
                 best_file = self.folder / f"best_task_{task_id}.cl"
+                # backend.format_result_artifact already strips any existing footer
+                # before re-applying, so no need to pre-strip _KERNEL_TIME_FOOTER_RE here.
                 best_file.write_text(
-                    self._format_global_best_artifact(
-                        _KERNEL_TIME_FOOTER_RE.sub("", best_kernel).rstrip(), best_ms
-                    )
+                    self.backend.format_result_artifact(best_kernel, best_ms)
                 )
 
                 return RLOpenCLFeedback(
