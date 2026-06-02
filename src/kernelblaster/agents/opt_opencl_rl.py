@@ -344,6 +344,25 @@ class RLOpenCLAgent(FeedbackAgent):
 
         await self._record_global_best_if_better(kernel_filepath, total_ms)
 
+        # Phase 3c: persist a structured ProfileResult next to the kernel
+        # so downstream tooling (analytics, future speedup-tracker) can read
+        # JSON instead of regex-parsing driver stdout. raw_log is filtered to
+        # just the [PROFILE] lines — keeping the full ~100KB driver dump per
+        # step would balloon the run tree for no real gain.
+        try:
+            pr = self.backend.parse_profile(profile_output)
+            pr.raw_log = "\n".join(
+                ln for ln in profile_output.splitlines() if "[PROFILE]" in ln
+            )
+            profile_json_path = kernel_filepath.with_suffix(".profile.json")
+            pr.write_json(profile_json_path)
+        except Exception as e:
+            # Persistence is best-effort — don't break the RL loop if the
+            # filesystem hiccups or parse_profile chokes on weird output.
+            self.agent_logger.warning(
+                f"Failed to write profile.json for {kernel_filepath.name}: {e}"
+            )
+
         return profile_output, stderr_text, total_ms
 
     async def _generate_reference(self):

@@ -691,6 +691,110 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# T6 — Phase 3c: profile.json written alongside profiled kernels (board)
+# ---------------------------------------------------------------------------
+# Phase 3c wired RLOpenCLAgent.gather_perf_metrics to write a structured
+# profile.json next to each profiled kernel. This test runs the SAME code
+# path (compile via SSH -> exec on board with profile=true -> parse [PROFILE]
+# -> filter raw_log -> write_json) outside the full agent, since T3.e/T3.f
+# already proved the upstream compile+exec works. We capture the real
+# board-produced stdout and verify the resulting profile.json shape.
+
+if [ "${SKIP_T6:-0}" != "1" ] && [ "${SKIP_T3:-0}" != "1" ]; then
+    if [ -n "${KERNELBLASTER_ADRENO_BOARD_HOST:-}" ] && \
+       ssh -o BatchMode=yes -o ConnectTimeout=5 "$KERNELBLASTER_ADRENO_BOARD_HOST" "echo ok" >/dev/null 2>&1; then
+        echo
+        echo "==== T6: Phase 3c profile.json next to kernel (board exec) ===="
+
+        # Reuse the OpenCL servers from T3 if still running; otherwise the
+        # test will be skipped because the curl below fails.
+        if curl -sf --max-time 2 "http://localhost:2202/health" >/dev/null 2>&1 && \
+           curl -sf --max-time 2 "http://localhost:2203/health" >/dev/null 2>&1; then
+            T6_OUT="$TMPDIR/t6.log"
+            T6_KERNEL="$TMPDIR/t6_kernel/kernel.cl"
+            mkdir -p "$TMPDIR/t6_kernel"
+            cp "$REPO_ROOT/data/benchmark-opencl/L1/19_ReLU/kernel.cl" "$T6_KERNEL"
+            T6_RESP="$TMPDIR/t6_exec_resp.json"
+            # Compile (T3.c-style) — quickly, with a fresh job name
+            if curl -sf --max-time 120 -G "http://localhost:2202/compile_opencl" \
+                --data-urlencode "job_name=verify_t6" \
+                --data-urlencode "main_file=$REPO_ROOT/data/benchmark-opencl/L1/19_ReLU/driver.c" \
+                --data-urlencode "kernel_file=$T6_KERNEL" \
+                --data-urlencode "opencl_version=opencl_2.0" \
+                --data-urlencode "remote=1" \
+                >"$TMPDIR/t6_compile_resp.json" 2>"$TMPDIR/t6_compile.err"; then
+                T6_BIN="$("$PY" -c "import json,sys; print(json.load(open(sys.argv[1])).get('output_path','') or '')" "$TMPDIR/t6_compile_resp.json")"
+                if [ -n "$T6_BIN" ] && curl -sf --max-time 120 -X POST "http://localhost:2203/gpu/binary" \
+                    -F "binary=@$T6_BIN" \
+                    -F "args=" \
+                    -F "n_runs=1" \
+                    -F "timeout=60" \
+                    -F "kernel_files=[\"$T6_KERNEL\"]" \
+                    -F "profile=true" \
+                    >"$T6_RESP" 2>"$TMPDIR/t6_exec.err"; then
+                    # Run Phase 3c integration steps verbatim against the real board stdout
+                    if "$PY" - "$T6_RESP" "$T6_KERNEL" >"$T6_OUT" 2>&1 <<'PYEOF'
+import json, sys
+from pathlib import Path
+
+sys.path.insert(0, ".")
+from src.kernelblaster.backends import get_backend, ProfileResult
+
+resp_path, kernel_path = Path(sys.argv[1]), Path(sys.argv[2])
+resp = json.load(open(resp_path))
+assert resp.get("success"), f"exec failed: {resp.get('message')}"
+out = resp.get("stdout", "")
+if isinstance(out, list): out = "".join(out)
+assert "[PROFILE]" in out, f"no [PROFILE] marker; got: {out[-200:]!r}"
+
+# Mirror the exact Phase 3c integration path in opt_opencl_rl.gather_perf_metrics
+backend = get_backend("opencl")
+pr = backend.parse_profile(out)
+pr.raw_log = "\n".join(ln for ln in out.splitlines() if "[PROFILE]" in ln)
+
+profile_json_path = kernel_path.with_suffix(".profile.json")
+pr.write_json(profile_json_path)
+assert profile_json_path.exists(), f"profile.json not written at {profile_json_path}"
+
+# Read it back; verify shape
+loaded = ProfileResult.read_json(profile_json_path)
+assert loaded.per_kernel_ms, f"per_kernel_ms empty: {loaded.to_dict()}"
+assert loaded.total_time_ms > 0, f"total_time_ms not positive: {loaded.total_time_ms}"
+# raw_log only contains [PROFILE] lines after Phase 3c filtering
+for ln in loaded.raw_log.splitlines():
+    assert "[PROFILE]" in ln, f"non-[PROFILE] line leaked into raw_log: {ln!r}"
+print(f"profile.json written: per_kernel_ms={dict(loaded.per_kernel_ms)} total_ms={loaded.total_time_ms}")
+print(f"raw_log length: {len(loaded.raw_log)} chars (vs full stdout: {len(out)} chars)")
+PYEOF
+                    then
+                        record "T6 profile.json alongside profiled kernel (board)" PASS
+                        tail -2 "$T6_OUT" | sed 's/^/  /'
+                    else
+                        tail -10 "$T6_OUT"
+                        record "T6 profile.json alongside profiled kernel (board)" FAIL
+                    fi
+                else
+                    echo "  /gpu/binary call failed; skipping T6 assertions"
+                    record "T6 profile.json alongside profiled kernel (board)" SKIP
+                fi
+            else
+                echo "  /compile_opencl call failed; skipping T6 assertions"
+                record "T6 profile.json alongside profiled kernel (board)" SKIP
+            fi
+        else
+            echo "  T3 servers not running on :2202/:2203; T6 needs them"
+            record "T6 profile.json alongside profiled kernel (board)" SKIP
+        fi
+    else
+        echo "  board not reachable; skipping T6"
+        record "T6 profile.json alongside profiled kernel (board)" SKIP
+    fi
+else
+    echo
+    echo "==== T6 skipped ===="
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
