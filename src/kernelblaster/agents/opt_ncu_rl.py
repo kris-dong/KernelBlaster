@@ -98,34 +98,21 @@ def generate_strategy_guided_prompt(
     database_content: str = "",
     override_description: str | None = None,
     original_code: str | None = None,
+    backend=None,
 ) -> str:
-    """Generate a prompt that guides the LLM using the comprehensive optimization database."""
-    
-    technique_descriptions = {
-        "1.1_coalesced_access": "Focus on ensuring memory accesses are coalesced. Rearrange thread-to-data mapping so consecutive threads access consecutive memory locations.",
-        "1.1_occupancy_tuning": "Optimize occupancy by tuning threads per block and shared memory usage. Aim for high occupancy while avoiding resource bottlenecks.",
-        "1.1_register_optimization": "Reduce register pressure by minimizing local variables and using shared memory for frequently accessed data.",
-        "1.1_shared_memory_optimization": "Optimize shared memory usage by reducing bank conflicts and improving access patterns.",
-        "1.1_block_size_tuning": "Experiment with different block sizes to maximize occupancy and resource utilization.",
-        "2.1_shared_memory_tiling": "Implement tiling using shared memory to reduce global memory accesses through data reuse.",
-        "2.1_tensor_core_utilization": "Modify the code to use tensor cores by ensuring proper data types (half, bfloat16) and matrix sizes.",
-        "2.2_thread_data_mapping": "Rearrange how threads map to data elements to improve memory access patterns and reduce conflicts.",
-        "2.2_functional_unit_optimization": "Balance the workload across different functional units (ALU, SFU, memory units).",
-        "2.2_instruction_mix_optimization": "Optimize the instruction mix to better utilize available compute resources.",
-        "2.3_data_layout_optimization": "Reorganize data layout in memory to improve cache utilization and memory bandwidth.",
-        "2.3_constant_cache_usage": "Move read-only data to constant memory to leverage the constant cache.",
-        "3.1_increase_thread_count": "Launch more threads by increasing grid size or using multiple kernels.",
-        "3.1_thread_work_remapping": "Remap thread work assignment to reduce warp divergence.",
-        "3.2_work_per_thread_increase": "Increase work per thread through loop unrolling or processing multiple elements per thread.",
-        "3.2_data_layout_for_divergence": "Restructure data layout to minimize control flow divergence.",
-        "3.3_vector_load_usage": "Use vector loads (float2, float4) to process multiple elements efficiently.",
-        "3.4_maximum_occupancy_tuning": "Fine-tune launch parameters to achieve maximum theoretical occupancy.",
-        "4.1_shared_memory_caching": "Cache frequently accessed global memory data in shared memory.",
-        "4.1_shared_memory_bank_conflict_removal": "Eliminate shared memory bank conflicts by padding or restructuring access patterns.",
-        "4.1_register_tiling": "Use register tiling to keep frequently accessed data in registers.",
-        "6.1_thread_coarsening": "Assign multiple work items to each thread to amortize parallelization overhead."
-    }
-    
+    """Generate a prompt that guides the LLM using the comprehensive optimization database.
+
+    The CUDA technique map is sourced from ``backend.technique_map`` (single
+    source of truth — see ``kernelblaster.backends.cuda``). The ``backend``
+    parameter is optional for back-compat; if omitted, the default CUDA backend
+    is constructed lazily. Phase 4b will fold this with the OpenCL prompt
+    function into a single backend-agnostic template.
+    """
+    if backend is None:
+        from ..backends import get_backend
+        backend = get_backend("cuda")
+    technique_descriptions = backend.technique_map
+
     # Handle composite optimizations differently
     if isinstance(optimization_entry, CompositeOptimization):
         # Composite optimization with multiple techniques
@@ -327,7 +314,12 @@ class RLNCUAgent(FeedbackAgent):
     ):
         # Initialize base feedback agent
         super().__init__(fb_config)
-        
+
+        # Phase 2 Backend abstraction: single source of truth for technique map,
+        # file-naming, profile parsing. Routed via gpu.backend() so this picks
+        # CUDABackend for any NVIDIA GPU in fb_config.gpu.
+        self.backend = self.gpu.backend()
+
         self.test_code_fp = fb_config.test_code_fp
         self.test_code = fb_config.test_code_fp.read_text()
         self.code_to_optimize_fp = code_to_optimize_fp
@@ -1260,6 +1252,7 @@ class RLNCUAgent(FeedbackAgent):
             database_content,
             override_description=strategy_description or None,
             original_code=code,  # Pass original code as fallback when annotated_ncu is empty
+            backend=self.backend,
         )
 
         # Persist initial prompt/response

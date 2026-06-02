@@ -61,26 +61,20 @@ def generate_opencl_strategy_prompt(
     database_content: str = "",
     override_description: str | None = None,
     original_code: str | None = None,
+    backend=None,
 ) -> str:
-    """Generate a prompt that guides the LLM to optimise an OpenCL kernel for Adreno."""
+    """Generate a prompt that guides the LLM to optimise an OpenCL kernel for Adreno.
 
-    technique_descriptions = {
-        "1.1_coalesced_access": "Ensure memory accesses are coalesced. Rearrange thread-to-data mapping so consecutive work-items access consecutive memory locations.",
-        "1.1_occupancy_tuning": "Tune work-group size and local memory usage to maximise GPU occupancy on Adreno.",
-        "1.1_vectorized_access": "Use OpenCL vector types (float4, int4) to widen memory transactions and improve bandwidth utilisation.",
-        "2.1_local_memory_tiling": "Tile data into __local memory to exploit data reuse and reduce global memory traffic.",
-        "2.1_register_tiling": "Increase work per work-item by computing multiple output elements, keeping intermediate results in private registers.",
-        "2.2_work_group_size_tuning": "Experiment with different local work-group dimensions to match Adreno SP/TP architecture.",
-        "2.2_texture_memory": "Use image/texture objects or read_only __global with __attribute__((nosvm)) for read-heavy data to exploit texture cache.",
-        "2.3_data_layout_optimization": "Reorganise data layout (SoA vs AoS, padding) to improve cache line utilisation.",
-        "3.1_work_per_item_increase": "Increase arithmetic intensity per work-item through loop unrolling or computing multiple outputs.",
-        "3.2_barrier_reduction": "Minimise barrier() calls by restructuring algorithms to reduce synchronisation points.",
-        "3.3_mad_fma_usage": "Use mad() / fma() and -cl-mad-enable to exploit fused multiply-add hardware.",
-        "3.4_half_precision": "Use half/half4 types where precision allows to double throughput on Adreno ALUs.",
-        "4.1_local_memory_bank_conflicts": "Pad or rearrange __local memory access patterns to avoid bank conflicts.",
-        "4.1_async_copy": "Use async_work_group_copy for DMA-style transfers between global and local memory.",
-        "6.1_thread_coarsening": "Assign multiple output elements to each work-item to amortise launch and synchronisation overhead.",
-    }
+    The Adreno-tuned technique map is sourced from ``backend.technique_map``
+    (single source of truth — see ``kernelblaster.backends.opencl``). The
+    ``backend`` parameter is optional for back-compat; if omitted, the default
+    OpenCL backend is constructed lazily. Phase 4b will fold this with the
+    CUDA prompt function into a single backend-agnostic template.
+    """
+    if backend is None:
+        from ..backends import get_backend
+        backend = get_backend("opencl")
+    technique_descriptions = backend.technique_map
 
     source_display = kernel_source if kernel_source.strip() else (original_code or "// Source code not available")
 
@@ -225,6 +219,11 @@ class RLOpenCLAgent(FeedbackAgent):
         database: Optional[OptimizationDatabase] = None,
     ):
         super().__init__(fb_config)
+
+        # Phase 2 Backend abstraction: single source of truth for technique map,
+        # board_host, file-naming, profile parsing. Picks OpenCLBackend for any
+        # Adreno GPU in fb_config.gpu.
+        self.backend = self.gpu.backend()
 
         self.test_code_fp = fb_config.test_code_fp  # driver.c
         self.test_code = fb_config.test_code_fp.read_text()
@@ -780,6 +779,7 @@ class RLOpenCLAgent(FeedbackAgent):
             database_content,
             override_description=strategy_description or None,
             original_code=code,
+            backend=self.backend,
         )
 
         response = await generate_code_retry(
