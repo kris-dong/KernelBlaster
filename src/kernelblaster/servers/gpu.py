@@ -28,7 +28,7 @@ import stat
 from typing import Optional
 
 from .server_logging import get_log_config
-from .utils import safe_kill_process
+from .utils.subprocess import run_subprocess_shell
 
 env = None
 
@@ -190,48 +190,37 @@ async def exec_command(
     env_vars: Optional[dict] = None,
     n_runs: Optional[int] = 1,
 ) -> tuple[list[str], list[str]] | tuple[str, str]:
-    """Execute a shell command"""
-    # Prepare environment
+    """Execute a shell command (possibly multiple times).
+
+    Subprocess plumbing — timeout, SIGKILL-on-timeout, non-zero-exit
+    diagnostics — is handled by ``run_subprocess_shell``. ``GpuCommandError``
+    is preserved as the raised exception type via the ``error_factory`` kwarg.
+    """
     process_env = env.copy() if env else os.environ.copy()
     if env_vars:
         process_env.update(env_vars)
 
-    # Use common temp directory as working directory
-    working_dir = get_temp_dir()
+    working_dir = Path(get_temp_dir())
 
-    stdout_list = []
-    stderr_list = []
+    stdout_list: list[str] = []
+    stderr_list: list[str] = []
 
-    for _ in range(n_runs):
-        proc = await asyncio.create_subprocess_shell(
-            cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=process_env,
-            start_new_session=True,
+    for run_idx in range(n_runs):
+        stdout, stderr = await run_subprocess_shell(
+            stage=f"gpu_exec:{cmd[:60]}",
+            cmd=cmd,
             cwd=working_dir,
+            timeout_s=timeout,
+            env=process_env,
+            error_factory=GpuCommandError,
+            logger=logger,
         )
-        try:
-            # Wait for the process with timeout
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            stdout_list.append(stdout.decode())
-            stderr_list.append(stderr.decode())
-            if proc.returncode != 0:
-                raise GpuCommandError(
-                    f"stdout:\n{stdout.decode()}\nstderr:\n{stderr.decode()}"
-                )
-        except asyncio.TimeoutError:
-            # Kill the process if it times out
-            logger.error(f"TIMEOUT: {cmd}")
-            await safe_kill_process(proc, logger)
-            raise GpuCommandError(
-                f"Timeout: Execution timed out after {timeout} seconds"
-            )
+        stdout_list.append(stdout.decode())
+        stderr_list.append(stderr.decode())
 
     if n_runs == 1:
         return stdout_list[0], stderr_list[0]
-    else:
-        return stdout_list, stderr_list
+    return stdout_list, stderr_list
 
 
 async def exec_binary(

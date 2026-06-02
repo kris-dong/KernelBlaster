@@ -19,7 +19,7 @@ import uuid
 from typing import Optional
 
 from .server_logging import get_log_config
-from .utils.process_management import safe_kill_process
+from .utils.subprocess import run_subprocess_shell
 
 logger = logging.getLogger("uvicorn")
 
@@ -48,32 +48,26 @@ async def exec_remote_command(
     timeout: float = 3600,
     cwd: str = None,
 ) -> tuple[str, str]:
-    """Execute a command on the remote board via SSH."""
+    """Execute a command on the remote Adreno board via SSH.
+
+    Timeout + safe-kill plumbing is shared with the rest of the servers via
+    ``run_subprocess_shell``. Raises ``AdrenoExecutionError`` on timeout or
+    non-zero exit (error_factory contract).
+    """
     remote_cmd = cmd
     if cwd:
         remote_cmd = f"cd {cwd} && {cmd}"
     full_cmd = f"ssh {SSH_OPTS} {board_host} '{remote_cmd}'"
 
-    proc = await asyncio.create_subprocess_shell(
-        full_cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        start_new_session=True,
+    stdout, stderr = await run_subprocess_shell(
+        stage=f"ssh:{cmd[:40]}",
+        cmd=full_cmd,
+        cwd=Path("/tmp"),
+        timeout_s=timeout,
+        error_factory=AdrenoExecutionError,
+        logger=logger,
     )
-    try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        stdout_str = stdout.decode()
-        stderr_str = stderr.decode()
-        if proc.returncode != 0:
-            raise AdrenoExecutionError(
-                f"stdout:\n{stdout_str}\nstderr:\n{stderr_str}"
-            )
-        return stdout_str, stderr_str
-    except asyncio.TimeoutError:
-        await safe_kill_process(proc, logger)
-        raise AdrenoExecutionError(
-            f"Timeout: Execution timed out after {timeout} seconds"
-        )
+    return stdout.decode(), stderr.decode()
 
 
 async def upload_and_exec_binary(
@@ -107,12 +101,14 @@ async def upload_and_exec_binary(
             os.chmod(local_tmp.name, 0o755)
 
             scp_cmd = f"scp {SSH_OPTS} -q {local_tmp.name} {board_host}:{remote_dir}/main"
-            proc = await asyncio.create_subprocess_shell(
-                scp_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            await run_subprocess_shell(
+                stage="scp_binary",
+                cmd=scp_cmd,
+                cwd=Path("/tmp"),
+                timeout_s=60,
+                error_factory=AdrenoExecutionError,
+                logger=logger,
             )
-            await asyncio.wait_for(proc.communicate(), timeout=60)
 
             # Make binary executable on board
             await exec_remote_command(f"chmod +x {remote_dir}/main", board_host, timeout=10)
@@ -129,12 +125,14 @@ async def upload_and_exec_binary(
                     if remote_name.endswith(".cl"):
                         remote_name = "kernel.cl"
                     scp_cmd = f"scp {SSH_OPTS} -q {kf} {board_host}:{remote_dir}/{remote_name}"
-                    proc = await asyncio.create_subprocess_shell(
-                        scp_cmd,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
+                    await run_subprocess_shell(
+                        stage=f"scp_kernel:{remote_name}",
+                        cmd=scp_cmd,
+                        cwd=Path("/tmp"),
+                        timeout_s=60,
+                        error_factory=AdrenoExecutionError,
+                        logger=logger,
                     )
-                    await asyncio.wait_for(proc.communicate(), timeout=60)
 
         # Execute
         exec_args = args_str

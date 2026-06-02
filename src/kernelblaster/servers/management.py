@@ -83,23 +83,27 @@ def test_server_connection(process, url, timeout: int = 5):
     return False
 
 
-def _spawn_compile_server(
+def _spawn_server(
     *,
     label: str,
     module: str,
     log_file: TextIOWrapper,
     port: int | None,
     default_port: int,
-    num_workers: int,
     extra_args: list[str],
-    artifacts_dir: Path,
     startup_extra_log: str = "",
 ):
-    """Spawn a compile-server subprocess and return ``(process, url)``.
+    """Spawn a server subprocess and return ``(process, url)``.
 
-    Shared scaffolding for both CUDA and OpenCL compile-server launchers:
-    auto-pick a port if not given, build the ``python -m <module>`` command,
-    spawn detached with logs redirected, and log the launch.
+    Shared scaffolding for all four launchers (CUDA compile, OpenCL compile,
+    CUDA GPU exec, Adreno GPU exec): auto-pick a port, build the
+    ``python -m <module>`` command, spawn detached with logs redirected,
+    and log the launch.
+
+    Server-type-specific flags (``--num-workers``, ``--artifacts-dir``,
+    ``--board-host``, etc.) flow through ``extra_args`` — different server
+    modules accept different sets of CLI flags so we keep the helper
+    agnostic.
     """
     if port is None:
         port = find_free_port(start_port=default_port)
@@ -111,10 +115,6 @@ def _spawn_compile_server(
         module,
         "--port",
         str(port),
-        "--num-workers",
-        str(num_workers),
-        "--artifacts-dir",
-        str(artifacts_dir),
         *extra_args,
     ]
 
@@ -155,20 +155,21 @@ def initialize_compiler_server(
         )
     )
 
-    extra_args: list[str] = []
+    extra_args: list[str] = [
+        "--num-workers", str(num_workers),
+        "--artifacts-dir", str(artifacts_dir),
+    ]
     compile_timeout = os.getenv("KERNELBLASTER_COMPILE_TIMEOUT_S")
     if compile_timeout:
         extra_args.extend(["--compile-timeout", compile_timeout])
 
-    return _spawn_compile_server(
+    return _spawn_server(
         label="compilation server",
         module="src.kernelblaster.servers.compile",
         log_file=log_file,
         port=port,
         default_port=2001,
-        num_workers=num_workers,
         extra_args=extra_args,
-        artifacts_dir=artifacts_dir,
     )
 
 
@@ -177,43 +178,25 @@ def initialize_gpu_server(
     gpu: Optional[GPUType],
     port: int | None,
 ):
-    """Initialize the GPU server and return the URL."""
-
+    """Initialize the CUDA GPU execution server and return ``(process, url)``."""
     if gpu is None:
         gpu = GPUType.current()
 
     gpu_server_url = config.get_gpu_server_url(gpu)
-
     if gpu_server_url is not None:
         logger.info(f"Using existing GPU server at {gpu_server_url} for {gpu}")
         return None, gpu_server_url
 
-    if port is None:
-        port = find_free_port(start_port=2002)
-        logger.info(f"🎯 Auto-assigned GPU server port: {port}")
-
-    gpu_server_cmd = [
-        sys.executable,
-        "-m",
-        "src.kernelblaster.servers.gpu",
-        "--port",
-        str(port),
-    ]
-
-    # Use a single file for both stdout and stderr
-    gpu_server_process = subprocess.Popen(
-        gpu_server_cmd,
-        stdout=log_file,
-        stderr=log_file,
-        start_new_session=True,
-    )
-
-    gpu_server_url = f"http://localhost:{port}"
-    logger.info(
-        f"Starting the GPU command server at {gpu_server_url}: {' '.join(gpu_server_cmd)}"
+    process, gpu_server_url = _spawn_server(
+        label="GPU command server",
+        module="src.kernelblaster.servers.gpu",
+        log_file=log_file,
+        port=port,
+        default_port=2002,
+        extra_args=[],
     )
     config.set_gpu_server_url(gpu, gpu_server_url)
-    return gpu_server_process, gpu_server_url
+    return process, gpu_server_url
 
 
 def initialize_opencl_compiler_server(
@@ -233,15 +216,17 @@ def initialize_opencl_compiler_server(
 
     num_workers = int(os.getenv("KERNELBLASTER_OPENCL_COMPILE_WORKERS", "4"))
 
-    return _spawn_compile_server(
+    return _spawn_server(
         label="OpenCL compilation server",
         module="src.kernelblaster.servers.compile_opencl",
         log_file=log_file,
         port=port,
         default_port=2003,
-        num_workers=num_workers,
-        extra_args=["--board-host", board_host],
-        artifacts_dir=artifacts_dir,
+        extra_args=[
+            "--num-workers", str(num_workers),
+            "--artifacts-dir", str(artifacts_dir),
+            "--board-host", board_host,
+        ],
         startup_extra_log=f"(board={board_host})",
     )
 
@@ -251,42 +236,24 @@ def initialize_adreno_gpu_server(
     board_host: str | None = None,
     port: int | None = None,
 ):
-    """Initialize the Adreno GPU execution server (SSH-based)."""
+    """Initialize the Adreno GPU execution server (SSH-based) and return ``(process, url)``."""
     gpu_server_url = os.getenv("KERNELBLASTER_ADRENO_GPU_SERVER_URL")
     if gpu_server_url:
         logger.info(f"Using existing Adreno GPU server at {gpu_server_url}")
         return None, gpu_server_url
 
-    if port is None:
-        port = find_free_port(start_port=2004)
-        logger.info(f"🎯 Auto-assigned Adreno GPU server port: {port}")
-
     if board_host is None:
         board_host = os.getenv("KERNELBLASTER_ADRENO_BOARD_HOST", "root@192.0.2.201")
 
-    gpu_server_cmd = [
-        sys.executable,
-        "-m",
-        "src.kernelblaster.servers.gpu_adreno",
-        "--port",
-        str(port),
-        "--board-host",
-        board_host,
-    ]
-
-    gpu_server_process = subprocess.Popen(
-        gpu_server_cmd,
-        stdout=log_file,
-        stderr=log_file,
-        start_new_session=True,
+    return _spawn_server(
+        label="Adreno GPU server",
+        module="src.kernelblaster.servers.gpu_adreno",
+        log_file=log_file,
+        port=port,
+        default_port=2004,
+        extra_args=["--board-host", board_host],
+        startup_extra_log=f"(board={board_host})",
     )
-
-    gpu_server_url = f"http://localhost:{port}"
-    logger.info(
-        f"Starting Adreno GPU server at {gpu_server_url} "
-        f"(board={board_host}): {' '.join(gpu_server_cmd)}"
-    )
-    return gpu_server_process, gpu_server_url
 
 
 def find_free_port(start_port: int = 2001) -> int:
