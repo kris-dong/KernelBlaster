@@ -872,35 +872,20 @@ class RLOpenCLAgent(FeedbackAgent):
     # Default optimisations fallback
     # ------------------------------------------------------------------
     def _try_add_default_optimizations(self, current_state: str) -> bool:
-        try:
-            defaults = {
-                "memory_bound": [
-                    ("1.1_coalesced_access", 20.0),
-                    ("2.1_local_memory_tiling", 25.0),
-                    ("1.1_vectorized_access", 15.0),
-                ],
-                "compute_bound": [
-                    ("3.1_work_per_item_increase", 30.0),
-                    ("3.3_mad_fma_usage", 20.0),
-                    ("3.4_half_precision", 25.0),
-                ],
-                "latency_bound": [
-                    ("1.1_occupancy_tuning", 35.0),
-                    ("2.2_work_group_size_tuning", 30.0),
-                    ("6.1_thread_coarsening", 25.0),
-                ],
-                "hybrid_bound": [
-                    ("2.1_local_memory_tiling", 40.0),
-                    ("2.1_register_tiling", 35.0),
-                    ("4.1_async_copy", 30.0),
-                ],
-            }
+        """Fallback when no optimisations are recorded for a discovered state.
 
+        The catalog (bottleneck -> [(technique, predicted_pct), ...]) lives on
+        the backend — see ``OpenCLBackend.get_default_optimizations``.
+        """
+        try:
+            defaults = self.backend.get_default_optimizations()
             for bottleneck, opts in defaults.items():
                 if bottleneck in current_state:
                     for technique, improvement in opts:
                         self.database.add_new_optimization(current_state, technique, improvement)
-                    self.agent_logger.info(f"Added {len(opts)} default optimisations for state: {current_state}")
+                    self.agent_logger.info(
+                        f"Added {len(opts)} default optimisations for state: {current_state}"
+                    )
                     return True
         except Exception as e:
             self.agent_logger.error(f"Error adding default optimisations: {e}")

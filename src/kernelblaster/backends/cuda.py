@@ -29,6 +29,32 @@ if TYPE_CHECKING:
     from ..config import GPUType
 
 
+# Fallback catalog: bottleneck -> [(technique_id, predicted_improvement_%), ...].
+# Previously inline in ``opt_ncu_rl._try_add_default_optimizations``.
+_CUDA_DEFAULT_OPTIMIZATIONS: Mapping[str, list[tuple[str, float]]] = {
+    "memory_bound": [
+        ("memory_coalescing_optimization", 20.0),
+        ("shared_memory_tiling", 25.0),
+        ("vectorized_processing", 15.0),
+    ],
+    "compute_bound": [
+        ("instruction_level_parallelism", 30.0),
+        ("fast_math_optimization", 20.0),
+        ("vectorized_operations", 25.0),
+    ],
+    "latency_bound": [
+        ("occupancy_optimization", 35.0),
+        ("register_pressure_reduction", 30.0),
+        ("work_per_thread_increase", 25.0),
+    ],
+    "hybrid_bound": [
+        ("memory_compute_overlap", 40.0),
+        ("algorithmic_optimization", 35.0),
+        ("adaptive_tiling", 30.0),
+    ],
+}
+
+
 # Technique IDs are conceptually shared with OpenCL but the prose is CUDA-tuned
 # (mentions of warps, tensor cores, shared memory banks, etc.). This map
 # previously lived inline in ``opt_ncu_rl.generate_strategy_guided_prompt``.
@@ -146,6 +172,10 @@ class CUDABackend(Backend):
 
     def best_filename(self) -> str:
         return "global_best_rl_optimization.cu"
+
+    # ---- default optimizations ----
+    def get_default_optimizations(self) -> Mapping[str, list[tuple[str, float]]]:
+        return _CUDA_DEFAULT_OPTIMIZATIONS
 
     # ---- LLM response handling ----
     def extract_code_from_response(self, response_text: str) -> str | None:

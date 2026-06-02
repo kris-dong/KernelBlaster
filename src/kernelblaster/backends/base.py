@@ -120,3 +120,15 @@ class Backend(ABC):
         CUDA footer:  ``// Elapsed Cycles: <int>``
         OpenCL footer: ``// Kernel time: <float> ms``
         """
+
+    # ---- default optimizations (RL fallback catalog) ----
+    @abstractmethod
+    def get_default_optimizations(self) -> "Mapping[str, list[tuple[str, float]]]":
+        """Per-backend fallback catalog: ``bottleneck -> [(technique_id, predicted_pct), ...]``.
+
+        Used by the RL agents' ``_try_add_default_optimizations`` when the LLM
+        produces a state name we have no recorded optimizations for. The
+        technique IDs are backend-specific (CUDA uses generic names like
+        ``memory_coalescing_optimization``; OpenCL uses entries from
+        ``technique_map`` like ``1.1_coalesced_access``).
+        """

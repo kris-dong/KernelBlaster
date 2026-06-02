@@ -1602,54 +1602,25 @@ The optimization process is learning and adapting. Continue with further optimiz
             )
 
     def _try_add_default_optimizations(self, current_state: str) -> bool:
-        """
-        Try to add default optimizations for a discovered state based on its characteristics.
-        
-        This is a fallback mechanism when no optimizations are found.
+        """Fallback when no optimizations are recorded for a discovered state.
+
+        The catalog (bottleneck -> [(technique, predicted_pct), ...]) lives on
+        the backend — see ``CUDABackend.get_default_optimizations``.
         """
         try:
-            # Define default optimizations based on common patterns
-            default_optimizations = {
-                "memory_bound": [
-                    ("memory_coalescing_optimization", 20.0),
-                    ("shared_memory_tiling", 25.0),
-                    ("vectorized_processing", 15.0)
-                ],
-                "compute_bound": [
-                    ("instruction_level_parallelism", 30.0),
-                    ("fast_math_optimization", 20.0),
-                    ("vectorized_operations", 25.0)
-                ],
-                "latency_bound": [
-                    ("occupancy_optimization", 35.0),
-                    ("register_pressure_reduction", 30.0),
-                    ("work_per_thread_increase", 25.0)
-                ],
-                "hybrid_bound": [
-                    ("memory_compute_overlap", 40.0),
-                    ("algorithmic_optimization", 35.0),
-                    ("adaptive_tiling", 30.0)
-                ]
-            }
-            
-            # Extract the primary bottleneck from the state name
-            primary_bottleneck = None
-            for bottleneck in default_optimizations.keys():
-                if bottleneck in current_state:
-                    primary_bottleneck = bottleneck
-                    break
-            
-            if primary_bottleneck and primary_bottleneck in default_optimizations:
-                # Add default optimizations for this state
-                for technique, improvement in default_optimizations[primary_bottleneck]:
+            defaults = self.backend.get_default_optimizations()
+            primary_bottleneck = next(
+                (b for b in defaults if b in current_state), None
+            )
+            if primary_bottleneck is not None:
+                for technique, improvement in defaults[primary_bottleneck]:
                     self.database.add_new_optimization(current_state, technique, improvement)
-                
-                self.agent_logger.info(f"Added {len(default_optimizations[primary_bottleneck])} default optimizations for state: {current_state}")
+                self.agent_logger.info(
+                    f"Added {len(defaults[primary_bottleneck])} default optimizations for state: {current_state}"
+                )
                 return True
-            
         except Exception as e:
             self.agent_logger.error(f"Error adding default optimizations: {e}")
-        
         return False
 
     def get_performance_summary(self) -> Dict[str, Any]:
