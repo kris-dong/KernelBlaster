@@ -28,12 +28,11 @@ import csv
 import loguru
 from dataclasses import dataclass, asdict
 
+from ..backends import Backend
 from ..config import GPUType
 from .utils import (
-    compile_and_run_cu_file,
     run_gpu_executable,
     find_kernel_names_ncu,
-    get_elapsed_cycles_ncu_log,
     NamedTimer,
     FeedbackError,
     UTILIZATION_METRICS,
@@ -75,6 +74,7 @@ class ReProfileAgent:
         cycles_only: bool = False,
         detailed_profiling: bool = True,
         profile_init: bool = False,
+        backend: Backend | None = None,
     ):
         self.base_folder = Path(base_folder)
         self.gpu = gpu
@@ -83,6 +83,10 @@ class ReProfileAgent:
         self.cycles_only = cycles_only
         self.detailed_profiling = detailed_profiling
         self.profile_init = profile_init
+        # Backend abstraction (Phase 2). Defaults to the GPU's canonical backend
+        # so existing callers don't need to pass it. Compile/run and profile-log
+        # parsing now flow through this object — see ``kernelblaster.backends``.
+        self.backend = backend if backend is not None else gpu.backend()
         
     def discover_success_files(
         self, 
@@ -303,7 +307,7 @@ class ReProfileAgent:
             compilation_logs["command"] = compilation_command_info
             (logs_dir / "compilation_command.json").write_text(json.dumps(compilation_command_info, indent=2))
             
-            stdout_list, stderr_list, compiled_path, success = await compile_and_run_cu_file(
+            stdout_list, stderr_list, compiled_path, success = await self.backend.compile_and_run(
                 test_code_fp,
                 success_file,
                 self.gpu,
@@ -412,7 +416,7 @@ class ReProfileAgent:
                     (logs_dir / f"ncu_basic_{kernel_name}_stderr.txt").write_text(ncu_stderr)
                     (logs_dir / f"ncu_basic_{kernel_name}_command.txt").write_text(ncu_text_command)
                     
-                    return ncu_stdout, ncu_stderr, get_elapsed_cycles_ncu_log(ncu_stdout)
+                    return ncu_stdout, ncu_stderr, self.backend.parse_profile(ncu_stdout).raw_metrics["elapsed_cycles"]
                 
                 # Profile all kernels in parallel
                 kernel_results = await asyncio.gather(*[
@@ -502,9 +506,9 @@ class ReProfileAgent:
                         prefix_command=ncu_basic_command,
                     )
                     
-                    # Extract cycles from text output
+                    # Extract cycles from text output (routed through Backend; raises on missing metric)
                     try:
-                        kernel_cycles = get_elapsed_cycles_ncu_log(ncu_stdout)
+                        kernel_cycles = self.backend.parse_profile(ncu_stdout).raw_metrics["elapsed_cycles"]
                     except Exception as e:
                         self.logger.error(
                             f"Failed to extract cycles from NCU output for {kernel_name}. "

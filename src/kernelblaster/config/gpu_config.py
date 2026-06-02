@@ -87,12 +87,25 @@ class GPUType(StrEnum):
 
     @property
     def target_lang(self) -> str:
-        """Return 'cuda' for NVIDIA, 'opencl' for Adreno."""
-        if self.is_nvidia:
-            return "cuda"
-        elif self.is_adreno:
-            return "opencl"
-        raise ValueError(f"Unknown GPU vendor for: {self.value}")
+        """Return 'cuda' for NVIDIA, 'opencl' for Adreno.
+
+        Note: kept for back-compat with existing consumers. New code should
+        prefer ``self.backend()`` (returns a full ``Backend`` object) and read
+        ``backend.name`` when only the language string is needed. The
+        ``Backend`` abstraction subsumes this — see ``kernelblaster.backends``.
+        """
+        return self.backend().name
+
+    def backend(self):
+        """Return the canonical ``Backend`` instance for this GPU type.
+
+        Lazy import avoids a circular dependency (backends -> agents.utils ->
+        config). The returned object carries the GPU type and is the single
+        source of truth for compile/profile/database conventions per the
+        Phase 2 abstraction.
+        """
+        from ..backends import backend_for_gpu
+        return backend_for_gpu(self)
 
     @staticmethod
     def current():
