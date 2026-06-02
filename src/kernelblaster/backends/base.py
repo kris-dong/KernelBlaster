@@ -51,6 +51,46 @@ class ProfileResult:
     raw_metrics: dict[str, Any] = field(default_factory=dict)
     raw_log: str = ""
 
+    # ---- serialization (Phase 3b) ----
+    # Used by the backfill script and (eventually) by RL agents to persist a
+    # structured profile.json next to each step's NCU/OpenCL raw log.
+
+    def to_dict(self) -> dict[str, Any]:
+        """Plain-dict view suitable for ``json.dumps``."""
+        return {
+            "total_time_ms": self.total_time_ms,
+            "per_kernel_ms": dict(self.per_kernel_ms),
+            "raw_metrics": dict(self.raw_metrics),
+            "raw_log": self.raw_log,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "ProfileResult":
+        return cls(
+            total_time_ms=float(d.get("total_time_ms", 0.0)),
+            per_kernel_ms=dict(d.get("per_kernel_ms", {})),
+            raw_metrics=dict(d.get("raw_metrics", {})),
+            raw_log=str(d.get("raw_log", "")),
+        )
+
+    def write_json(self, path) -> None:
+        """Serialize to ``path``. Parent directory must exist.
+
+        ``raw_log`` is included verbatim — the JSON encoder handles newlines.
+        For large logs (~MB), callers may want to omit ``raw_log`` first via
+        ``ProfileResult(raw_log="", ...other fields)`` before writing.
+        """
+        import json
+        from pathlib import Path as _Path
+        _Path(path).write_text(json.dumps(self.to_dict(), indent=2))
+
+    @classmethod
+    def read_json(cls, path) -> "ProfileResult":
+        """Deserialize from a ``profile.json`` produced by ``write_json``."""
+        import json
+        from pathlib import Path as _Path
+        return cls.from_dict(json.loads(_Path(path).read_text()))
+
 
 class Backend(ABC):
     """Contract every hardware backend satisfies.

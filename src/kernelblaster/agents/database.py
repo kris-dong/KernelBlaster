@@ -36,16 +36,12 @@ def get_elapsed_cycles_v2(text: str) -> int:
         raise ValueError("No elapsed cycles found in text")
     return int(groups.group(1))
 
-def get_speedup_from_files(soln_file: Path) -> Tuple[int, int, float]:
-    final_text = soln_file.read_text()
-    if (soln_file.parent /"ncu/0_init_ncu_log.txt").exists():
-        initial_text = (soln_file.parent /"ncu/0_init_ncu_log.txt").read_text()
-    else:
-        initial_text = (soln_file.parent /"ncu_annot/init.cu").read_text()
-    final_elapsed_cycles = get_elapsed_cycles_v2(final_text)
-    initial_elapsed_cycles = get_elapsed_cycles_v2(initial_text)
-    speedup_ratio = initial_elapsed_cycles / final_elapsed_cycles
-    return initial_elapsed_cycles, final_elapsed_cycles, speedup_ratio
+# NB: ``get_speedup_from_files`` was removed in Phase 3b — it had zero
+# callers in the repo. The live cycle-parsing path is ``get_elapsed_cycles_v2``
+# (above) called from ``update_optimization_result``; a future Phase 3c
+# may replace it with ``ProfileResult.from_dict(profile_json)`` once RL
+# agents write ``profile.json`` at every step.
+
 
 class LLMInterface:
     """Interface for LLM queries used in state analysis."""

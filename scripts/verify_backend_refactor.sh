@@ -632,6 +632,65 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# T5 — Phase 3b: ProfileResult JSON roundtrip
+# ---------------------------------------------------------------------------
+# Phase 3b added ProfileResult.to_dict / from_dict / write_json / read_json
+# for structured persistence next to raw NCU/OpenCL logs. This is a unit-
+# style test that the roundtrip is lossless for both backends.
+
+if [ "${SKIP_T5:-0}" != "1" ]; then
+    echo
+    echo "==== T5: Phase 3b ProfileResult JSON roundtrip (no servers) ===="
+    T5_OUT="$TMPDIR/t5.log"
+    if "$PY" - >"$T5_OUT" 2>&1 <<'PYEOF'
+import sys, tempfile
+sys.path.insert(0, ".")
+
+from pathlib import Path
+from src.kernelblaster.backends import get_backend, ProfileResult
+
+cuda = get_backend("cuda")
+ocl = get_backend("opencl")
+
+# CUDA: dict roundtrip
+pr1 = cuda.parse_profile("Elapsed Cycles cycle 98765")
+assert pr1.raw_metrics["elapsed_cycles"] == 98765
+pr2 = ProfileResult.from_dict(pr1.to_dict())
+assert pr2.raw_metrics["elapsed_cycles"] == 98765
+assert pr2.raw_log == pr1.raw_log
+
+# OpenCL: dict roundtrip
+ocl_log = "[PROFILE] vec_add: 0.5 ms\n[PROFILE] matmul: 2.25 ms"
+pr1 = ocl.parse_profile(ocl_log)
+pr2 = ProfileResult.from_dict(pr1.to_dict())
+assert pr2.per_kernel_ms == {"vec_add": 0.5, "matmul": 2.25}
+assert abs(pr2.total_time_ms - 2.75) < 1e-9
+
+# File roundtrip
+with tempfile.TemporaryDirectory() as td:
+    p = Path(td) / "profile.json"
+    pr1.write_json(p)
+    pr3 = ProfileResult.read_json(p)
+    assert pr3.to_dict() == pr1.to_dict()
+
+# Empty / default-constructed ProfileResult also roundtrips
+empty = ProfileResult(total_time_ms=0.0)
+assert ProfileResult.from_dict(empty.to_dict()).total_time_ms == 0.0
+
+print("T5: OK")
+PYEOF
+    then
+        record "T5 ProfileResult.to_dict/from_dict/write_json/read_json roundtrip" PASS
+    else
+        cat "$T5_OUT" | tail -30
+        record "T5 ProfileResult.to_dict/from_dict/write_json/read_json roundtrip" FAIL
+    fi
+else
+    echo
+    echo "==== T5 skipped (SKIP_T5=1) ===="
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
