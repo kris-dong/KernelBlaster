@@ -313,54 +313,21 @@ class RLNCUAgent(RLAgentBase):
         database_path: Path,
         max_rollout_steps: int = 5,
         replay_buffer_size: int = 1000,
-        update_frequency: int = 10,  # Update database every N trajectories
+        update_frequency: int = 10,
         database: Optional[OptimizationDatabase] = None,
     ):
-        # Initialize base feedback agent
-        super().__init__(fb_config)
-
-        # Phase 2 Backend abstraction: single source of truth for technique map,
-        # file-naming, profile parsing. Routed via gpu.backend() so this picks
-        # CUDABackend for any NVIDIA GPU in fb_config.gpu.
-        self.backend = self.gpu.backend()
-
-        self.test_code_fp = fb_config.test_code_fp
-        self.test_code = fb_config.test_code_fp.read_text()
-        self.kernel_source_fp = code_to_optimize_fp
-        self.kernel_source = code_to_optimize_fp.read_text()
-        
-        # RL-specific components - Use enhanced database with GPU optimization report
-        gpu_report_path = Path(__file__).parent.parent.parent.parent.parent / "algo-sol-modeling/algo-space/gpu_optimization_report.md"
-        llm_interface = LLMInterface(self.model, self.agent_logger)
-        # Use provided shared database if available; otherwise create a new one
-        if database is not None:
-            self.database = database
-        else:
-            self.database = OptimizationDatabase(database_path, gpu_report_path, llm_interface, backend=self.backend)
-        self.replay_buffer = ReplayBuffer(max_size=replay_buffer_size)
-        self.max_rollout_steps = max_rollout_steps
-        self.update_frequency = update_frequency
-        
-        # RL agents
-        self.policy_evaluation_agent = PolicyEvaluationAgent()
-        self.perf_gap_analysis_agent = PerfGapAnalysisAgent()
-        self.parameter_update_agent = ParameterUpdateAgent()
-        
-        # Tracking
-        self.iteration_count = 0
-        self.total_trajectories = 0
-        self.best_metric = float('inf')
-        self.initial_metric = None
-        
-        # Concurrency helpers
-        import asyncio as _asyncio
-        self._trajectory_lock: _asyncio.Lock = _asyncio.Lock()
-        
-        # Current trajectory
-        self.current_trajectory = None
-        
-        # Number of RL iterations to run (can be set by the workflow)
-        self.num_rl_iterations = 50  # Default to 50 RL iterations
+        # Phase 4f step 2: shared __init__ lives on RLAgentBase. The public
+        # CUDA constructor keeps ``code_to_optimize_fp`` for back-compat;
+        # internally it's passed under the canonical kernel_source_fp name.
+        super().__init__(
+            fb_config=fb_config,
+            kernel_source_fp=code_to_optimize_fp,
+            database_path=database_path,
+            max_rollout_steps=max_rollout_steps,
+            replay_buffer_size=replay_buffer_size,
+            update_frequency=update_frequency,
+            database=database,
+        )
 
     async def initialize(self):
         """Initialize the agent by gathering initial profiling data."""

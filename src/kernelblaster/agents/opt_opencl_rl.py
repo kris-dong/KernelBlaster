@@ -218,45 +218,32 @@ class RLOpenCLAgent(RLAgentBase):
         update_frequency: int = 10,
         database: Optional[OptimizationDatabase] = None,
     ):
-        super().__init__(fb_config)
+        # Phase 4f step 2: shared __init__ lives on RLAgentBase. The public
+        # OpenCL constructor keeps ``kernel_to_optimize_fp`` for back-compat;
+        # internally it's passed under the canonical kernel_source_fp name.
+        # OpenCL-specific extras (exec_timeout_s, global-best verification-pool
+        # fields) are set up via _init_backend_extras() below.
+        super().__init__(
+            fb_config=fb_config,
+            kernel_source_fp=kernel_to_optimize_fp,
+            database_path=database_path,
+            max_rollout_steps=max_rollout_steps,
+            replay_buffer_size=replay_buffer_size,
+            update_frequency=update_frequency,
+            database=database,
+        )
 
-        # Phase 2 Backend abstraction: single source of truth for technique map,
-        # board_host, file-naming, profile parsing. Picks OpenCLBackend for any
-        # Adreno GPU in fb_config.gpu.
-        self.backend = self.gpu.backend()
+    def _init_backend_extras(self) -> None:
+        """OpenCL-specific instance attrs not present on the CUDA agent.
 
-        self.test_code_fp = fb_config.test_code_fp  # driver.c
-        self.test_code = fb_config.test_code_fp.read_text()
-        self.kernel_source_fp = kernel_to_optimize_fp  # kernel.cl
-        self.kernel_source = kernel_to_optimize_fp.read_text()
-
-        gpu_report_path = Path(__file__).parent.parent.parent.parent.parent / "algo-sol-modeling/algo-space/gpu_optimization_report.md"
-        llm_interface = LLMInterface(self.model, self.agent_logger)
-        if database is not None:
-            self.database = database
-        else:
-            self.database = OptimizationDatabase(database_path, gpu_report_path, llm_interface, backend=self.backend)
-        self.replay_buffer = ReplayBuffer(max_size=replay_buffer_size)
-        self.max_rollout_steps = max_rollout_steps
-        self.update_frequency = update_frequency
-
-        self.policy_evaluation_agent = PolicyEvaluationAgent()
-        self.perf_gap_analysis_agent = PerfGapAnalysisAgent()
-        self.parameter_update_agent = ParameterUpdateAgent()
-
-        self.iteration_count = 0
-        self.total_trajectories = 0
-        self.best_metric = float('inf')
-        self.initial_metric = None
-
-        self._trajectory_lock: asyncio.Lock = asyncio.Lock()
-        self.current_trajectory = None
-        self.num_rl_iterations = 50
+        - ``exec_timeout_s``: SSH-exec timeout (board can be slow). Env-var
+          driven so operators can tune per-board.
+        - ``_global_best_*``: verification-pool best-tracker. Captures the
+          fastest correct kernel across all attempts (not just the final
+          per-trajectory step). CUDA's libtorch-based reference verification
+          doesn't use this pattern.
+        """
         self.exec_timeout_s = int(os.getenv("KERNELBLASTER_OPENCL_TIMEOUT_S", "600"))
-
-        # Fastest kernel seen across *any* successful profile run in this session (verifies
-        # correctness; includes pre-step profiles, init, and fix-attempt passes — not only
-        # the last accepted step in each trajectory).
         self._global_best_lock: asyncio.Lock = asyncio.Lock()
         self._global_best_time_ms: float = float("inf")
         self._global_best_code: Optional[str] = None

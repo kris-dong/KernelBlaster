@@ -38,22 +38,116 @@ per-backend kernel-source attribute names (``code_to_optimize_fp`` /
 """
 from __future__ import annotations
 
+import asyncio
+from pathlib import Path
 from typing import Any, Dict, Optional
 
-from .feedback import FeedbackAgent
-from .database import OptimizationDatabase, OptimizationEntry, CompositeOptimization
+from .feedback import FeedbackAgent, FeedbackConfig
+from .database import (
+    OptimizationDatabase,
+    OptimizationEntry,
+    CompositeOptimization,
+    LLMInterface,
+)
+from .rl_agents import (
+    ReplayBuffer,
+    PolicyEvaluationAgent,
+    PerfGapAnalysisAgent,
+    ParameterUpdateAgent,
+)
 
 
 class RLAgentBase(FeedbackAgent):
     """Shared scaffolding for ``RLNCUAgent`` and ``RLOpenCLAgent``.
 
-    Subclasses must set ``self.backend`` in ``__init__`` (typically via
-    ``self.gpu.backend()``) before any base method that reads
-    ``self.backend`` is called. They must also populate the canonical
-    state fields ``self.iteration_count``, ``self.total_trajectories``,
-    ``self.best_metric``, ``self.initial_metric``, ``self.database``,
-    and ``self.replay_buffer`` during their ``__init__``.
+    The shared ``__init__`` sets up everything common to both backends:
+    the Backend object (``self.backend`` via ``self.gpu.backend()``),
+    test-code references, kernel-source references under canonical names
+    (``self.kernel_source_fp`` / ``self.kernel_source``), the
+    ``OptimizationDatabase``, ``ReplayBuffer``, RL sub-agents, state
+    counters, and concurrency locks. Subclasses override
+    ``_init_backend_extras`` to add backend-specific attributes (e.g.
+    OpenCL's global-best verification-pool fields and SSH-exec timeout).
+
+    Subclasses MUST pass their per-backend kernel-source path under the
+    canonical name ``kernel_source_fp`` to ``super().__init__``; they may
+    keep their original public parameter name (``code_to_optimize_fp`` /
+    ``kernel_to_optimize_fp``) in their own ``__init__`` signature for
+    back-compat with existing callers.
     """
+
+    def __init__(
+        self,
+        fb_config: FeedbackConfig,
+        kernel_source_fp: Path,
+        database_path: Path,
+        max_rollout_steps: int = 5,
+        replay_buffer_size: int = 1000,
+        update_frequency: int = 10,
+        database: Optional[OptimizationDatabase] = None,
+    ):
+        super().__init__(fb_config)
+
+        # Phase 2 Backend abstraction: single source of truth for technique
+        # map, file-naming, profile parsing, board_host (OpenCL), etc.
+        # Routed via gpu.backend() so this picks the right backend for the
+        # GPU type carried in fb_config.
+        self.backend = self.gpu.backend()
+
+        # Test driver + kernel source (canonical names — Phase 4f rename).
+        self.test_code_fp = fb_config.test_code_fp
+        self.test_code = fb_config.test_code_fp.read_text()
+        self.kernel_source_fp = kernel_source_fp
+        self.kernel_source = kernel_source_fp.read_text()
+
+        # Database: use the shared instance if one was passed in (graph
+        # nodes do this when running multiple problems in one process);
+        # otherwise construct a fresh one rooted at ``database_path``.
+        gpu_report_path = (
+            Path(__file__).parent.parent.parent.parent.parent
+            / "algo-sol-modeling/algo-space/gpu_optimization_report.md"
+        )
+        llm_interface = LLMInterface(self.model, self.agent_logger)
+        if database is not None:
+            self.database = database
+        else:
+            self.database = OptimizationDatabase(
+                database_path, gpu_report_path, llm_interface, backend=self.backend
+            )
+
+        # RL components.
+        self.replay_buffer = ReplayBuffer(max_size=replay_buffer_size)
+        self.max_rollout_steps = max_rollout_steps
+        self.update_frequency = update_frequency
+
+        self.policy_evaluation_agent = PolicyEvaluationAgent()
+        self.perf_gap_analysis_agent = PerfGapAnalysisAgent()
+        self.parameter_update_agent = ParameterUpdateAgent()
+
+        # State tracking — unified naming since Phase 4d.
+        self.iteration_count = 0
+        self.total_trajectories = 0
+        self.best_metric = float("inf")
+        self.initial_metric = None
+
+        # Concurrency.
+        self._trajectory_lock: asyncio.Lock = asyncio.Lock()
+        self.current_trajectory = None
+
+        # Default RL iteration count (can be overridden by the workflow).
+        self.num_rl_iterations = 50
+
+        # Backend-specific extras (OpenCL global-best fields, etc.) go in
+        # the subclass hook so they always run AFTER all shared state is set.
+        self._init_backend_extras()
+
+    def _init_backend_extras(self) -> None:
+        """Subclass hook for backend-specific instance attributes.
+
+        Default: no-op (CUDA agent has no extras beyond what the base sets).
+        OpenCL agent overrides to set up SSH timeout + global-best fields.
+        """
+        return None
 
     # ------------------------------------------------------------------
     # Reward calculation — backend-independent.
