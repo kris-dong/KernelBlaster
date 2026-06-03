@@ -150,6 +150,26 @@ class RLAgentBase(FeedbackAgent):
         return None
 
     # ------------------------------------------------------------------
+    # Shared state-derivation glue (Phase 4f.3a)
+    # ------------------------------------------------------------------
+    async def _derive_state(self, profile_result, code: str) -> str:
+        """Compute the optimisation-state string for the current kernel.
+
+        Backend-agnostic — the per-backend bits (metrics extraction, cycles
+        arg conversion) come from ``backend.derive_metrics_for_state`` and
+        ``backend.state_cycles_arg``. On any database exception, returns a
+        ``"<backend>_unknown"`` sentinel so callers can proceed.
+        """
+        metrics = self.backend.derive_metrics_for_state(profile_result)
+        cycles_arg = self.backend.state_cycles_arg(profile_result)
+        try:
+            return await self.database.get_state_from_ncu_report(
+                profile_result.raw_log, metrics, code, elapsed_cycles=cycles_arg
+            )
+        except Exception:
+            return f"{self.backend.name}_unknown"
+
+    # ------------------------------------------------------------------
     # Reward calculation — backend-independent.
     # Byte-identical in both agents pre-Phase-4f.
     # ------------------------------------------------------------------

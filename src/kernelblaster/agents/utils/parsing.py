@@ -28,7 +28,51 @@ __all__ = [
     "find_kernel_name",
     "get_elapsed_cycles_ncu_log",
     "find_kernel_launch_header",
+    "parse_ncu_metrics",
 ]
+
+
+def parse_ncu_metrics(ncu_log: str) -> dict:
+    """Parse key Speed-Of-Light metrics from an NCU text log.
+
+    Lifted from ``opt_ncu_rl`` in Phase 4f.3a so it can be consumed both
+    by the CUDA agent and by ``CUDABackend.derive_metrics_for_state``
+    without circular imports. Behavior is unchanged.
+
+    NCU text tables don't always print a trailing '%' after the value;
+    columns are ``<Metric Name>  <Metric Unit>  <Metric Value>``. We grab
+    the *last* numeric token on the matching line, which handles variable
+    column widths and absent unit columns.
+    """
+    metrics: dict = {}
+
+    def _build_pattern(keyword: str) -> str:
+        return rf"{keyword}.*?([0-9]+(?:\.[0-9]+)?)"
+
+    patterns = {
+        "memory_throughput":         _build_pattern(r"Memory\s+Throughput"),
+        "compute_throughput":        _build_pattern(r"Compute\s*\(SM\)\s*Throughput"),
+        "sm_efficiency":             _build_pattern(r"SM\s+Efficiency"),
+        "occupancy":                 _build_pattern(r"Achieved\s+Occupancy"),
+        "coalescing_efficiency":     _build_pattern(r"Global\s+Memory\s+Coalescing"),
+        "cache_hit_rate":            _build_pattern(r"L2\s+Cache\s+Hit\s+Rate"),
+        "shared_memory_efficiency":  _build_pattern(r"Shared\s+Memory\s+Efficiency"),
+        "tensor_core_usage":         _build_pattern(r"Tensor\s+Core\s+Usage"),
+        "register_usage":            _build_pattern(r"Registers\s+Per\s+Thread"),
+        "shared_memory_usage":       _build_pattern(r"Shared\s+Memory\s+Usage"),
+    }
+
+    for metric_name, pattern in patterns.items():
+        match = re.search(pattern, ncu_log, re.IGNORECASE | re.MULTILINE)
+        if match:
+            try:
+                metrics[metric_name] = float(match.group(1))
+            except ValueError:
+                metrics[metric_name] = 0.0
+        else:
+            metrics[metric_name] = 0.0
+
+    return metrics
 
 
 async def find_kernel_names_ncu(

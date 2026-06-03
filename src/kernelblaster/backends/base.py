@@ -247,3 +247,33 @@ class Backend(ABC):
     def rl_node_config(self) -> "RLNodeConfig":
         """Return the per-backend config consumed by the unified RL-optimization
         graph node — see ``RLNodeConfig`` and ``graph/nodes/_rl_node.py``."""
+
+    # ---- State derivation glue (Phase 4f.3a) ----
+    # These two methods carry the per-backend bits that the database needs
+    # in order to compute a state for the current kernel. They keep
+    # ``Backend`` pure (no database/agent dependency) — the agent calls them
+    # to build the args, then passes them to its own ``self.database``.
+    @abstractmethod
+    def derive_metrics_for_state(self, profile_result: "ProfileResult") -> dict:
+        """Build the metrics dict that ``database.get_state_from_ncu_report``
+        expects for THIS backend.
+
+        CUDA: parses ``profile_result.raw_log`` (an NCU report) via
+        ``parse_ncu_metrics`` to extract Speed-Of-Light metrics.
+
+        OpenCL: returns per-kernel ms (from ``per_kernel_ms``) plus
+        ``total_kernel_time_ms`` — the dict shape the database has been
+        consuming since the original OpenCL agent landed.
+        """
+
+    @abstractmethod
+    def state_cycles_arg(self, profile_result: "ProfileResult") -> int:
+        """Build the ``elapsed_cycles=`` integer that ``database.get_state_from_ncu_report``
+        expects (the database API name is CUDA-flavored; OpenCL fakes it
+        with microseconds-as-integer).
+
+        CUDA: returns ``profile_result.raw_metrics["elapsed_cycles"]``.
+        OpenCL: returns ``int(profile_result.total_time_ms * 1000)`` —
+        the existing OpenCL hack of stuffing microseconds into the
+        cycles parameter.
+        """

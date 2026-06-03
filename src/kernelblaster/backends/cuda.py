@@ -192,6 +192,15 @@ class CUDABackend(Backend):
     def extract_primary_metric(self, profile_result: ProfileResult) -> float:
         return float(profile_result.raw_metrics.get("elapsed_cycles", 0))
 
+    # ---- State derivation glue (Phase 4f.3a) ----
+    def derive_metrics_for_state(self, profile_result: ProfileResult) -> dict:
+        """Parse NCU Speed-Of-Light metrics from the raw NCU log."""
+        from ..agents.utils.parsing import parse_ncu_metrics
+        return parse_ncu_metrics(profile_result.raw_log)
+
+    def state_cycles_arg(self, profile_result: ProfileResult) -> int:
+        return int(profile_result.raw_metrics.get("elapsed_cycles", 0))
+
     # ---- RL graph-node config ----
     def rl_node_config(self):
         """Per-backend wiring for the unified RL-optimization graph node.

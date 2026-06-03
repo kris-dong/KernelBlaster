@@ -189,6 +189,20 @@ class OpenCLBackend(Backend):
     def extract_primary_metric(self, profile_result: ProfileResult) -> float:
         return float(profile_result.total_time_ms)
 
+    # ---- State derivation glue (Phase 4f.3a) ----
+    def derive_metrics_for_state(self, profile_result: ProfileResult) -> dict:
+        """Return per-kernel ms + total_kernel_time_ms, the shape OpenCL's
+        legacy state-analysis path has been consuming since day one."""
+        metrics = dict(profile_result.per_kernel_ms)
+        metrics["total_kernel_time_ms"] = profile_result.total_time_ms
+        return metrics
+
+    def state_cycles_arg(self, profile_result: ProfileResult) -> int:
+        # OpenCL has no native "cycles" metric; stuff microseconds-as-int
+        # into the parameter (matches the historical opt_opencl_rl hack at
+        # opt_opencl_rl.py:432 — kept verbatim for state-derivation parity).
+        return int(profile_result.total_time_ms * 1000)
+
     # ---- RL graph-node config ----
     def rl_node_config(self):
         """Per-backend wiring for the unified RL-optimization graph node.
