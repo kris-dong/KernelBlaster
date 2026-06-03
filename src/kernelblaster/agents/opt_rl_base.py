@@ -152,6 +152,18 @@ class RLAgentBase(FeedbackAgent):
     # ------------------------------------------------------------------
     # Shared state-derivation glue (Phase 4f.3a)
     # ------------------------------------------------------------------
+    async def gather_profile_result(self, kernel_fp):
+        """Backend-agnostic wrapper that returns a ProfileResult.
+
+        Subclasses override to convert their existing ``gather_perf_metrics``
+        tuple return into a ``ProfileResult``. Shared methods in this base
+        call ``gather_profile_result`` rather than the per-backend
+        ``gather_perf_metrics`` so they don't have to know the tuple shape.
+        """
+        raise NotImplementedError(
+            "Subclasses must implement gather_profile_result"
+        )
+
     async def _derive_state(self, profile_result, code: str) -> str:
         """Compute the optimisation-state string for the current kernel.
 
@@ -168,6 +180,81 @@ class RLAgentBase(FeedbackAgent):
             )
         except Exception:
             return f"{self.backend.name}_unknown"
+
+    # ------------------------------------------------------------------
+    # initialize() lift (Phase 4f.3c)
+    # ------------------------------------------------------------------
+    async def _maybe_generate_reference(self) -> None:
+        """Subclass hook: backend-specific pre-profile setup.
+
+        CUDA: no-op (default). OpenCL: SSH-execs ``--generate-reference``
+        on the board to cache ``reference_output.bin``.
+        """
+        return None
+
+    def _write_init_artifact(self, profile_result) -> None:
+        """Subclass hook: write the per-backend ``0_init_*`` artifact.
+
+        CUDA writes the NCU-annotated source; OpenCL writes the raw kernel
+        source (the [PROFILE] markers are already in raw_log, no annotation
+        needed for prompts).
+        """
+        raise NotImplementedError(
+            "Subclasses must implement _write_init_artifact"
+        )
+
+    def _handle_init_failure(self) -> None:
+        """Subclass hook: optional cleanup/fallback when initial profiling
+        raised ``FeedbackError``. Default: no-op. CUDA overrides to populate
+        a fallback state via the database and write a placeholder annotated
+        artifact so downstream steps have something to read.
+        """
+        return None
+
+    async def initialize(self):
+        """Gather initial profiling data for the unoptimised kernel.
+
+        Backend-agnostic shape (Phase 4f.3c) — the per-backend bits go
+        through three hooks: ``_maybe_generate_reference`` (pre-profile
+        setup), ``_write_init_artifact`` (post-profile artifact), and
+        ``_handle_init_failure`` (fallback when the first profile pass
+        raises). Profile extraction goes through ``gather_profile_result``
+        (Phase 4f.3b) so the return shape is ``ProfileResult`` regardless
+        of backend.
+        """
+        from .utils import FeedbackError
+
+        # Anchor the kernel source under the per-backend init filename.
+        self.kernel_source_fp = self.folder / f"init{self.backend.kernel_ext}"
+        self.kernel_source_fp.write_text(self.kernel_source)
+
+        # OpenCL-specific: pre-cache CPU reference output on the board.
+        # CUDA's libtorch driver computes its reference in-process — no-op.
+        await self._maybe_generate_reference()
+
+        self.agent_logger.info(
+            f"Gathering initial {self.backend.name.upper()} profiling data..."
+        )
+        try:
+            pr = await self.gather_profile_result(self.kernel_source_fp)
+            metric = self.backend.extract_primary_metric(pr)
+            self.initial_metric = metric
+            self.best_metric = metric
+            self.last_profile_log = pr.raw_log
+
+            initial_state = await self._derive_state(pr, self.kernel_source)
+            self.agent_logger.info(
+                f"Initial state: {initial_state}, "
+                f"{self.backend.format_metric(metric)}"
+            )
+
+            self._write_init_artifact(pr)
+        except FeedbackError as e:
+            self.agent_logger.warning(
+                f"Initial profiling failed; proceeding with fallback state. Details: {e}"
+            )
+            self.last_profile_log = ""
+            self._handle_init_failure()
 
     # ------------------------------------------------------------------
     # Reward calculation — backend-independent.

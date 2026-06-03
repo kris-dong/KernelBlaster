@@ -295,54 +295,33 @@ class RLNCUAgent(RLAgentBase):
             database=database,
         )
 
-    async def initialize(self):
-        """Initialize the agent by gathering initial profiling data."""
-        # Copy init cu file to folder
-        self.kernel_source_fp = self.folder / "init.cu"
-        self.kernel_source_fp.write_text(self.kernel_source)
+    # initialize() lifted to RLAgentBase in Phase 4f.3c. This subclass only
+    # contributes the two per-backend hooks below (_write_init_artifact,
+    # _handle_init_failure). _maybe_generate_reference inherits the no-op
+    # default — CUDA's libtorch driver computes the reference in-process.
 
-        self.agent_logger.info(f"Gathering initial NCU log...")
+    def _write_init_artifact(self, profile_result) -> None:
+        """Write ``0_init_annotated.cu`` with the NCU-annotated source CSV."""
+        annotated = profile_result.raw_metrics.get("annotated_ncu", "") or ""
+        (self.folder / "0_init_annotated.cu").write_text(annotated)
+
+    def _handle_init_failure(self) -> None:
+        """Populate fallback state via the database; write a placeholder
+        ``0_init_annotated.cu`` (raw init.cu) so downstream steps can proceed."""
         try:
-            annotated_ncu, init_ncu_log, _, cycles = await self.gather_perf_metrics(
-                self.kernel_source_fp
-            )
-            self.initial_metric = cycles
-            self.best_metric = cycles
+            # Compute fallback state for its database side-effects; the return
+            # value isn't stored anywhere else, mirroring the legacy behavior.
+            self.database._fallback_state_analysis("", {})
+        except Exception as e:
+            self.agent_logger.warning(f"Fallback state analysis failed: {e}")
 
-            # Persist first NCU log so subsequent steps can perform analysis
-            self.last_ncu_log = init_ncu_log
-            
-            # Save initial state
-            init_metrics = parse_ncu_metrics(init_ncu_log)
-            initial_state = await self.database.get_state_from_ncu_report(
-                init_ncu_log, init_metrics, self.kernel_source, elapsed_cycles=cycles
-            )
-            
-            self.agent_logger.info(f"Initial state: {initial_state}, cycles: {cycles}")
-            
-            # Save initial files
-            (self.folder / "0_init_annotated.cu").write_text(annotated_ncu)
-            
-        except FeedbackError as e:
-            # Log the failure but continue with a fallback analysis so the agent can proceed.
+        try:
+            init_src = self.kernel_source_fp.read_text()
+            (self.folder / "0_init_annotated.cu").write_text(init_src)
+        except Exception as _e:
             self.agent_logger.warning(
-                f"Initial profiling failed numeric verification; proceeding with fallback state. Details: {e}"
+                f"Failed to write fallback 0_init_annotated.cu: {_e}"
             )
-
-            # Use basic fallback state; keep cycles as None so we do not report bogus values.
-            init_metrics = {}
-            initial_state_profile = self.database._fallback_state_analysis("", init_metrics)
-            initial_state = initial_state_profile.state_name
-            # Leave self.initial_metric unchanged (None by default). Keep best_cycles as-is.
-            # Persist placeholder NCU log for downstream steps
-            self.last_ncu_log = ""
-
-            # Fallback: write annotated file using raw init.cu so downstream steps can proceed
-            try:
-                init_src = self.kernel_source_fp.read_text()
-                (self.folder / "0_init_annotated.cu").write_text(init_src)
-            except Exception as _e:
-                self.agent_logger.warning(f"Failed to write fallback 0_init_annotated.cu: {_e}")
 
     async def run(self) -> Path:
         """
@@ -355,12 +334,12 @@ class RLNCUAgent(RLAgentBase):
         best_cycles = float('inf')
 
         # Ensure initial profiling data is available ONCE before spawning tasks
-        if not hasattr(self, "last_ncu_log") or not self.last_ncu_log:
+        if not hasattr(self, "last_profile_log") or not self.last_profile_log:
             await self.initialize()
         # Compute and share the initial state derived from the initial NCU log
         initial_state_shared = await self.database.get_state_from_ncu_report(
-            self.last_ncu_log,
-            parse_ncu_metrics(self.last_ncu_log),
+            self.last_profile_log,
+            parse_ncu_metrics(self.last_profile_log),
             self.kernel_source,
             elapsed_cycles=self.initial_metric,
         )
@@ -490,6 +469,27 @@ class RLNCUAgent(RLAgentBase):
             "All RL iterations failed; wrote failure_rl_optimization.cu with baseline (if available)"
         )
         return failure_file
+
+    async def gather_profile_result(self, filepath: Path):
+        """Phase 4f.3b: wrap the CUDA tuple return into a ProfileResult.
+
+        Old callers (~5 sites in this file) still use the tuple directly;
+        shared methods in RLAgentBase use this wrapper to stay backend-
+        agnostic. ``raw_metrics`` carries the CUDA-specific extras
+        (``annotated_ncu``, ``stderr``).
+        """
+        from ..backends import ProfileResult
+        annotated_ncu, ncu_log, stderr, cycles = await self.gather_perf_metrics(filepath)
+        return ProfileResult(
+            total_time_ms=0.0,
+            per_kernel_ms={},
+            raw_metrics={
+                "elapsed_cycles": cycles,
+                "annotated_ncu": annotated_ncu,
+                "stderr": stderr,
+            },
+            raw_log=ncu_log,
+        )
 
     async def gather_perf_metrics(self, filepath: Path) -> Tuple[str, str, str, int]:
         """Gather performance metrics using NCU profiling."""
@@ -871,7 +871,7 @@ class RLNCUAgent(RLAgentBase):
         current_code: str = initial_code
         current_state: str = initial_state
         current_cycles: int = self.initial_metric
-        last_ncu_log: str = getattr(self, "last_ncu_log", "")
+        last_ncu_log: str = getattr(self, "last_profile_log", "")
         
         self.agent_logger.info(f"Starting rollout from state: {current_state}")
         

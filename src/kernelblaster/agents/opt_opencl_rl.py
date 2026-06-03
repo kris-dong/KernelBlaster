@@ -304,6 +304,18 @@ class RLOpenCLAgent(RLAgentBase):
     # ------------------------------------------------------------------
     # Profiling: compile + run with --profile, parse timings
     # ------------------------------------------------------------------
+    async def gather_profile_result(self, kernel_filepath: Path):
+        """Phase 4f.3b: wrap the OpenCL tuple return into a ProfileResult.
+
+        Delegates to ``backend.parse_profile`` (which already builds the
+        right ProfileResult from a ``[PROFILE]``-bearing stdout) then
+        stashes stderr in raw_metrics for parity with the CUDA wrapper.
+        """
+        profile_output, stderr, time_ms = await self.gather_perf_metrics(kernel_filepath)
+        pr = self.backend.parse_profile(profile_output)
+        pr.raw_metrics["stderr"] = stderr
+        return pr
+
     async def gather_perf_metrics(self, kernel_filepath: Path) -> Tuple[str, str, float]:
         """Compile and execute on Adreno, return (profile_output, stderr, total_kernel_time_ms)."""
         extra_files = None
@@ -409,30 +421,23 @@ class RLOpenCLAgent(RLAgentBase):
     # ------------------------------------------------------------------
     # Initialisation
     # ------------------------------------------------------------------
-    async def initialize(self):
-        """Gather initial profiling data for the unoptimised kernel."""
-        self.kernel_source_fp = self.folder / "init.cl"
-        self.kernel_source_fp.write_text(self.kernel_source)
+    # initialize() lifted to RLAgentBase in Phase 4f.3c. This subclass
+    # overrides _maybe_generate_reference (SSH-execs the reference-gen pass
+    # on the board) and _write_init_artifact (writes raw kernel source as
+    # the init artifact). _handle_init_failure inherits the no-op default.
 
-        # Generate CPU reference once (cached for all subsequent runs)
+    async def _maybe_generate_reference(self) -> None:
+        """OpenCL needs a one-shot CPU-reference cache on the board so
+        subsequent profile passes don't recompute it. Calls the existing
+        SSH-based ``_generate_reference`` helper."""
         await self._generate_reference()
 
-        self.agent_logger.info("Gathering initial OpenCL profiling data...")
-        try:
-            profile_output, _, time_ms = await self.gather_perf_metrics(self.kernel_source_fp)
-            self.initial_metric = time_ms
-            self.best_metric = time_ms
-            self.last_profile_output = profile_output
+    def _write_init_artifact(self, profile_result) -> None:
+        """Write ``0_init_kernel.cl`` — raw kernel source; no NCU-style
+        annotation needed since OpenCL prompt context comes from
+        ``[PROFILE]`` markers in ``profile_result.raw_log``."""
+        (self.folder / "0_init_kernel.cl").write_text(self.kernel_source)
 
-            initial_state = await self._get_state(profile_output, self.kernel_source, time_ms)
-            self.agent_logger.info(f"Initial state: {initial_state}, time: {time_ms:.3f} ms")
-
-            (self.folder / "0_init_kernel.cl").write_text(self.kernel_source)
-        except FeedbackError as e:
-            self.agent_logger.warning(
-                f"Initial profiling failed; proceeding with fallback state. Details: {e}"
-            )
-            self.last_profile_output = ""
 
     async def _get_state(self, profile_output: str, code: str, time_ms: float) -> str:
         """Derive an optimisation state string from profiling output."""
@@ -461,7 +466,7 @@ class RLOpenCLAgent(RLAgentBase):
 
         await self._reset_global_best_for_run()
 
-        if not hasattr(self, "last_profile_output") or not self.last_profile_output:
+        if not hasattr(self, "last_profile_log") or not self.last_profile_log:
             await self.initialize()
 
         # `initialize()` may run on the host before `run()`; the reset above clears
@@ -470,7 +475,7 @@ class RLOpenCLAgent(RLAgentBase):
             await self._record_global_best_if_better(self.folder / "init.cl", self.initial_metric)
 
         initial_state = await self._get_state(
-            self.last_profile_output, self.kernel_source, self.initial_metric or 0.0
+            self.last_profile_log, self.kernel_source, self.initial_metric or 0.0
         )
 
         async def _run_single_iteration(idx: int):
@@ -576,7 +581,7 @@ class RLOpenCLAgent(RLAgentBase):
         current_code = initial_code
         current_state = initial_state
         current_time_ms = self.initial_metric
-        last_profile = getattr(self, "last_profile_output", "")
+        last_profile = getattr(self, "last_profile_log", "")
 
         self.agent_logger.info(f"Starting rollout from state: {current_state}")
 
