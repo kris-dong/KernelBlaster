@@ -227,8 +227,8 @@ class RLOpenCLAgent(RLAgentBase):
 
         self.test_code_fp = fb_config.test_code_fp  # driver.c
         self.test_code = fb_config.test_code_fp.read_text()
-        self.kernel_to_optimize_fp = kernel_to_optimize_fp  # kernel.cl
-        self.kernel_to_optimize = kernel_to_optimize_fp.read_text()
+        self.kernel_source_fp = kernel_to_optimize_fp  # kernel.cl
+        self.kernel_source = kernel_to_optimize_fp.read_text()
 
         gpu_report_path = Path(__file__).parent.parent.parent.parent.parent / "algo-sol-modeling/algo-space/gpu_optimization_report.md"
         llm_interface = LLMInterface(self.model, self.agent_logger)
@@ -387,7 +387,7 @@ class RLOpenCLAgent(RLAgentBase):
         remote_dir = f"/tmp/kernelblaster_refgen_{os.getpid()}"
 
         driver_path = str(self.test_code_fp.resolve())
-        kernel_path = str(self.kernel_to_optimize_fp.resolve())
+        kernel_path = str(self.kernel_source_fp.resolve())
 
         cmds = [
             f"ssh {ssh_opts} {board_host} 'mkdir -p {remote_dir}'",
@@ -424,23 +424,23 @@ class RLOpenCLAgent(RLAgentBase):
     # ------------------------------------------------------------------
     async def initialize(self):
         """Gather initial profiling data for the unoptimised kernel."""
-        self.kernel_to_optimize_fp = self.folder / "init.cl"
-        self.kernel_to_optimize_fp.write_text(self.kernel_to_optimize)
+        self.kernel_source_fp = self.folder / "init.cl"
+        self.kernel_source_fp.write_text(self.kernel_source)
 
         # Generate CPU reference once (cached for all subsequent runs)
         await self._generate_reference()
 
         self.agent_logger.info("Gathering initial OpenCL profiling data...")
         try:
-            profile_output, _, time_ms = await self.gather_perf_metrics(self.kernel_to_optimize_fp)
+            profile_output, _, time_ms = await self.gather_perf_metrics(self.kernel_source_fp)
             self.initial_metric = time_ms
             self.best_metric = time_ms
             self.last_profile_output = profile_output
 
-            initial_state = await self._get_state(profile_output, self.kernel_to_optimize, time_ms)
+            initial_state = await self._get_state(profile_output, self.kernel_source, time_ms)
             self.agent_logger.info(f"Initial state: {initial_state}, time: {time_ms:.3f} ms")
 
-            (self.folder / "0_init_kernel.cl").write_text(self.kernel_to_optimize)
+            (self.folder / "0_init_kernel.cl").write_text(self.kernel_source)
         except FeedbackError as e:
             self.agent_logger.warning(
                 f"Initial profiling failed; proceeding with fallback state. Details: {e}"
@@ -483,13 +483,13 @@ class RLOpenCLAgent(RLAgentBase):
             await self._record_global_best_if_better(self.folder / "init.cl", self.initial_metric)
 
         initial_state = await self._get_state(
-            self.last_profile_output, self.kernel_to_optimize, self.initial_metric or 0.0
+            self.last_profile_output, self.kernel_source, self.initial_metric or 0.0
         )
 
         async def _run_single_iteration(idx: int):
             self.agent_logger.info(f"[Async] RL Iteration {idx + 1}/{self.num_rl_iterations}")
             try:
-                trajectory = await self.run_rollout(self.kernel_to_optimize, initial_state)
+                trajectory = await self.run_rollout(self.kernel_source, initial_state)
                 return idx, trajectory
             except Exception as exc:
                 self.agent_logger.error(f"RL iteration {idx + 1} failed: {exc}")
@@ -556,7 +556,7 @@ class RLOpenCLAgent(RLAgentBase):
             failure_file = self.folder / "failure_rl_optimization.cl"
             baseline_str = f"{self.initial_metric:.3f} ms" if self.initial_metric is not None else "N/A"
             failure_file.write_text(
-                self.kernel_to_optimize + f"\n\n// Baseline: {baseline_str}\n"
+                self.kernel_source + f"\n\n// Baseline: {baseline_str}\n"
             )
             self.agent_logger.error("RL did not improve over baseline; wrote failure file")
             return failure_file
@@ -564,7 +564,7 @@ class RLOpenCLAgent(RLAgentBase):
         failure_file = self.folder / "failure_rl_optimization.cl"
         baseline_str = f"{self.initial_metric:.3f} ms" if self.initial_metric is not None else "N/A"
         failure_file.write_text(
-            self.kernel_to_optimize + f"\n\n// Baseline: {baseline_str}\n"
+            self.kernel_source + f"\n\n// Baseline: {baseline_str}\n"
         )
         self.agent_logger.error("All RL iterations failed; wrote failure file")
         return failure_file

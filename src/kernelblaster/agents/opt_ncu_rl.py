@@ -326,8 +326,8 @@ class RLNCUAgent(RLAgentBase):
 
         self.test_code_fp = fb_config.test_code_fp
         self.test_code = fb_config.test_code_fp.read_text()
-        self.code_to_optimize_fp = code_to_optimize_fp
-        self.code_to_optimize = code_to_optimize_fp.read_text()
+        self.kernel_source_fp = code_to_optimize_fp
+        self.kernel_source = code_to_optimize_fp.read_text()
         
         # RL-specific components - Use enhanced database with GPU optimization report
         gpu_report_path = Path(__file__).parent.parent.parent.parent.parent / "algo-sol-modeling/algo-space/gpu_optimization_report.md"
@@ -365,13 +365,13 @@ class RLNCUAgent(RLAgentBase):
     async def initialize(self):
         """Initialize the agent by gathering initial profiling data."""
         # Copy init cu file to folder
-        self.code_to_optimize_fp = self.folder / "init.cu"
-        self.code_to_optimize_fp.write_text(self.code_to_optimize)
+        self.kernel_source_fp = self.folder / "init.cu"
+        self.kernel_source_fp.write_text(self.kernel_source)
 
         self.agent_logger.info(f"Gathering initial NCU log...")
         try:
             annotated_ncu, init_ncu_log, _, cycles = await self.gather_perf_metrics(
-                self.code_to_optimize_fp
+                self.kernel_source_fp
             )
             self.initial_metric = cycles
             self.best_metric = cycles
@@ -382,7 +382,7 @@ class RLNCUAgent(RLAgentBase):
             # Save initial state
             init_metrics = parse_ncu_metrics(init_ncu_log)
             initial_state = await self.database.get_state_from_ncu_report(
-                init_ncu_log, init_metrics, self.code_to_optimize, elapsed_cycles=cycles
+                init_ncu_log, init_metrics, self.kernel_source, elapsed_cycles=cycles
             )
             
             self.agent_logger.info(f"Initial state: {initial_state}, cycles: {cycles}")
@@ -406,7 +406,7 @@ class RLNCUAgent(RLAgentBase):
 
             # Fallback: write annotated file using raw init.cu so downstream steps can proceed
             try:
-                init_src = self.code_to_optimize_fp.read_text()
+                init_src = self.kernel_source_fp.read_text()
                 (self.folder / "0_init_annotated.cu").write_text(init_src)
             except Exception as _e:
                 self.agent_logger.warning(f"Failed to write fallback 0_init_annotated.cu: {_e}")
@@ -428,7 +428,7 @@ class RLNCUAgent(RLAgentBase):
         initial_state_shared = await self.database.get_state_from_ncu_report(
             self.last_ncu_log,
             parse_ncu_metrics(self.last_ncu_log),
-            self.code_to_optimize,
+            self.kernel_source,
             elapsed_cycles=self.initial_metric,
         )
 
@@ -440,7 +440,7 @@ class RLNCUAgent(RLAgentBase):
                 # Initial state derived once and shared across iterations
                 initial_state = initial_state_shared
 
-                trajectory = await self.run_rollout(self.code_to_optimize, initial_state)
+                trajectory = await self.run_rollout(self.kernel_source, initial_state)
                 return iteration_idx, trajectory
             except Exception as exc:
                 self.agent_logger.error(
@@ -492,11 +492,11 @@ class RLNCUAgent(RLAgentBase):
             # Ensure we have baseline cycles to judge improvement.
             try:
                 if self.initial_metric is None:
-                    init_fp = getattr(self, "code_to_optimize_fp", None)
+                    init_fp = getattr(self, "kernel_source_fp", None)
                     if not init_fp or not init_fp.exists():
-                        self.code_to_optimize_fp = self.folder / "init.cu"
-                        self.code_to_optimize_fp.write_text(self.code_to_optimize)
-                    _, _, _, baseline_cycles = await self.gather_perf_metrics(self.code_to_optimize_fp)
+                        self.kernel_source_fp = self.folder / "init.cu"
+                        self.kernel_source_fp.write_text(self.kernel_source)
+                    _, _, _, baseline_cycles = await self.gather_perf_metrics(self.kernel_source_fp)
                     self.initial_metric = baseline_cycles
             except Exception as e:
                 self.agent_logger.warning(
@@ -513,11 +513,11 @@ class RLNCUAgent(RLAgentBase):
             baseline_str = self.initial_metric if self.initial_metric is not None else "N/A"
             try:
                 failure_file.write_text(
-                    self.backend.format_result_artifact(self.code_to_optimize, baseline_str)
+                    self.backend.format_result_artifact(self.kernel_source, baseline_str)
                 )
             except Exception:
                 try:
-                    init_fp = getattr(self, "code_to_optimize_fp", None)
+                    init_fp = getattr(self, "kernel_source_fp", None)
                     if init_fp and init_fp.exists():
                         failure_file.write_text(
                             self.backend.format_result_artifact(init_fp.read_text(), baseline_str)
@@ -532,11 +532,11 @@ class RLNCUAgent(RLAgentBase):
         # No trajectory produced a candidate. Still write a failure file (with baseline if available).
         try:
             if self.initial_metric is None:
-                init_fp = getattr(self, "code_to_optimize_fp", None)
+                init_fp = getattr(self, "kernel_source_fp", None)
                 if not init_fp or not init_fp.exists():
-                    self.code_to_optimize_fp = self.folder / "init.cu"
-                    self.code_to_optimize_fp.write_text(self.code_to_optimize)
-                _, _, _, cycles = await self.gather_perf_metrics(self.code_to_optimize_fp)
+                    self.kernel_source_fp = self.folder / "init.cu"
+                    self.kernel_source_fp.write_text(self.kernel_source)
+                _, _, _, cycles = await self.gather_perf_metrics(self.kernel_source_fp)
                 self.initial_metric = cycles
                 self.best_metric = min(self.best_metric, cycles) if self.best_metric else cycles
         except Exception as e:
@@ -545,10 +545,10 @@ class RLNCUAgent(RLAgentBase):
         fallback_cycles = self.initial_metric if self.initial_metric is not None else "N/A"
         failure_file = self.folder / "failure_rl_optimization.cu"
         try:
-            failure_file.write_text(self.backend.format_result_artifact(self.code_to_optimize, fallback_cycles))
+            failure_file.write_text(self.backend.format_result_artifact(self.kernel_source, fallback_cycles))
         except Exception:
             try:
-                init_fp = getattr(self, "code_to_optimize_fp", None)
+                init_fp = getattr(self, "kernel_source_fp", None)
                 if init_fp and init_fp.exists():
                     failure_file.write_text(self.backend.format_result_artifact(init_fp.read_text(), fallback_cycles))
             except Exception:
