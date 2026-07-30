@@ -51,7 +51,11 @@ from src.kernelblaster.resources import CompileServer, GPUServer, OpenCLCompileS
 from src.kernelblaster.workflow import run_workflow
 from src.kernelblaster.agents.database import GPUOptimizationDatabase, LLMInterface
 
-from data import get_dataset
+from data.sources import (
+    Problem,
+    iter_problems_for_args,
+    resolve_reference_code as _source_resolve_reference_code,
+)
 from utils.arguments import *
 
 COMPILE_SERVER = None
@@ -78,74 +82,14 @@ def _normalize_http_service_url(url: str | None) -> str | None:
     return u
 
 
-def resolve_reference_code_for_entry(entry: dict) -> str | None:
-    """
-    Prefer packaged reference code, then ``data/benchmark/<L*|level*>/<problem>/reference.py``,
-    then ``data/kernelbench-cuda/sol-level{1,2}/...`` for those subsets, then legacy
-    KernelBench ``.py`` samples under ``data/kernelbench/...``.
-    """
-    if entry.get("reference_code"):
-        return entry["reference_code"]
-    ref_fp = entry.get("reference_py_fp")
-    if ref_fp:
-        p = Path(ref_fp)
-        if p.is_file():
-            try:
-                return p.read_text()
-            except OSError:
-                pass
-    level = entry.get("level")
-    problem_name = entry.get("problem_name")
-    if level and problem_name:
-        bench_ref = ROOT_DIR / "data" / "benchmark" / level / problem_name / "reference.py"
-        if bench_ref.is_file():
-            try:
-                return bench_ref.read_text()
-            except OSError:
-                pass
-        if level in {"sol-level1", "sol-level2"}:
-            bench_port = (
-                ROOT_DIR
-                / "data"
-                / "kernelbench-cuda"
-                / level
-                / problem_name
-                / "reference.py"
-            )
-            if bench_port.is_file():
-                try:
-                    return bench_port.read_text()
-                except OSError:
-                    pass
-            fallback_level = "L1" if level == "sol-level1" else "L2"
-            bench_fallback = (
-                ROOT_DIR / "data" / "benchmark" / fallback_level / problem_name / "reference.py"
-            )
-            if bench_fallback.is_file():
-                try:
-                    return bench_fallback.read_text()
-                except OSError:
-                    pass
-    prob_num = entry.get("problem_num")
-    if prob_num is None or not level:
-        return None
-    legacy_level = {
-        "L1": "level1",
-        "L2": "level2",
-        "L3": "level3",
-        "sol-level1": "level1",
-        "sol-level2": "level2",
-    }.get(level, level)
-    kb_dir = ROOT_DIR / "data" / "kernelbench" / "kernelbench" / legacy_level
-    if not kb_dir.is_dir():
-        return None
-    matches = sorted(kb_dir.glob(f"{int(prob_num):03d}_*.py"))
-    if not matches:
-        return None
-    try:
-        return matches[0].read_text()
-    except OSError:
-        return None
+# resolve_reference_code_for_entry deleted in the Item 2 followup Phase 1
+# migration. The Problem-native resolver lives in
+# :func:`data.sources.resolve_reference_code`; it covers the two
+# in-scope fallback tiers (inlined ``Problem.reference_code`` +
+# ``curated_artifacts["reference_py"]``). The four cross-suite tiers
+# the pre-refactor helper handled were unreachable in the new source
+# taxonomy — see ``notes/run_rl_migration_audit.md`` §2 for the
+# rationale.
 
 
 def load_comprehensive_analysis_results():
@@ -371,59 +315,47 @@ def signal_handler(signum, frame):
 
 
 async def process_problem(
-    entry,
+    problem: Problem,
     folder,
     semaphore,
     workflow_config,
     timeout_minutes,
     shared_database=None,
 ) -> tuple[dict[str, Path], bool]:
-    problem_id = entry["id"]
-    user_message = entry.get("user_message", "")
-    reference_code = entry.get("reference_code") or resolve_reference_code_for_entry(
-        entry
-    )
+    """Run the LangGraph workflow for a single :class:`Problem`.
 
-    # Extract task information for optimization data lookup
-    task_id = entry.get("task_id")
-    level_id = entry.get("level_id")
-    op_name = entry.get("op_name")
-    
-    # If not directly available, try to extract from entry structure
-    if task_id is None and "problem_num" in entry:
-        task_id = entry["problem_num"]
-    
-    if level_id is None and "level" in entry:
-        level_str = entry["level"]
-        if level_str == "L1":
-            level_id = 1
-        elif level_str == "L2":
-            level_id = 2
-        elif level_str == "L3":
-            level_id = 3
-        elif level_str == "sol-level1":
-            level_id = 1
-        elif level_str == "sol-level2":
-            level_id = 2
-        elif level_str and level_str.startswith("level") and level_str != "sol-level1":
-            level_id = int(level_str.replace("level", ""))
-    
-    if op_name is None and task_id is not None:
-        # Try to construct op_name from problem information
-        # Extract operation name from problem_name or id
-        problem_name = entry.get("problem_name", "")
-        if problem_name:
-            # Remove numeric prefix and underscores to get operation name
-            parts = problem_name.split("_")
-            if len(parts) > 1:
-                operation_name = "_".join(parts[1:])  # Skip the numeric prefix
-                op_name = f"{task_id}_{operation_name}"
-        
-        # Fallback: use just the task_id if we can't determine operation name
-        if op_name is None:
-            op_name = str(task_id)
-    
-    # Enhance user message with optimization data if available
+    Item 2 followup, Phase 1 (migration): consumes a ``Problem`` object
+    directly. The 5-way ``level_str`` normalisation collapses to
+    ``problem.level_id``, the reference-code fallback pyramid
+    collapses to :func:`data.sources.resolve_reference_code`, and the
+    ``problem`` is threaded into ``state["problem"]`` via
+    :func:`run_workflow` so ``_rl_node.py`` picks up the
+    Problem-driven artifact-resolution path.
+    """
+    problem_id = problem.id
+    user_message = ""
+    reference_code = _source_resolve_reference_code(problem)
+
+    # Extract task information for optimization data lookup.
+    # ``task_id`` and ``op_name`` used to be lookup keys on the entry
+    # dict; the shims never populated them, so the pre-refactor path
+    # always fell through to deriving them from problem_num +
+    # problem_name. Keep that derivation but off Problem now.
+    task_id = problem.problem_num
+    level_id = problem.level_id
+
+    problem_name = problem.problem_name or ""
+    op_name = None
+    if problem_name:
+        parts = problem_name.split("_")
+        if len(parts) > 1:
+            # Skip the numeric prefix.
+            operation_name = "_".join(parts[1:])
+            op_name = f"{task_id}_{operation_name}"
+    if op_name is None:
+        op_name = str(task_id)
+
+    # Enhance user message with optimization data if available.
     if op_name and task_id is not None and level_id is not None:
         user_message = enhance_user_message_with_optimization_data(
             user_message, task_id, level_id, op_name
@@ -449,6 +381,7 @@ async def process_problem(
                 job_logger=job_logger,
                 timeout_seconds=timeout_minutes * 60,
                 shared_database=shared_database,
+                problem=problem,
             )
             if result.success:
                 logger.info(
@@ -572,24 +505,20 @@ async def async_main():
     if getattr(args, "openai_api_key", None):
         os.environ["OPENAI_API_KEY"] = args.openai_api_key
 
-    dataset_str = args.dataset
+    # Item 2 followup Phase 1: migrated off ``get_dataset`` onto the
+    # source registry. Materialize into a list so ``len(problems)``
+    # works for the progress-log line further down.
+    problems = iter_problems_for_args(args)
 
-    dataset, dataset_iter = get_dataset(
-        args.dataset,
-        args.subset,
-        args.dataset_split,
-        args.precision,
-        args.problem_numbers,
-        args.start,
-        args.end,
-        args.single_file_path,
-    )
+    dataset_str = args.dataset
     # Append precision to dataset string when provided (avoid dataset-specific special-casing)
     if getattr(args, "precision", None):
         dataset_str += "/" + args.precision
     if args.subset in {"sol-level1", "sol-level2"} and args.dataset in (
         "kernelbench",
         "kernelbench-cuda",
+        "sol-execbench",
+        "sol-execbench-cuda",
     ):
         dataset_str += f"/{args.subset}"
 
@@ -705,10 +634,15 @@ async def async_main():
 
     workflow_config = create_workflow_config(args)
 
-    logger.info(f"Processing {len(dataset)} problems")
-    for entry in dataset_iter:
-        problem_id = entry["id"]
-        folder = OUT_DIR / problem_id
+    logger.info(f"Processing {len(problems)} problems")
+    for problem in problems:
+        problem_id = problem.id
+        # Use ``filesystem_id`` (drops the ``<source>:`` prefix from
+        # Problem.id) so the output-folder name matches the pre-migration
+        # ``entry["id"]`` layout exactly. Resuming existing runs from a
+        # previous session keeps working; new runs land at the same
+        # tree location.
+        folder = OUT_DIR / problem.filesystem_id
         if args.no_resume:
             logger.warning(
                 f"Retrying {problem_id} from scratch because --no-resume flag is set."
@@ -723,7 +657,7 @@ async def async_main():
         # Create a task for this problem
         task = asyncio.create_task(
             process_problem(
-                entry,
+                problem,
                 folder,
                 semaphore,
                 workflow_config,

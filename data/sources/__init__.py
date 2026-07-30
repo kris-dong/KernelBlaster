@@ -46,7 +46,103 @@ __all__ = [
     "parse_problem_numbers",
     "TIER_MARKERS",
     "path_tier_and_problem",
+    "resolve_reference_code",
+    "iter_problems_for_args",
 ]
+
+
+def resolve_reference_code(problem: Problem) -> Optional[str]:
+    """Resolve a torch reference for ``problem``.
+
+    Returns the inlined ``reference_code`` when the source populated
+    it (torch sources always do). Falls back to reading the
+    ``reference_py`` curated artifact on disk when only the path is
+    known (some OpenCL entries). Returns ``None`` when neither is
+    available — the caller decides whether that's an error.
+
+    Replaces ``scripts/run_RL.py::resolve_reference_code_for_entry``
+    (Item 2 followup, Phase 1). The pre-refactor helper had six
+    fallback tiers; the last four covered cross-suite lookups that
+    are now the source's responsibility to pre-resolve (see
+    ``notes/run_rl_migration_audit.md`` §2).
+    """
+    if problem.reference_code:
+        return problem.reference_code
+    ref_py = problem.curated_artifacts.get("reference_py")
+    if ref_py is not None:
+        try:
+            return Path(ref_py).read_text()
+        except OSError:
+            return None
+    return None
+
+
+def iter_problems_for_args(args) -> list[Problem]:
+    """Materialise problems from an argparse Namespace.
+
+    Threads the CLI's dataset / subset / precision / problem-numbers /
+    start / end / single-file-path knobs through ``get_source(...)`` +
+    ``iter_problems(...)``. Returns a list (not an iterator) so
+    ``len(...)`` works for the "Processing N problems" log line.
+
+    ``args.single_file_path``, when set, short-circuits everything
+    and returns a single ``Problem`` with ``source="custom"``,
+    ``tier="custom"`` — matches the pre-refactor behaviour in
+    ``scripts/run_kgen_opencl.py::collect_problems``.
+
+    Introduced in Item 2 followup Phase 1 as a run_RL migration
+    helper; can grow into the canonical CLI-to-Problem bridge as
+    more scripts migrate off ``get_dataset``.
+    """
+    single_fp = getattr(args, "single_file_path", None)
+    if single_fp:
+        return [_single_file_problem(single_fp, getattr(args, "precision", "fp32"))]
+
+    kwargs: dict[str, Any] = {}
+    precision = getattr(args, "precision", None)
+    if precision is not None:
+        # Only torch sources accept precision; the guard below picks
+        # the right constructor kwarg set.
+        kwargs["precision"] = precision
+
+    source_name = args.dataset
+    try:
+        source = get_source(source_name, **kwargs)
+    except TypeError:
+        # Source doesn't accept ``precision=`` (curated CUDA/OpenCL) —
+        # retry without it. Matches ``get_dataset``'s behaviour where
+        # precision is silently ignored for non-torch sources.
+        kwargs.pop("precision", None)
+        source = get_source(source_name, **kwargs)
+
+    problem_numbers = parse_problem_numbers(getattr(args, "problem_numbers", None))
+    return list(source.iter_problems(
+        tier=getattr(args, "subset", None),
+        problem_numbers=problem_numbers,
+        start=getattr(args, "start", None),
+        end=getattr(args, "end", None),
+    ))
+
+
+def _single_file_problem(path, precision: Optional[str]) -> Problem:
+    """Build a synthetic ``Problem`` for the ``--single-file-path`` CLI knob."""
+    from ._precision import inject_precision
+    p = Path(path)
+    reference_code = p.read_text()
+    if precision:
+        reference_code = inject_precision(reference_code, precision)
+    problem_name = p.stem
+    return Problem(
+        id=f"custom:custom/{problem_name}",
+        source="custom",
+        tier="custom",
+        problem_num=0,
+        problem_name=problem_name,
+        curated_artifacts={"reference_py": p},
+        reference_code=reference_code,
+        metadata={"precision": precision or "fp32"},
+        backends_supported=frozenset({"cuda", "opencl"}),
+    )
 
 
 # Every source-native tier name that can appear as a path segment in

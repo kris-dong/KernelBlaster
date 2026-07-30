@@ -65,6 +65,48 @@ class Problem:
         """
         return self.curated_artifacts[role]
 
+    @property
+    def level_id(self) -> Optional[int]:
+        """Numeric level extracted from ``tier``.
+
+        Handles all three tier taxonomies in circulation:
+          - ``level{1,2,3}``    -> 1 / 2 / 3
+          - ``L{1,2,3}``        -> 1 / 2 / 3
+          - ``sol-level{1,2}``  -> 1 / 2
+          - ``custom`` / other  -> ``None``
+
+        Consumes the 5-way if/elif in ``run_RL.py::process_problem``
+        (see ``notes/run_rl_migration_audit.md`` §3).
+        """
+        t = self.tier or ""
+        if t in ("L1", "level1", "sol-level1"):
+            return 1
+        if t in ("L2", "level2", "sol-level2"):
+            return 2
+        if t in ("L3", "level3"):
+            return 3
+        if t.startswith("level"):
+            try:
+                return int(t[len("level"):])
+            except ValueError:
+                return None
+        return None
+
+    @property
+    def filesystem_id(self) -> str:
+        """Filesystem-safe identifier — strips the ``<source>:`` prefix
+        from :attr:`id`.
+
+        ``Problem.id`` includes the source name for global uniqueness
+        (``"kernelbench-cuda:level1/003_Foo"``); putting the raw form
+        into a path yields a colon in the directory name, which some
+        filesystems (and shells) handle poorly. Callers that build
+        output directories use this property instead:
+
+            folder = out_dir / problem.filesystem_id
+        """
+        return self.id.split(":", 1)[1] if ":" in self.id else self.id
+
 
 class ProblemSource(ABC):
     """Contract every problem source satisfies.

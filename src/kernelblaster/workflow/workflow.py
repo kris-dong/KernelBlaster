@@ -98,8 +98,16 @@ async def run_workflow(
     job_logger: loguru.Logger,
     timeout_seconds: int,
     shared_database=None,
+    problem=None,
 ) -> WorkflowResult:
+    """Run the LangGraph workflow for a single problem.
 
+    ``problem`` (``data.sources.Problem``) is optional for back-compat
+    but strongly preferred — when set, it lands in ``state["problem"]``
+    so :mod:`kernelblaster.graph.nodes._rl_node` uses the
+    Problem-driven path (role-keyed curated_artifacts) instead of
+    deriving paths from the run-folder name.
+    """
     folder.mkdir(exist_ok=True, parents=True)
     start = time.time()
 
@@ -122,6 +130,8 @@ async def run_workflow(
         "shared_optimization_database": shared_database,
         **workflow_config.dict(),
     }
+    if problem is not None:
+        workflow_input["problem"] = problem
 
     try:
         final_state = await asyncio.wait_for(
