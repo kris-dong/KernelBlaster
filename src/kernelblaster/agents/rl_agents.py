@@ -31,11 +31,20 @@ from ..config import config
 
 @dataclass
 class TrajectoryStep:
-    """Represents a single step in an optimization trajectory."""
+    """Represents a single step in an optimization trajectory.
+
+    ``cycles`` retains its historical name for on-disk / JSON stability
+    but is now ``float`` — Step 4 canonicalisation. Both backends store
+    their primary metric here in the backend's native unit (CUDA cycles,
+    OpenCL ms). Previously OpenCL scaled ms → int µs to fit an ``int``
+    field; that shape-conversion (``Backend.metric_to_traj_cycles`` /
+    ``metric_from_traj_cycles``) is now identity and the hooks are
+    deleted.
+    """
     state: str
     action: str  # optimization technique
     code: str
-    cycles: int
+    cycles: float
     predicted_improvement: float
     actual_improvement: float
     reward: float
@@ -46,8 +55,8 @@ class Trajectory:
     """Represents a complete optimization trajectory."""
     steps: List[TrajectoryStep] = field(default_factory=list)
     total_reward: float = 0.0
-    initial_cycles: int = 0
-    final_cycles: int = 0
+    initial_cycles: float = 0.0
+    final_cycles: float = 0.0
     
     def add_step(self, step: TrajectoryStep):
         self.steps.append(step)

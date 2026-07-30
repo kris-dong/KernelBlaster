@@ -339,22 +339,8 @@ class Backend(ABC):
         OpenCL: ``int((current_metric or 0) * 1000)`` (ms -> microseconds-as-int).
         """
 
-    @abstractmethod
-    def metric_to_traj_cycles(self, metric) -> int:
-        """Convert a backend primary metric into the value stored in
-        ``TrajectoryStep.cycles`` (typed ``int``).
-
-        CUDA: ``int(metric)`` — cycles are already integer-valued.
-        OpenCL: ``int(metric * 1000)`` — stuff microseconds into the field.
-
-        Inverse of ``metric_from_traj_cycles``.
-        """
-
-    @abstractmethod
-    def metric_from_traj_cycles(self, cycles: int) -> float:
-        """Inverse of ``metric_to_traj_cycles``. Used by the top-level
-        ``run()`` loop when it reads ``TrajectoryStep.cycles`` back out to
-        select the fastest iteration.
-
-        CUDA: ``float(cycles)``. OpenCL: ``cycles / 1000.0``.
-        """
+    # ``metric_to_traj_cycles`` / ``metric_from_traj_cycles`` deleted in
+    # Step 4: ``TrajectoryStep.cycles`` is now typed ``float`` and holds
+    # each backend's native metric (CUDA cycles, OpenCL ms). No shape
+    # conversion is needed on read or write — callers just read
+    # ``step.cycles`` directly.

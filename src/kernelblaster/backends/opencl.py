@@ -256,11 +256,9 @@ class OpenCLBackend(Backend):
         # cycles slot the CUDA-flavored database API expects.
         return int((current_metric or 0) * 1000)
 
-    def metric_to_traj_cycles(self, metric) -> int:
-        return int(metric * 1000)
-
-    def metric_from_traj_cycles(self, cycles: int) -> float:
-        return cycles / 1000.0
+    # metric_to_traj_cycles / metric_from_traj_cycles deleted in Step 4 —
+    # TrajectoryStep.cycles is now ``float`` and holds ms directly (no
+    # more int-µs scaling).
 
     # ---- RL graph-node config ----
     def rl_node_config(self):

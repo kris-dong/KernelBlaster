@@ -594,7 +594,9 @@ class RLAgentBase(FeedbackAgent):
 
             if trajectory.steps:
                 best_step = min(trajectory.steps, key=lambda s: s.cycles)
-                step_metric = self.backend.metric_from_traj_cycles(best_step.cycles)
+                # Step 4: ``TrajectoryStep.cycles`` is the backend's native
+                # metric (float, no shape conversion needed).
+                step_metric = best_step.cycles
                 if step_metric < best_metric:
                     best_metric = step_metric
                     fp = self.folder / f"rl_iter_{idx}_best{ext}"
@@ -806,7 +808,9 @@ class RLAgentBase(FeedbackAgent):
                     state=current_state,
                     action=action_name,
                     code=optimized_code,
-                    cycles=self.backend.metric_to_traj_cycles(new_metric),
+                    # Step 4: cycles field now holds the backend's native
+                    # metric verbatim (float).
+                    cycles=new_metric,
                     predicted_improvement=(
                         getattr(optimization_entry, "predicted_improvement", 0.0) or 0.0
                     ),

@@ -564,7 +564,8 @@ class RLOpenCLAgent(RLAgentBase):
             best_kernel = self._global_best_code
             best_action = bstep.action if bstep else "global_best_pool"
             if bstep is not None:
-                t_ms = bstep.cycles / 1000.0
+                # Step 4: cycles is now the native metric (ms), no scaling.
+                t_ms = bstep.cycles
                 if abs(t_ms - best_ms) > 0.0005:
                     self.agent_logger.info(
                         f"Feedback uses global best {best_ms:.3f} ms "
@@ -575,7 +576,7 @@ class RLOpenCLAgent(RLAgentBase):
             best_step = min(trajectory.steps, key=lambda s: s.cycles)
             return (
                 best_step.code,
-                best_step.cycles / 1000.0,
+                best_step.cycles,  # already ms since Step 4
                 best_step.action,
                 best_step,
             )

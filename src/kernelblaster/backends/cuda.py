@@ -266,11 +266,8 @@ class CUDABackend(Backend):
     def state_cycles_from_metric(self, current_metric) -> int:
         return int(current_metric or 0)
 
-    def metric_to_traj_cycles(self, metric) -> int:
-        return int(metric)
-
-    def metric_from_traj_cycles(self, cycles: int) -> float:
-        return float(cycles)
+    # metric_to_traj_cycles / metric_from_traj_cycles deleted in Step 4 —
+    # TrajectoryStep.cycles is now ``float`` and holds cycles directly.
 
     # ---- RL graph-node config ----
     def rl_node_config(self):
