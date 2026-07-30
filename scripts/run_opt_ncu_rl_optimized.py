@@ -252,36 +252,54 @@ async def smoke_test_model(
 # ---------------------------------------------------------------------------
 
 
-def collect_problems(args) -> list[dict]:
-    """Return a list of {id, problem_name, level, init_cu, test_cpp} dicts.
+_SUBSET_TO_DIR = {
+    "L1": "level1",
+    "L2": "level2",
+    "L3": "level3",
+    "level1": "level1",
+    "level2": "level2",
+    "level3": "level3",
+    "sol-level1": "sol-level1",
+    "sol-level2": "sol-level2",
+}
 
-    Each problem must have a baseline ``final_cuda.cu`` (or equivalent) to
-    optimise and a ``driver.cpp`` test driver. The function is permissive about
-    naming so it works for both ``data/kernelbench-cuda/level1/...`` and
-    ``data/kernelbench-cuda/sol-level2/...`` layouts.
+# Kernel + driver candidates, tried in order. Matches the pre-refactor
+# permissive scan (this script's inputs are batch kgen outputs whose
+# filenames drift — ``final_cuda.cu`` = canonical kgen, ``init.cu`` =
+# pre-optimisation seed, ``kernel.cu`` = legacy alias; ditto for the
+# driver). This is script-local behaviour — ``KernelBenchCUDASource``
+# stays strict at ``init.cu``+``driver.cpp``.
+_KERNEL_CANDIDATES = ("final_cuda.cu", "init.cu", "kernel.cu")
+_DRIVER_CANDIDATES = ("driver.cpp", "test_driver.cpp")
+
+
+def collect_problems(args) -> list["Problem"]:
+    """Walk ``data/kernelbench-cuda/<sub>/`` and yield Problem objects.
+
+    Migrated in Item-2-followup cleanup Phase 2a. Yields
+    ``data.sources.Problem`` instances with role-keyed artifacts —
+    ``problem.artifact("kernel")`` (the .cu to optimise, may be
+    ``final_cuda.cu``/``init.cu``/``kernel.cu``) and
+    ``problem.artifact("driver")`` (the test driver, ``driver.cpp`` or
+    ``test_driver.cpp``). The permissive candidate scan stays here
+    because RL-optimized batch runs produce ``final_cuda.cu``, which
+    ``KernelBenchCUDASource`` deliberately doesn't accept (strict
+    ``init.cu``-only for the curated tree).
     """
-    subset_to_dir = {
-        "L1": "level1",
-        "L2": "level2",
-        "L3": "level3",
-        "level1": "level1",
-        "level2": "level2",
-        "level3": "level3",
-        "sol-level1": "sol-level1",
-        "sol-level2": "sol-level2",
-    }
-    sub = subset_to_dir.get(args.subset, args.subset)
+    from data.sources import Problem, parse_problem_numbers
+
+    sub = _SUBSET_TO_DIR.get(args.subset, args.subset)
     base = ROOT_DIR / "data" / "kernelbench-cuda" / sub
     if not base.is_dir():
         raise SystemExit(f"Subset directory not found: {base}")
 
-    # Item 2, Phase 6: shared parse_problem_numbers helper. Consumer uses a
-    # set for ``in`` membership checks; convert once here.
-    from data.sources import parse_problem_numbers
     _nums = parse_problem_numbers(args.problem_numbers)
     wanted: set[int] | None = set(_nums) if _nums is not None else None
 
-    out: list[dict] = []
+    is_sol = sub.startswith("sol-")
+    source_name = "sol-execbench-cuda" if is_sol else "kernelbench-cuda"
+
+    out: list[Problem] = []
     for prob_dir in sorted(p for p in base.iterdir() if p.is_dir()):
         try:
             num = int(prob_dir.name.split("_", 1)[0])
@@ -293,34 +311,32 @@ def collect_problems(args) -> list[dict]:
             continue
         if args.end and num > args.end:
             continue
-        # Init kernel: prefer final_cuda.cu (the kgen output / ground truth).
-        init_cu = None
-        for candidate in ("final_cuda.cu", "init.cu", "kernel.cu"):
-            p = prob_dir / candidate
-            if p.is_file():
-                init_cu = p
-                break
-        # Test driver.
-        test_cpp = None
-        for candidate in ("driver.cpp", "test_driver.cpp"):
-            p = prob_dir / candidate
-            if p.is_file():
-                test_cpp = p
-                break
-        if init_cu is None or test_cpp is None:
+
+        kernel = _first_existing(prob_dir, _KERNEL_CANDIDATES)
+        driver = _first_existing(prob_dir, _DRIVER_CANDIDATES)
+        if kernel is None or driver is None:
             logger.debug(f"Skipping {prob_dir.name}: missing init.cu or driver.cpp")
             continue
-        out.append(
-            {
-                "id": f"{sub}/{prob_dir.name}",
-                "problem_name": prob_dir.name,
-                "level": sub,
-                "init_cu": init_cu,
-                "test_cpp": test_cpp,
-            }
-        )
-    out.sort(key=lambda p: p["id"])
+
+        out.append(Problem(
+            id=f"{source_name}:{sub}/{prob_dir.name}",
+            source=source_name,
+            tier=sub,
+            problem_num=num,
+            problem_name=prob_dir.name,
+            curated_artifacts={"kernel": kernel, "driver": driver},
+            backends_supported=frozenset({"cuda"}),
+        ))
+    out.sort(key=lambda p: p.id)
     return out
+
+
+def _first_existing(directory, candidates):
+    for name in candidates:
+        p = directory / name
+        if p.is_file():
+            return p
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -337,7 +353,7 @@ AGENT_NAME = "opt_ncu_rl_optimized"
 
 async def _run_one(
     *,
-    problem: dict,
+    problem: "Problem",
     out_root: Path,
     model: str,
     gpu: GPUType,
@@ -352,10 +368,14 @@ async def _run_one(
     cost_tracker: Optional[CostTracker] = None,
     progress_writer: Optional[ProgressWriter] = None,
 ) -> bool:
-    folder = out_root / problem["id"]
+    # Item-2 cleanup Phase 2a: ``problem`` is now a ``data.sources.Problem``.
+    # ``filesystem_id`` strips the ``<source>:`` prefix so the output-folder
+    # layout matches the pre-migration ``problem.id`` shape.
+    problem_id = problem.id
+    folder = out_root / problem.filesystem_id
     folder.mkdir(parents=True, exist_ok=True)
 
-    job_logger = logger.bind(problem_id=problem["id"])
+    job_logger = logger.bind(problem_id=problem_id)
     log_file = folder / "run.log"
     handler_id = job_logger.add(
         log_file,
@@ -363,7 +383,7 @@ async def _run_one(
         backtrace=True,
         diagnose=True,
         format=config.CUSTOM_LOGGER_FORMAT,
-        filter=lambda r, pid=problem["id"]: r["extra"].get("problem_id") == pid,
+        filter=lambda r, pid=problem_id: r["extra"].get("problem_id") == pid,
     )
 
     fb_config = FeedbackConfig(
@@ -373,14 +393,14 @@ async def _run_one(
         init_user_prompt="",
         model=model,
         gpu=gpu,
-        test_code_fp=problem["test_cpp"],
+        test_code_fp=problem.artifact("driver"),
         max_attempts=1,
     )
 
     try:
         agent = OptimizedRLNCUAgent(
             fb_config=fb_config,
-            code_to_optimize_fp=problem["init_cu"],
+            code_to_optimize_fp=problem.artifact("kernel"),
             database_path=database_path,
             max_rollout_steps=max_steps,
             num_rl_iterations=num_iterations,
@@ -389,13 +409,13 @@ async def _run_one(
             prune_patience=prune_patience,
             max_fix_attempts=max_fix,
             cost_tracker=cost_tracker,
-            problem_id=problem["id"],
+            problem_id=problem_id,
             progress_writer=progress_writer,
         )
 
         # Mark this problem as started in the live progress feed (file-only).
         if progress_writer is not None:
-            progress_writer.problem_started(problem["id"])
+            progress_writer.problem_started(problem_id)
 
         ok = False
         no_baseline = False
@@ -407,14 +427,14 @@ async def _run_one(
             ok = "success" in result_path.name or no_baseline
             if no_baseline:
                 job_logger.warning(
-                    f"OPT-RL kept best rollout for {problem['id']} (no baseline to compare): {result_path}"
+                    f"OPT-RL kept best rollout for {problem.id} (no baseline to compare): {result_path}"
                 )
             elif ok:
-                job_logger.info(f"OPT-RL succeeded for {problem['id']}: {result_path}")
+                job_logger.info(f"OPT-RL succeeded for {problem.id}: {result_path}")
             else:
-                job_logger.warning(f"OPT-RL did not improve {problem['id']}: {result_path}")
+                job_logger.warning(f"OPT-RL did not improve {problem.id}: {result_path}")
         except asyncio.TimeoutError:
-            job_logger.error(f"OPT-RL timed out for {problem['id']}")
+            job_logger.error(f"OPT-RL timed out for {problem.id}")
             timed_out = True
 
         if progress_writer is not None:
@@ -434,7 +454,7 @@ async def _run_one(
             else:
                 status_override = None
             progress_writer.problem_finished(
-                problem["id"],
+                problem.id,
                 success=ok,
                 final_cycles=final_cycles,
                 init_cycles=init_cycles,
@@ -674,7 +694,8 @@ async def async_main() -> None:
 
     # ── Resume filter ────────────────────────────────────────────────
     if args.resume:
-        kept: list[dict] = []
+        from data.sources import Problem
+        kept: list[Problem] = []
         skipped_success = 0
         skipped_failed = 0
         for p in problems:
@@ -682,13 +703,13 @@ async def async_main() -> None:
             # directly under <problem-id>/ — FeedbackAgent appends agent_name
             # to base_folder. Without this subdir, every prior run looked
             # like a fresh problem and resume re-ran everything.
-            pdir = out_root / p["id"] / AGENT_NAME
+            pdir = out_root / p.filesystem_id / AGENT_NAME
             success_marker = pdir / "success_rl_optimization.cu"
             no_baseline_marker = pdir / "no_baseline_rl_optimization.cu"
             failure_marker = pdir / "failure_rl_optimization.cu"
             if success_marker.exists():
                 logger.info(
-                    f"RESUME  skipping {p['id']}  (already succeeded: {success_marker.name})"
+                    f"RESUME  skipping {p.id}  (already succeeded: {success_marker.name})"
                 )
                 skipped_success += 1
                 continue
@@ -696,14 +717,14 @@ async def async_main() -> None:
                 # Treat no-baseline as 'kept' — the artifact is usable; re-running
                 # without first repairing init.cu won't change the outcome.
                 logger.info(
-                    f"RESUME  skipping {p['id']}  (no_baseline kernel already kept: "
+                    f"RESUME  skipping {p.id}  (no_baseline kernel already kept: "
                     f"{no_baseline_marker.name})"
                 )
                 skipped_success += 1
                 continue
             if args.resume_skip_failed and failure_marker.exists():
                 logger.info(
-                    f"RESUME  skipping {p['id']}  (previously failed; --resume-skip-failed set)"
+                    f"RESUME  skipping {p.id}  (previously failed; --resume-skip-failed set)"
                 )
                 skipped_failed += 1
                 continue
@@ -758,15 +779,15 @@ async def async_main() -> None:
             if cost_tracker is not None:
                 t = cost_tracker.totals()
                 logger.info(
-                    f"DONE  {problem['id']}  "
+                    f"DONE  {problem.id}  "
                     f"status={'success' if ok else 'failed'}  "
                     f"calls={t['calls']}  cost=${t['cost_usd']:.3f}  "
                     f"({t['elapsed_s']:.0f}s elapsed)"
                 )
             else:
-                logger.info(f"DONE  {problem['id']}  status={'success' if ok else 'failed'}")
+                logger.info(f"DONE  {problem.id}  status={'success' if ok else 'failed'}")
 
-    tasks = [asyncio.create_task(_bound(p), name=f"bound:{p['id']}") for p in problems]
+    tasks = [asyncio.create_task(_bound(p), name=f"bound:{p.id}") for p in problems]
     try:
         await asyncio.gather(*tasks)
     finally:

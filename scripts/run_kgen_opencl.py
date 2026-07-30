@@ -74,46 +74,48 @@ def signal_handler(signum, frame):
     sys.exit(0)
 
 
-# Precision-injection was moved onto KernelBenchSource in Item 2, Phase 4.
-# This shim keeps ``_inject_precision`` in the local namespace so
-# ``collect_problems`` below can call it without churn. Phase 6 (script-
-# loader consolidation) migrates ``collect_problems`` onto
-# ``get_source("kernelbench")`` and this alias can be deleted.
-from data.sources.kernelbench_source import KernelBenchSource as _KernelBenchSource
-
-_inject_precision = _KernelBenchSource.inject_precision
+# Precision-injection helper — Item 2 cleanup Phase 2b: dropped the
+# ``_inject_precision`` local alias in favour of the canonical helper
+# in ``data.sources._precision``. Callers use ``inject_precision`` here.
+from data.sources._precision import inject_precision
 
 
-def collect_problems(args) -> list[dict]:
-    """Build problem list from CLI args.
+def collect_problems(args) -> list["Problem"]:
+    """Composite walker for kgen's two input sources.
 
-    Each entry has: id, problem_name, level, reference_code.
-    Sources reference.py from:
-      1. --single-file-path (direct .py file)
-      2. data/benchmark-opencl/<level>/<problem>/reference.py
-      3. data/KernelBench/KernelBench/<level>/<num>_*.py (original PyTorch benchmarks)
+    Yields ``data.sources.Problem`` objects with ``reference_code``
+    inlined (precision-injected). Two disk trees, tried in order:
+
+      1. ``data/benchmark-opencl/<L*>/<prob>/reference.py`` — the
+         curated OpenCL bench (also the base for
+         ``KernelBenchOpenCLSource``). Problems here have hand-authored
+         driver.c + kernel.cl artifacts alongside the reference.
+      2. ``data/KernelBench/KernelBench/<level*>/<NNN>_*.py`` — the
+         legacy KernelBench pytorch corpus, used as a fallback for
+         problems not yet ported into ``benchmark-opencl``.
+
+    Deduped by problem number: benchmark-opencl wins when both trees
+    contain a given problem. ``--single-file-path`` short-circuits
+    everything via :func:`data.sources.iter_problems_for_args` and
+    returns a single ``source="custom"`` Problem.
+
+    Migrated from the pre-cleanup dict-yielding walker in Item 2
+    cleanup Phase 2b — the composite-fallback semantics are kept
+    intact locally rather than pushed into a `CompositeSource`,
+    because this two-tree fallback is script-specific (kgen ingests
+    torch references; the fallback tree isn't a general concern for
+    other consumers).
     """
-    problems = []
+    from data.sources import Problem, iter_problems_for_args, parse_problem_numbers
 
     if args.single_file_path:
-        fp = Path(args.single_file_path)
-        if not fp.exists():
-            logger.error(f"File not found: {fp}")
-            return []
-        ref_code = _inject_precision(fp.read_text(), args.precision)
-        problem_name = fp.stem
-        problems.append({
-            "id": f"custom/{problem_name}",
-            "problem_name": problem_name,
-            "level": "custom",
-            "reference_code": ref_code,
-        })
-        return problems
+        # Reuse the canonical single-file-path handling — same
+        # source="custom" Problem shape as run_RL.py.
+        args_local = argparse.Namespace(
+            **{**vars(args), "dataset": "kernelbench"},  # dataset unused but required
+        )
+        return iter_problems_for_args(args_local)
 
-    # Item 2, Phase 6: shared parse_problem_numbers helper.
-    # The local ``problem_numbers`` used to be a set; keep it as a set for
-    # the ``in`` membership checks below (helper returns a sorted list).
-    from data.sources import parse_problem_numbers
     _nums = parse_problem_numbers(args.problem_numbers)
     problem_numbers = set(_nums) if _nums is not None else None
 
@@ -127,17 +129,26 @@ def collect_problems(args) -> list[dict]:
         logger.error(f"Unsupported subset for kgen: {subset}")
         return []
 
-    # Normalize to L1/L2/L3 for output paths
+    # Normalize to L1/L2/L3 for output paths — the OpenCL bench uses
+    # the L* spelling; problem IDs downstream match this.
     out_level = {"level1": "L1", "level2": "L2", "level3": "L3"}.get(kb_level, subset)
 
-    # Source 1: benchmark-opencl reference.py files
     opencl_bench = ROOT_DIR / "data" / "benchmark-opencl" / out_level
-    # Source 2: KernelBench PyTorch files
     kb_dir = ROOT_DIR / "data" / "KernelBench" / "KernelBench" / kb_level
 
-    seen = set()
+    def _in_range(num: int) -> bool:
+        if problem_numbers is not None and num not in problem_numbers:
+            return False
+        if args.start and num < args.start:
+            return False
+        if args.end and num > args.end:
+            return False
+        return True
 
-    # Scan benchmark-opencl for reference.py
+    problems: list[Problem] = []
+    seen: set[int] = set()
+
+    # Tier 1: benchmark-opencl reference.py.
     if opencl_bench.is_dir():
         for prob_dir in sorted(opencl_bench.iterdir()):
             if not prob_dir.is_dir():
@@ -149,44 +160,44 @@ def collect_problems(args) -> list[dict]:
                 num = int(prob_dir.name.split("_", 1)[0])
             except ValueError:
                 continue
-            if problem_numbers and num not in problem_numbers:
+            if not _in_range(num):
                 continue
-            if args.start and num < args.start:
-                continue
-            if args.end and num > args.end:
-                continue
-            problems.append({
-                "id": f"{out_level}/{prob_dir.name}",
-                "problem_name": prob_dir.name,
-                "level": out_level,
-                "reference_code": _inject_precision(ref_py.read_text(), args.precision),
-            })
+            problems.append(Problem(
+                id=f"kernelbench-opencl:{out_level}/{prob_dir.name}",
+                source="kernelbench-opencl",
+                tier=out_level,
+                problem_num=num,
+                problem_name=prob_dir.name,
+                curated_artifacts={"reference_py": ref_py},
+                reference_code=inject_precision(ref_py.read_text(), args.precision),
+                metadata={"precision": args.precision},
+                backends_supported=frozenset({"opencl"}),
+            ))
             seen.add(num)
 
-    # Scan KernelBench for PyTorch files not already covered
+    # Tier 2: KernelBench torch files not covered by Tier 1.
     if kb_dir.is_dir():
         for py_file in sorted(kb_dir.glob("*.py")):
             try:
                 num = int(py_file.name.split("_", 1)[0])
             except ValueError:
                 continue
-            if num in seen:
-                continue
-            if problem_numbers and num not in problem_numbers:
-                continue
-            if args.start and num < args.start:
-                continue
-            if args.end and num > args.end:
+            if num in seen or not _in_range(num):
                 continue
             problem_name = py_file.stem
-            problems.append({
-                "id": f"{out_level}/{problem_name}",
-                "problem_name": problem_name,
-                "level": out_level,
-                "reference_code": _inject_precision(py_file.read_text(), args.precision),
-            })
+            problems.append(Problem(
+                id=f"kernelbench:{out_level}/{problem_name}",
+                source="kernelbench",
+                tier=out_level,
+                problem_num=num,
+                problem_name=problem_name,
+                curated_artifacts={"reference_py": py_file},
+                reference_code=inject_precision(py_file.read_text(), args.precision),
+                metadata={"precision": args.precision},
+                backends_supported=frozenset({"cuda", "opencl"}),
+            ))
 
-    problems.sort(key=lambda p: p["id"])
+    problems.sort(key=lambda p: p.id)
     return problems
 
 
@@ -283,10 +294,13 @@ async def async_main():
     succeeded = 0
     failed = 0
 
-    async def process_one(entry):
+    async def process_one(problem):
         nonlocal succeeded, failed
-        problem_id = entry["id"]
-        folder = OUT_DIR / problem_id
+        # Item 2 cleanup Phase 2b: ``problem`` is a Problem now.
+        # ``filesystem_id`` keeps the pre-migration folder layout
+        # (drops the ``<source>:`` prefix from ``.id``).
+        problem_id = problem.id
+        folder = OUT_DIR / problem.filesystem_id
 
         job_logger = logger.bind(problem_id=problem_id)
         job_logger_id = job_logger.add(
@@ -303,7 +317,7 @@ async def async_main():
                 ok = await asyncio.wait_for(
                     run_kgen_opencl_pipeline(
                         folder=folder,
-                        reference_code=entry["reference_code"],
+                        reference_code=problem.reference_code,
                         logger=job_logger,
                         model=config.MODEL,
                         gpu=gpu_type,
