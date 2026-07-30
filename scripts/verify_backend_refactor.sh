@@ -35,10 +35,10 @@
 #   otherwise system python (will likely fail on import of fastapi).
 #
 # Ports:
-#   2200 — CUDA compile server
-#   2201 — CUDA GPU server
-#   2202 — OpenCL compile server
-#   2203 — Adreno GPU server
+#   22200 — CUDA compile server
+#   22201 — CUDA GPU server
+#   22202 — OpenCL compile server
+#   22203 — Adreno GPU server
 # (Deliberately offset from the existing container's 2101/2102.)
 #
 # Usage:
@@ -302,8 +302,8 @@ if [ "${SKIP_T2:-0}" != "1" ]; then
 
     if [ -n "$SKIP_T2_REASON" ]; then
         echo "  Skipping T2: $SKIP_T2_REASON"
-        record "T2.a compile server boot (port 2200)" SKIP
-        record "T2.b gpu server boot (port 2201)" SKIP
+        record "T2.a compile server boot (port 22200)" SKIP
+        record "T2.b gpu server boot (port 22201)" SKIP
         record "T2.c CUDA compile of 005_Matrix_scalar_multiplication" SKIP
         record "T2.d CUDA binary execute -> 'passed'" SKIP
     elif [ ! -f "$PROBLEM_DIR/driver.cpp" ] || [ ! -f "$PROBLEM_DIR/init.cu" ]; then
@@ -312,7 +312,7 @@ if [ "${SKIP_T2:-0}" != "1" ]; then
     else
         # Spawn compile server
         "$PY" -m src.kernelblaster.servers.compile \
-            --port 2200 \
+            --port 22200 \
             --num-workers 2 \
             --artifacts-dir "$CUDA_ARTIFACTS" \
             >"$TMPDIR/cuda_compile.log" 2>&1 &
@@ -320,30 +320,30 @@ if [ "${SKIP_T2:-0}" != "1" ]; then
 
         # Spawn GPU server
         "$PY" -m src.kernelblaster.servers.gpu \
-            --port 2201 \
+            --port 22201 \
             --log_path "$TMPDIR/cuda_gpu.log" \
             >"$TMPDIR/cuda_gpu_stdout.log" 2>&1 &
         SPAWNED_PIDS+=($!)
 
-        if wait_for_health "http://localhost:2200" 30; then
-            record "T2.a compile server boot (port 2200)" PASS
+        if wait_for_health "http://localhost:22200" 30; then
+            record "T2.a compile server boot (port 22200)" PASS
         else
             echo "  compile server failed to start — log tail:"
             tail -20 "$TMPDIR/cuda_compile.log"
-            record "T2.a compile server boot (port 2200)" FAIL
+            record "T2.a compile server boot (port 22200)" FAIL
         fi
 
-        if wait_for_health "http://localhost:2201" 30; then
-            record "T2.b gpu server boot (port 2201)" PASS
+        if wait_for_health "http://localhost:22201" 30; then
+            record "T2.b gpu server boot (port 22201)" PASS
         else
             echo "  gpu server failed to start — log tail:"
             tail -20 "$TMPDIR/cuda_gpu.log" 2>/dev/null || tail -20 "$TMPDIR/cuda_gpu_stdout.log"
-            record "T2.b gpu server boot (port 2201)" FAIL
+            record "T2.b gpu server boot (port 22201)" FAIL
         fi
 
         # Issue compile request
         COMPILE_RESP="$TMPDIR/cuda_compile_resp.json"
-        if curl -sf --max-time 120 -G "http://localhost:2200/compile" \
+        if curl -sf --max-time 120 -G "http://localhost:22200/compile" \
             --data-urlencode "job_name=verify_t2" \
             --data-urlencode "main_file=$PROBLEM_DIR/driver.cpp" \
             --data-urlencode "cuda_file=$PROBLEM_DIR/init.cu" \
@@ -369,7 +369,7 @@ if [ "${SKIP_T2:-0}" != "1" ]; then
         # Execute the binary via /gpu/binary
         if [ -n "$BINARY_PATH" ] && [ -f "$BINARY_PATH" ]; then
             EXEC_RESP="$TMPDIR/cuda_exec_resp.json"
-            if curl -sf --max-time 60 -X POST "http://localhost:2201/gpu/binary" \
+            if curl -sf --max-time 60 -X POST "http://localhost:22201/gpu/binary" \
                 -F "binary=@$BINARY_PATH" \
                 -F "args=" \
                 -F "n_runs=1" \
@@ -426,7 +426,7 @@ if [ "${SKIP_T3:-0}" != "1" ]; then
 
         # Spawn OpenCL compile server
         "$PY" -m src.kernelblaster.servers.compile_opencl \
-            --port 2202 \
+            --port 22202 \
             --num-workers 1 \
             --board-host "$KERNELBLASTER_ADRENO_BOARD_HOST" \
             --artifacts-dir "$OCL_ARTIFACTS" \
@@ -435,31 +435,31 @@ if [ "${SKIP_T3:-0}" != "1" ]; then
 
         # Spawn Adreno GPU server
         "$PY" -m src.kernelblaster.servers.gpu_adreno \
-            --port 2203 \
+            --port 22203 \
             --board-host "$KERNELBLASTER_ADRENO_BOARD_HOST" \
             --log_path "$TMPDIR/ocl_gpu.log" \
             >"$TMPDIR/ocl_gpu_stdout.log" 2>&1 &
         SPAWNED_PIDS+=($!)
 
-        if wait_for_health "http://localhost:2202" 30; then
-            record "T3.a opencl compile server boot (port 2202)" PASS
+        if wait_for_health "http://localhost:22202" 30; then
+            record "T3.a opencl compile server boot (port 22202)" PASS
         else
             echo "  opencl compile server failed to start — log tail:"
             tail -20 "$TMPDIR/ocl_compile.log"
-            record "T3.a opencl compile server boot (port 2202)" FAIL
+            record "T3.a opencl compile server boot (port 22202)" FAIL
         fi
 
-        if wait_for_health "http://localhost:2203" 30; then
-            record "T3.b adreno gpu server boot (port 2203, board=$KERNELBLASTER_ADRENO_BOARD_HOST)" PASS
+        if wait_for_health "http://localhost:22203" 30; then
+            record "T3.b adreno gpu server boot (port 22203, board=$KERNELBLASTER_ADRENO_BOARD_HOST)" PASS
         else
             echo "  adreno gpu server failed to start — log tail:"
             tail -20 "$TMPDIR/ocl_gpu.log" 2>/dev/null || tail -20 "$TMPDIR/ocl_gpu_stdout.log"
-            record "T3.b adreno gpu server boot (port 2203, board=$KERNELBLASTER_ADRENO_BOARD_HOST)" FAIL
+            record "T3.b adreno gpu server boot (port 22203, board=$KERNELBLASTER_ADRENO_BOARD_HOST)" FAIL
         fi
 
         # Issue OpenCL compile request
         OCL_COMPILE_RESP="$TMPDIR/ocl_compile_resp.json"
-        if curl -sf --max-time 120 -G "http://localhost:2202/compile_opencl" \
+        if curl -sf --max-time 120 -G "http://localhost:22202/compile_opencl" \
             --data-urlencode "job_name=verify_t3" \
             --data-urlencode "main_file=$OCL_PROBLEM_DIR/driver.c" \
             --data-urlencode "kernel_file=$OCL_PROBLEM_DIR/kernel.cl" \
@@ -507,7 +507,7 @@ if [ "${SKIP_T3:-0}" != "1" ]; then
         # compile-on-CPU-reference + GPU kernel + tolerance check end-to-end.
         if [ -n "$LOCAL_BIN" ] && [ -f "$LOCAL_BIN" ]; then
             OCL_EXEC_RESP="$TMPDIR/ocl_exec_resp.json"
-            if curl -sf --max-time 120 -X POST "http://localhost:2203/gpu/binary" \
+            if curl -sf --max-time 120 -X POST "http://localhost:22203/gpu/binary" \
                 -F "binary=@$LOCAL_BIN" \
                 -F "args=" \
                 -F "n_runs=1" \
@@ -540,7 +540,7 @@ sys.exit(0 if 'passed' in out.lower() else 2)
             # T3.f — execute with profile=true, verify [PROFILE] marker is present
             # and OpenCLBackend.parse_profile extracts the kernel timing.
             OCL_PROF_RESP="$TMPDIR/ocl_prof_resp.json"
-            if curl -sf --max-time 120 -X POST "http://localhost:2203/gpu/binary" \
+            if curl -sf --max-time 120 -X POST "http://localhost:22203/gpu/binary" \
                 -F "binary=@$LOCAL_BIN" \
                 -F "args=" \
                 -F "n_runs=1" \
@@ -726,15 +726,15 @@ if [ "${SKIP_T6:-0}" != "1" ] && [ "${SKIP_T3:-0}" != "1" ]; then
 
         # Reuse the OpenCL servers from T3 if still running; otherwise the
         # test will be skipped because the curl below fails.
-        if curl -sf --max-time 2 "http://localhost:2202/health" >/dev/null 2>&1 && \
-           curl -sf --max-time 2 "http://localhost:2203/health" >/dev/null 2>&1; then
+        if curl -sf --max-time 2 "http://localhost:22202/health" >/dev/null 2>&1 && \
+           curl -sf --max-time 2 "http://localhost:22203/health" >/dev/null 2>&1; then
             T6_OUT="$TMPDIR/t6.log"
             T6_KERNEL="$TMPDIR/t6_kernel/kernel.cl"
             mkdir -p "$TMPDIR/t6_kernel"
             cp "$REPO_ROOT/data/benchmark-opencl/L1/19_ReLU/kernel.cl" "$T6_KERNEL"
             T6_RESP="$TMPDIR/t6_exec_resp.json"
             # Compile (T3.c-style) — quickly, with a fresh job name
-            if curl -sf --max-time 120 -G "http://localhost:2202/compile_opencl" \
+            if curl -sf --max-time 120 -G "http://localhost:22202/compile_opencl" \
                 --data-urlencode "job_name=verify_t6" \
                 --data-urlencode "main_file=$REPO_ROOT/data/benchmark-opencl/L1/19_ReLU/driver.c" \
                 --data-urlencode "kernel_file=$T6_KERNEL" \
@@ -742,7 +742,7 @@ if [ "${SKIP_T6:-0}" != "1" ] && [ "${SKIP_T3:-0}" != "1" ]; then
                 --data-urlencode "remote=1" \
                 >"$TMPDIR/t6_compile_resp.json" 2>"$TMPDIR/t6_compile.err"; then
                 T6_BIN="$("$PY" -c "import json,sys; print(json.load(open(sys.argv[1])).get('output_path','') or '')" "$TMPDIR/t6_compile_resp.json")"
-                if [ -n "$T6_BIN" ] && curl -sf --max-time 120 -X POST "http://localhost:2203/gpu/binary" \
+                if [ -n "$T6_BIN" ] && curl -sf --max-time 120 -X POST "http://localhost:22203/gpu/binary" \
                     -F "binary=@$T6_BIN" \
                     -F "args=" \
                     -F "n_runs=1" \
@@ -800,7 +800,7 @@ PYEOF
                 record "T6 profile.json alongside profiled kernel (board)" SKIP
             fi
         else
-            echo "  T3 servers not running on :2202/:2203; T6 needs them"
+            echo "  T3 servers not running on :22202/:22203; T6 needs them"
             record "T6 profile.json alongside profiled kernel (board)" SKIP
         fi
     else

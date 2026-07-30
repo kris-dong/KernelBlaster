@@ -24,7 +24,8 @@ phased migration plan.
 """
 from __future__ import annotations
 
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any, Optional, Tuple
 
 from .base import Problem, ProblemSource
 from .kernelbench_source import KernelBenchSource
@@ -39,7 +40,47 @@ __all__ = [
     "KernelBenchOpenCLSource",
     "get_source",
     "parse_problem_numbers",
+    "TIER_MARKERS",
+    "path_tier_and_problem",
 ]
+
+
+# Every source-native tier name that can appear as a path segment in
+# run-output trees. Kept in one place so ``reprofile.py`` and
+# ``reprofile_nsys.py`` (and any future tier-aware consumer) don't
+# reinvent it. Ordering is unimportant — this is a membership set.
+TIER_MARKERS: frozenset[str] = frozenset({
+    "level1", "level2", "level3",
+    "L1", "L2", "L3",
+    "sol-level1", "sol-level2", "sol-level3",
+})
+
+
+def path_tier_and_problem(
+    path: Path,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Extract ``(tier, problem_name)`` from a run-output-tree path.
+
+    Convention: ``.../<tier>/<problem_name>/…`` where ``<tier>`` is one
+    of :data:`TIER_MARKERS`. Both reprofile scripts (Item 2, Phase 7)
+    parse paths this way. Uses the LAST tier marker in the path — paths
+    can legitimately contain the marker more than once (e.g. an output
+    dir named ``level2_results``); the tier associated with the leaf
+    kernel wins.
+
+    Returns ``(None, None)`` if no tier marker is found — callers fall
+    back to their own heuristic (usually ``path.parent.name``).
+    """
+    parts = path.parts
+    last_idx: Optional[int] = None
+    for i, part in enumerate(parts):
+        if part in TIER_MARKERS:
+            last_idx = i
+    if last_idx is None:
+        return None, None
+    tier = parts[last_idx]
+    problem_name = parts[last_idx + 1] if last_idx + 1 < len(parts) else None
+    return tier, problem_name
 
 
 def parse_problem_numbers(spec: Optional[str]) -> Optional[list[int]]:

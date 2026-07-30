@@ -216,15 +216,26 @@ class ReProfileAgent:
         return None
     
     def _get_problem_name(self, success_file: Path) -> str:
-        """Extract problem name from file path."""
-        # Path structure: .../level2/025_Conv2d_Min_Tanh_Tanh/rl_ncu/success_rl_optimization.cu
-        # Extract the problem directory name
-        parts = success_file.parts
-        for i, part in enumerate(parts):
-            if part.startswith(('level1', 'level2', 'level3')) and i + 1 < len(parts):
-                return parts[i + 1]  # Return the problem name directory
+        """Extract problem name from file path.
+
+        Path structure: ``.../level2/025_Conv2d_Min_Tanh_Tanh/rl_ncu/success_rl_optimization.cu``
+        The tier segment is one of ``TIER_MARKERS`` in ``data.sources``;
+        the problem-name segment immediately follows. Item 2, Phase 7:
+        migrated onto the shared ``path_tier_and_problem`` helper so the
+        list of tier markers (previously ``('level1','level2','level3')``
+        via ``str.startswith``, which quietly matched ``"level10"``) is
+        one place.
+        """
+        from data.sources import path_tier_and_problem
+        _, problem_name = path_tier_and_problem(success_file)
+        if problem_name is not None:
+            return problem_name
         # Fallback: use parent directory name
-        return success_file.parent.parent.name if success_file.parent.parent.name != 'rl_ncu' else success_file.parent.parent.parent.name
+        return (
+            success_file.parent.parent.name
+            if success_file.parent.parent.name != "rl_ncu"
+            else success_file.parent.parent.parent.name
+        )
     
     def _get_problem_number(self, success_file: Path) -> Optional[str]:
         """Extract problem number from file path."""

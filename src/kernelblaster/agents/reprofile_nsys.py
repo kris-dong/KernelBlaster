@@ -272,30 +272,22 @@ class NsysReProfileAgent:
         return None
 
     def _get_problem_name(self, path: Path) -> str:
-        tier_markers = ("L1", "L2", "L3", "level1", "level2", "level3",
-                        "sol-level1", "sol-level2", "sol-level3")
-        parts = path.parts
-        # Use the *last* tier marker (paths may contain the marker more than once)
-        last_idx = None
-        for i, part in enumerate(parts):
-            if part in tier_markers and i + 1 < len(parts):
-                last_idx = i
-        if last_idx is not None:
-            return parts[last_idx + 1]
-        return path.parent.parent.name if path.parent.name == "rl_ncu" else path.parent.name
+        # Item 2, Phase 7: shared path parser (see data.sources).
+        from data.sources import path_tier_and_problem
+        _, problem_name = path_tier_and_problem(path)
+        if problem_name is not None:
+            return problem_name
+        return (
+            path.parent.parent.name
+            if path.parent.name == "rl_ncu"
+            else path.parent.name
+        )
 
     def _get_tier(self, path: Path) -> Optional[str]:
         """Extract the tier directory name (e.g. 'sol-level1') from the path."""
-        tier_markers = ("sol-level1", "sol-level2", "sol-level3",
-                        "L1", "L2", "L3", "level1", "level2", "level3")
-        parts = path.parts
-        last_idx = None
-        for i, part in enumerate(parts):
-            if part in tier_markers:
-                last_idx = i
-        if last_idx is not None:
-            return parts[last_idx]
-        return None
+        from data.sources import path_tier_and_problem
+        tier, _ = path_tier_and_problem(path)
+        return tier
 
     @staticmethod
     def _find_repo_root(path: Path) -> Optional[Path]:
