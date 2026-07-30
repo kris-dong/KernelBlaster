@@ -6,46 +6,43 @@
 # You may obtain a copy of the License at
 #
 # http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-from glob import glob
-from typing import Iterator, Dict, Any
+"""Back-compat shim over :mod:`data.sources.kernelbench_source`.
+
+Item 2, Phase 4 (2026-07): the KernelBench (PyTorch reference) load
+logic + precision injection + SOL-level filtering now live on
+:class:`KernelBenchSource`. This module re-exports
+``KernelBenchDataset`` (and the two convenience lookup methods) so
+callers using the legacy factory ``get_dataset`` keep working. Phase 6
+migrates the factory itself onto sources.
+"""
+from __future__ import annotations
+
 from pathlib import Path
+from typing import Any
 
 from .dataset import Dataset
+from .sources.kernelbench_source import KernelBenchSource
 
 
 class KernelBenchDataset(Dataset):
-    """Dataset class for KernelBench dataset."""
+    """Back-compat facade — yields the pre-refactor dict-shaped entries.
+
+    New code should use :class:`data.sources.KernelBenchSource` directly.
+    """
 
     def __init__(
         self,
-        level_str: str = None,
+        level_str: str | None = None,
         problem_numbers: list[int] | None = None,
         precision: str = "fp32",
-        start: int = None,
-        end: int = None,
+        start: int | None = None,
+        end: int | None = None,
     ):
-        """Initialize the KernelBench dataset.
-
-        Args:
-            level (str): Level of the dataset to load
-            problem_name (str): Problem id to load
-        """
-        # Use a lowercase dataset directory name to avoid hard-coded capitalized paths
-        super().__init__(Path(__file__).parent / "kernelbench")
         assert level_str is None or level_str in [
-            "level1",
-            "level2",
-            "level3",
-            "sol-level1",
-            "sol-level2",
+            "level1", "level2", "level3", "sol-level1", "sol-level2",
         ], "Invalid level"
-        assert precision in ["fp32", "fp16", "bf16"], "Invalid precision"
+        source = KernelBenchSource(precision=precision)
+        super().__init__(Path(__file__).parent / "kernelbench")
         self.precision = precision
         self.sol_level1 = level_str == "sol-level1"
         self.sol_level2 = level_str == "sol-level2"
@@ -54,90 +51,15 @@ class KernelBenchDataset(Dataset):
             if self.sol_level1 or self.sol_level2
             else (int(level_str.split("level")[1]) if level_str else None)
         )
-        self._load_dataset(problem_numbers, start, end)
-
-    def _load_dataset(self, problem_numbers: list[int] | None, start: int | None, end: int | None) -> None:
-        """Load all JSON files from the dataset directory."""
-        if not self.data_dir.exists():
-            raise FileNotFoundError(f"Dataset directory {self.data_dir} not found")
-
-        if self.sol_level1:
-            paths = self.data_dir.glob("kernelbench/sol-level1/**/*.py")
-        elif self.sol_level2:
-            paths = self.data_dir.glob("kernelbench/sol-level2/**/*.py")
-        else:
-            paths = self.data_dir.glob("kernelbench/**/*.py")
-
-        for path in paths:
-            rel_parts = path.relative_to(self.data_dir).parts
-            if (
-                not (self.sol_level1 or self.sol_level2)
-                and len(rel_parts) >= 2
-                and rel_parts[1] in {"sol-level1", "sol-level2"}
-            ):
-                continue
-
-            parts = list(filter(lambda f: f, path.stem.split("_")))
-            num = int(parts[0])
-            parent_stem = path.parent.stem
-            if self.sol_level1 or self.sol_level2:
-                expected_sol_level = "sol-level1" if self.sol_level1 else "sol-level2"
-                if parent_stem != expected_sol_level:
-                    continue
-                new_name = f'{num:03d}_{"_".join(parts[1:])}'
-                id = f"{expected_sol_level}/{new_name}"
-                level_tag = expected_sol_level
-            else:
-                level = int(parent_stem.split("level")[1])
-                new_name = f'{num:03d}_{"_".join(parts[1:])}'
-                id = f"level{level}/{new_name}"
-                level_tag = f"level{level}"
-                if self.level_num is not None and self.level_num != level:
-                    continue
-                if self.level_num is None and (level == 3 or level == 4):
-                    # skip level3 and level4 problems unless explicitly specified
-                    # because they are outside the scope of the current agent.
-                    continue
-            if problem_numbers is not None and int(num) not in problem_numbers:
-                continue
-            if start is not None and int(num) < start:
-                continue
-            if end is not None and int(num) > end:
-                continue
-
-            # modify code for precision
-            reference_code = path.read_text()
-            match self.precision:
-                case "fp32":
-                    snippet = f"# Use fp32 datatype for all tensors\ntorch.set_default_dtype(torch.float32)"
-                case "fp16":
-                    snippet = f"# Use fp16 datatype for all tensors\ntorch.set_default_dtype(torch.float16)"
-                case "bf16":
-                    snippet = f"# Use bf16 datatype for all tensors\ntorch.set_default_dtype(torch.bfloat16)"
-                case _:
-                    raise ValueError(f"Invalid precision: {self.precision}")
-            insertion_point = reference_code.find("class Model")
-            reference_code = (
-                reference_code[:insertion_point]
-                + snippet
-                + "\n\n"
-                + reference_code[insertion_point:]
-            )
-
-            entry = {
-                "id": id,
-                "problem_name": new_name,
-                "problem_num": num,
-                "level": level_tag,
-                "reference_code": reference_code,
-                "filepath": str(path),
-                "precision": self.precision,
-            }
-            self.data.append(entry)
-        self.data.sort(key=lambda x: x["id"])
+        for problem in source.iter_problems(
+            tier=level_str,
+            problem_numbers=problem_numbers,
+            start=start,
+            end=end,
+        ):
+            self.data.append(_problem_to_legacy_entry(problem))
 
     def get_sample(self, level: int, problem_num: int) -> dict[str, Any]:
-        """Get a sample from the dataset by level and problem number."""
         for entry in self.data:
             if entry["level"] == level and entry["problem_num"] == problem_num:
                 return entry
@@ -146,21 +68,32 @@ class KernelBenchDataset(Dataset):
         )
 
     def get_sample_by_id(self, id_substring: str) -> dict[str, Any]:
-        """Get a sample from the dataset by id."""
         for entry in self.data:
             if id_substring in entry["id"]:
                 return entry
         raise ValueError(f"No sample found for id {id_substring}")
 
 
+def _problem_to_legacy_entry(problem) -> dict[str, Any]:
+    """Reverse of :meth:`KernelBenchSource._entry_to_problem` — keeps
+    pre-Phase-4 dict keys stable for legacy consumers."""
+    legacy_id = problem.id.split(":", 1)[1] if ":" in problem.id else problem.id
+    return {
+        "id": legacy_id,
+        "problem_name": problem.problem_name,
+        "problem_num": problem.problem_num,
+        "level": problem.tier,
+        "reference_code": problem.reference_code or "",
+        "filepath": str(problem.curated_artifacts["reference_py"]),
+        "precision": problem.metadata.get("precision", "fp32"),
+    }
+
+
 if __name__ == "__main__":
-    # Example usage
     dataset = KernelBenchDataset()
     print(f"Dataset size: {len(dataset)}")
-
-    # Example of iterating through the dataset
     for idx, sample in enumerate(dataset):
-        if idx < 3:  # Print first 3 samples
+        if idx < 3:
             print(f"Sample {idx}:", sample)
         else:
             break

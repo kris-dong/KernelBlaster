@@ -74,28 +74,14 @@ def signal_handler(signum, frame):
     sys.exit(0)
 
 
-_DTYPE_SNIPPETS = {
-    "fp16": "# Use fp16 datatype for all tensors\ntorch.set_default_dtype(torch.float16)",
-    "fp32": "# Use fp32 datatype for all tensors\ntorch.set_default_dtype(torch.float32)",
-}
+# Precision-injection was moved onto KernelBenchSource in Item 2, Phase 4.
+# This shim keeps ``_inject_precision`` in the local namespace so
+# ``collect_problems`` below can call it without churn. Phase 6 (script-
+# loader consolidation) migrates ``collect_problems`` onto
+# ``get_source("kernelbench")`` and this alias can be deleted.
+from data.sources.kernelbench_source import KernelBenchSource as _KernelBenchSource
 
-
-def _inject_precision(reference_code: str, precision: str) -> str:
-    """Inject torch.set_default_dtype before `class Model` (same as CUDA flow)."""
-    snippet = _DTYPE_SNIPPETS.get(precision)
-    if not snippet:
-        return reference_code
-    if "set_default_dtype" in reference_code:
-        return reference_code
-    insertion_point = reference_code.find("class Model")
-    if insertion_point == -1:
-        return snippet + "\n\n" + reference_code
-    return (
-        reference_code[:insertion_point]
-        + snippet
-        + "\n\n"
-        + reference_code[insertion_point:]
-    )
+_inject_precision = _KernelBenchSource.inject_precision
 
 
 def collect_problems(args) -> list[dict]:
