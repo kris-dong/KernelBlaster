@@ -416,10 +416,16 @@ class RLNCUAgent(RLAgentBase):
         shared methods in RLAgentBase use this wrapper to stay backend-
         agnostic. ``raw_metrics`` carries the CUDA-specific extras
         (``annotated_ncu``, ``stderr``).
+
+        Phase 3c CUDA: also persist ``<kernel>.profile.json`` next to the
+        kernel file for downstream tooling. Best-effort — failures logged
+        but don't break the RL loop (see ``_write_profile_json``).
+        ``raw_log`` is stored as the Speed-Of-Light-filtered NCU log
+        (already trimmed by ``_extract_speed_of_light_section``).
         """
         from ..backends import ProfileResult
         annotated_ncu, ncu_log, stderr, cycles = await self.gather_perf_metrics(filepath)
-        return ProfileResult(
+        pr = ProfileResult(
             total_time_ms=0.0,
             per_kernel_ms={},
             raw_metrics={
@@ -429,6 +435,14 @@ class RLNCUAgent(RLAgentBase):
             },
             raw_log=ncu_log,
         )
+        # Only persist when we actually got a profile — cycles=0 typically
+        # means NCU didn't profile any kernels (see gather_perf_metrics
+        # fallbacks). Writing an empty profile would obscure real issues
+        # downstream. Match OpenCL's implicit convention where an empty
+        # profile short-circuits the write.
+        if cycles:
+            self._write_profile_json(filepath, pr)
+        return pr
 
     async def gather_perf_metrics(self, filepath: Path) -> Tuple[str, str, str, int]:
         """Gather performance metrics using NCU profiling."""

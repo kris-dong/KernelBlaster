@@ -165,6 +165,24 @@ class RLAgentBase(FeedbackAgent):
             "Subclasses must implement gather_profile_result"
         )
 
+    def _write_profile_json(self, kernel_filepath: Path, pr: ProfileResult) -> None:
+        """Best-effort persist a ``ProfileResult`` next to the kernel file.
+
+        Phase 3c: downstream tooling (analytics, future speedup-tracker)
+        should read JSON instead of regex-parsing driver stdout. The file
+        is written to ``<kernel_filepath>.with_suffix('.profile.json')``.
+
+        Never raises — a filesystem hiccup or JSON-encode issue should not
+        break the RL loop. Failures are logged at WARNING.
+        """
+        try:
+            profile_json_path = Path(kernel_filepath).with_suffix(".profile.json")
+            pr.write_json(profile_json_path)
+        except Exception as e:
+            self.agent_logger.warning(
+                f"Failed to write profile.json for {kernel_filepath.name}: {e}"
+            )
+
     async def _derive_state(self, profile_result, code: str) -> str:
         """Compute the optimisation-state string for the current kernel.
 
