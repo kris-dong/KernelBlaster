@@ -6,48 +6,37 @@
 # You may obtain a copy of the License at
 #
 # http://www.apache.org/licenses/LICENSE-2.0
-"""KernelBench (PyTorch reference) source (Item 2, Phase 4).
+"""KernelBench (PyTorch reference) source.
 
 Layout: ``data/kernelbench/kernelbench/**/*.py`` (the doubled directory
-comes from the upstream repo layout). Also supports SOL-level tiers via
-``data/kernelbench/sol-level1/`` and ``data/kernelbench/sol-level2/`` —
-the two SOL tiers are handled inline here for now; the audit's proposed
-``SOLExecBenchSource`` split is deferred to a follow-up.
+comes from the upstream repo layout).
 
-This source has no on-disk curated artifacts — ``curated_artifacts`` is
-empty and ``reference_code`` is the inlined PyTorch module text (with
-precision snippet injected). Backends run kgen against
-``reference_code`` to produce their driver+kernel pair.
+Tier scope after the SOL split: this source covers **only** the
+regular KernelBench tiers ``level{1,2,3}``. The ``sol-level{1,2}`` tiers
+moved to :class:`SOLExecBenchTorchSource` — see that class and
+``notes/dataset_abstraction_audit.md`` §"Proposed abstractions".
 
-Phase 4 pulled loading + precision injection out of
-:class:`KernelBenchDataset`; the legacy module is now a back-compat
-shim over this source. ``scripts/run_kgen_opencl.py::_inject_precision``
-still exists as a script-local duplicate; Phase 6 deletes it in favour
-of :meth:`KernelBenchSource.inject_precision`.
+This source has no on-disk curated artifacts — ``curated_artifacts``
+carries only the reference `.py` file path; ``reference_code`` is the
+inlined PyTorch module text (with precision snippet injected).
+Backends run kgen against ``reference_code`` to produce their driver +
+kernel pair.
 """
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional
 
+from ._precision import ALLOWED_PRECISION, inject_precision
 from .base import Problem, ProblemSource
 
 
-_ALLOWED_TIERS = frozenset({
-    "level1", "level2", "level3", "sol-level1", "sol-level2",
-})
-_ALLOWED_PRECISION = frozenset({"fp32", "fp16", "bf16"})
+_ALLOWED_TIERS = frozenset({"level1", "level2", "level3"})
 
 # Levels considered "in scope" when no tier filter is given — historical
 # behaviour from ``KernelBenchDataset._load_dataset`` (skip level3/level4
 # without an explicit tier).
 _DEFAULT_IN_SCOPE_LEVELS = frozenset({1, 2})
-
-_DTYPE_SNIPPETS: Mapping[str, str] = {
-    "fp32": "# Use fp32 datatype for all tensors\ntorch.set_default_dtype(torch.float32)",
-    "fp16": "# Use fp16 datatype for all tensors\ntorch.set_default_dtype(torch.float16)",
-    "bf16": "# Use bf16 datatype for all tensors\ntorch.set_default_dtype(torch.bfloat16)",
-}
 
 
 def _data_dir() -> Path:
@@ -70,9 +59,9 @@ class KernelBenchSource(ProblemSource):
         precision: str = "fp32",
         root_dir: str | Path | None = None,
     ):
-        if precision not in _ALLOWED_PRECISION:
+        if precision not in ALLOWED_PRECISION:
             raise ValueError(
-                f"Invalid precision: {precision!r}. Expected one of {sorted(_ALLOWED_PRECISION)}."
+                f"Invalid precision: {precision!r}. Expected one of {sorted(ALLOWED_PRECISION)}."
             )
         self._precision = precision
         self._root = (
@@ -87,38 +76,11 @@ class KernelBenchSource(ProblemSource):
         # No curated artifacts — kgen produces them per problem.
         return None
 
-    # ---- Precision-injection (Phase 4) ----
-    @staticmethod
-    def inject_precision(reference_code: str, precision: str) -> str:
-        """Inject a ``torch.set_default_dtype`` snippet before ``class Model``.
-
-        Robust version (matches the ``scripts/run_kgen_opencl.py`` copy;
-        supersedes the CUDA-path variant in :class:`KernelBenchDataset`
-        which had no idempotency guard and would corrupt the source if
-        ``class Model`` was missing).
-
-        - Returns input unchanged when ``precision`` isn't recognised
-          (silent no-op — matches script behaviour for unknown
-          precisions like ``"bf16"`` in the OpenCL loader).
-        - Skips injection when the snippet is already present
-          (idempotent — safe to call multiple times).
-        - Falls back to prepending the snippet when ``class Model``
-          isn't found (previously silently corrupted the source).
-        """
-        snippet = _DTYPE_SNIPPETS.get(precision)
-        if not snippet:
-            return reference_code
-        if "set_default_dtype" in reference_code:
-            return reference_code
-        insertion_point = reference_code.find("class Model")
-        if insertion_point == -1:
-            return snippet + "\n\n" + reference_code
-        return (
-            reference_code[:insertion_point]
-            + snippet
-            + "\n\n"
-            + reference_code[insertion_point:]
-        )
+    # ---- Precision-injection ----
+    # Static method kept as a stable alias for
+    # ``scripts/run_kgen_opencl.py::_inject_precision`` (Phase 4 shim).
+    # Underlying logic now lives in :mod:`data.sources._precision`.
+    inject_precision = staticmethod(inject_precision)
 
     # ---- Loading ----
     def iter_problems(
@@ -132,32 +94,22 @@ class KernelBenchSource(ProblemSource):
         if tier is not None and tier not in _ALLOWED_TIERS:
             raise ValueError(
                 f"Invalid tier for kernelbench: {tier!r}. "
-                f"Expected one of {sorted(_ALLOWED_TIERS)}."
+                f"Expected one of {sorted(_ALLOWED_TIERS)}. "
+                f"For SOL-level tiers use the 'sol-execbench' source."
             )
         if not self._root.exists():
             raise FileNotFoundError(f"Dataset directory {self._root} not found")
 
-        is_sol = tier in {"sol-level1", "sol-level2"}
-        if tier == "sol-level1":
-            paths = self._root.glob("kernelbench/sol-level1/**/*.py")
-        elif tier == "sol-level2":
-            paths = self._root.glob("kernelbench/sol-level2/**/*.py")
-        else:
-            paths = self._root.glob("kernelbench/**/*.py")
-
-        level_num = (
-            int(tier.split("level")[1])
-            if tier and tier.startswith("level")
-            else None
-        )
+        level_num = int(tier.split("level")[1]) if tier else None
+        paths = self._root.glob("kernelbench/**/*.py")
 
         entries: list[dict[str, Any]] = []
         for path in paths:
-            # Skip SOL subtrees when no tier filter is given.
+            # Skip SOL subtrees — SOL problems live under
+            # SOLExecBenchTorchSource now, not this source.
             rel_parts = path.relative_to(self._root).parts
             if (
-                not is_sol
-                and len(rel_parts) >= 2
+                len(rel_parts) >= 2
                 and rel_parts[1] in {"sol-level1", "sol-level2"}
             ):
                 continue
@@ -169,26 +121,18 @@ class KernelBenchSource(ProblemSource):
                 continue
             parent_stem = path.parent.stem
 
-            if is_sol:
-                expected_sol_level = tier  # sol-level1 / sol-level2
-                if parent_stem != expected_sol_level:
-                    continue
-                new_name = f'{num:03d}_{"_".join(parts[1:])}'
-                pid = f"{expected_sol_level}/{new_name}"
-                level_tag = expected_sol_level
-            else:
-                try:
-                    level = int(parent_stem.split("level")[1])
-                except (ValueError, IndexError):
-                    continue
-                new_name = f'{num:03d}_{"_".join(parts[1:])}'
-                pid = f"level{level}/{new_name}"
-                level_tag = f"level{level}"
-                if level_num is not None and level_num != level:
-                    continue
-                if level_num is None and level not in _DEFAULT_IN_SCOPE_LEVELS:
-                    # historical: skip level3/level4 unless explicitly asked
-                    continue
+            try:
+                level = int(parent_stem.split("level")[1])
+            except (ValueError, IndexError):
+                continue
+            new_name = f'{num:03d}_{"_".join(parts[1:])}'
+            pid = f"level{level}/{new_name}"
+            level_tag = f"level{level}"
+            if level_num is not None and level_num != level:
+                continue
+            if level_num is None and level not in _DEFAULT_IN_SCOPE_LEVELS:
+                # historical: skip level3/level4 unless explicitly asked
+                continue
 
             if problem_numbers is not None and num not in problem_numbers:
                 continue
@@ -197,7 +141,7 @@ class KernelBenchSource(ProblemSource):
             if end is not None and num > end:
                 continue
 
-            reference_code = self.inject_precision(path.read_text(), self._precision)
+            reference_code = inject_precision(path.read_text(), self._precision)
             entries.append({
                 "id": pid,
                 "problem_name": new_name,

@@ -71,9 +71,67 @@ def get_dataset(
                 start=start,
                 end=end,
             )
+        case "sol-execbench":
+            # SOL split (2026-07): torch reference for the sol-level*
+            # tiers. Route through KernelBenchDataset — which dispatches
+            # to SOLExecBenchTorchSource internally when it sees a SOL
+            # tier — so the returned dataset is dict-shaped like every
+            # other legacy caller expects.
+            assert subset in [None, "sol-level1", "sol-level2"], f"Invalid subset: {subset}"
+            assert split is None, "dataset-split is not supported for sol-execbench"
+            dataset = KernelBenchDataset(
+                level_str=subset or "sol-level1",
+                problem_numbers=problem_numbers,
+                precision=precision,
+                start=start,
+                end=end,
+            )
+        case "sol-execbench-cuda":
+            # Curated CUDA artifacts for the SOL suite. Uses the new
+            # source directly — no legacy dataset shim exists for this
+            # tier (the pre-Phase-3 ``KernelBenchCUDADataset`` never
+            # accepted sol-level tiers).
+            from .sources import SOLExecBenchCUDASource
+            assert subset in [None, "sol-level1", "sol-level2"], f"Invalid subset: {subset}"
+            assert split is None, "dataset-split is not supported for sol-execbench-cuda"
+            dataset = _SourceBackedDataset(
+                SOLExecBenchCUDASource(),
+                tier=subset,
+                problem_numbers=problem_numbers,
+                start=start,
+                end=end,
+            )
         case _:
             raise ValueError(
-                f"Unknown dataset: {name}. Supported: 'kernelbench', 'kernelbench-cuda'."
+                f"Unknown dataset: {name}. Supported: 'kernelbench', 'kernelbench-cuda', "
+                f"'sol-execbench', 'sol-execbench-cuda'."
             )
 
     return dataset, dataset.get_iter(split)
+
+
+class _SourceBackedDataset:
+    """Minimal Dataset-shaped adapter over a ``ProblemSource``.
+
+    Used only for sources that don't have a legacy back-compat dataset
+    shim (currently ``sol-execbench-cuda``). Exposes ``__len__``,
+    ``__iter__``, and ``get_iter(split)`` so it plugs into
+    :func:`get_dataset`'s ``(dataset, iterator)`` return contract.
+    """
+
+    def __init__(self, source, *, tier, problem_numbers, start, end):
+        # Materialise entries into a list of Problem objects so
+        # ``__len__`` / ``__iter__`` / ``get_iter`` don't re-scan.
+        self._problems = list(source.iter_problems(
+            tier=tier, problem_numbers=problem_numbers, start=start, end=end,
+        ))
+
+    def __len__(self):
+        return len(self._problems)
+
+    def __iter__(self):
+        return iter(self._problems)
+
+    def get_iter(self, split=None):
+        assert split is None, "dataset-split is not supported for source-backed datasets"
+        return iter(self._problems)

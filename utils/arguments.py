@@ -87,6 +87,12 @@ def add_common_arguments(parser: argparse.ArgumentParser):
             "kernelbench",
             "kernelbench-cuda",
             "kernelbench-opencl",
+            # SOL split (2026-07): the SOL-ExecBench suite is a distinct
+            # source from KernelBench. ``sol-execbench`` = torch reference;
+            # ``sol-execbench-cuda`` = pre-generated CUDA artifacts (skip
+            # kgen). Sol-level tiers select via ``--subset``.
+            "sol-execbench",
+            "sol-execbench-cuda",
         ],
     )
     parser.add_argument(

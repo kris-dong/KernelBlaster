@@ -31,6 +31,8 @@ from .base import Problem, ProblemSource
 from .kernelbench_source import KernelBenchSource
 from .kernelbench_cuda_source import KernelBenchCUDASource
 from .kernelbench_opencl_source import KernelBenchOpenCLSource
+from .sol_execbench_torch_source import SOLExecBenchTorchSource
+from .sol_execbench_cuda_source import SOLExecBenchCUDASource
 
 __all__ = [
     "Problem",
@@ -38,6 +40,8 @@ __all__ = [
     "KernelBenchSource",
     "KernelBenchCUDASource",
     "KernelBenchOpenCLSource",
+    "SOLExecBenchTorchSource",
+    "SOLExecBenchCUDASource",
     "get_source",
     "parse_problem_numbers",
     "TIER_MARKERS",
@@ -117,6 +121,8 @@ _SOURCE_REGISTRY: dict[str, type[ProblemSource]] = {
     "kernelbench": KernelBenchSource,
     "kernelbench-cuda": KernelBenchCUDASource,
     "kernelbench-opencl": KernelBenchOpenCLSource,
+    "sol-execbench": SOLExecBenchTorchSource,
+    "sol-execbench-cuda": SOLExecBenchCUDASource,
 }
 
 
