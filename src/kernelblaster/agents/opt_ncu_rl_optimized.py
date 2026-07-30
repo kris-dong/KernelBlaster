@@ -1141,8 +1141,20 @@ class OptimizedRLNCUAgent(FeedbackAgent):
                 actual_improvement = 0.0
             reward = actual_improvement / 100.0
             self.bandit.update(current_state, chosen_name, reward)
+            # Phase 3c full: prefer direct metrics over the legacy file parse.
+            # ``current_file_path`` remains as a fallback for the tiny window
+            # where ``self.initial_cycles`` might be None (initial profiling
+            # exhausted its fix attempts — see the branch at :925). The
+            # DB then reads init.profile.json / ncu/0_init_ncu_log.txt via
+            # _read_baseline_metric_from_files.
             self.database.update_optimization_result(
                 current_state, chosen_name, actual_improvement,
+                current_metric=float(new_cycles),
+                baseline_metric=(
+                    float(self.initial_cycles)
+                    if self.initial_cycles is not None
+                    else None
+                ),
                 current_file_path=self.folder / "init.cu",
             )
 

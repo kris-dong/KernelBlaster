@@ -311,15 +311,10 @@ class Backend(ABC):
         prompt. CUDA uses a ```cpp fence and mentions ``cuda_fp16.h`` etc.;
         OpenCL uses a ```c fence and asks for the same signature."""
 
-    def database_update_kwargs(self) -> dict:
-        """Extra kwargs forwarded to ``database.update_optimization_result``.
-
-        CUDA passes nothing (relies on the DB's default baseline-file
-        speedup parse). OpenCL passes ``current_file_path=None`` to
-        suppress that parse because it tracks percent improvement from
-        measured ms directly.
-        """
-        return {}
+    # ``database_update_kwargs`` removed in Phase 3c full — the DB now
+    # prefers direct ``current_metric`` / ``baseline_metric`` args over any
+    # legacy file-based parsing, so the CUDA-vs-OpenCL split it used to
+    # bridge no longer exists. Callers pass metrics directly.
 
     # ---- Metric-shape glue (Phase 4f.3d.b) ----
     # The trajectory loop holds two scalar state variables — ``current_metric``

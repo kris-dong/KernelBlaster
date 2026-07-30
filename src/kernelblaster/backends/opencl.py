@@ -239,10 +239,7 @@ class OpenCLBackend(Backend):
             "Keep the same kernel function name and argument signature.\n"
         )
 
-    def database_update_kwargs(self) -> dict:
-        # OpenCL RL tracks percent improvement from measured ms; suppress
-        # the CUDA baseline-file speedup parse the database defaults to.
-        return {"current_file_path": None}
+    # ``database_update_kwargs`` removed in Phase 3c full (see base.py).
 
     # ---- Metric-shape glue (Phase 4f.3d.b) ----
     def parse_state_metrics(self, raw_log: str, current_metric) -> dict:

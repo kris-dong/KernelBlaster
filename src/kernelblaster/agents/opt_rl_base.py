@@ -835,11 +835,23 @@ class RLAgentBase(FeedbackAgent):
                         current_state, technique_name, actual_improvement,
                     )
                 else:
+                    # Phase 3c full: pass primary metrics directly. The DB's
+                    # speedup calc prefers this over any legacy file-based
+                    # parsing. ``current_metric`` and ``self.initial_metric``
+                    # are in the backend's primary unit (CUDA cycles / OpenCL
+                    # ms) — direction-consistent (lower is faster). This
+                    # supersedes the ``database_update_kwargs`` hook that used
+                    # to suppress the CUDA-flavored file parse for OpenCL.
                     self.database.update_optimization_result(
                         current_state,
                         technique_name,
                         actual_improvement,
-                        **self.backend.database_update_kwargs(),
+                        current_metric=float(new_metric),
+                        baseline_metric=(
+                            float(self.initial_metric)
+                            if self.initial_metric is not None
+                            else None
+                        ),
                     )
 
                 self.agent_logger.info(

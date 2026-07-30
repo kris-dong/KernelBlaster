@@ -36,11 +36,69 @@ def get_elapsed_cycles_v2(text: str) -> int:
         raise ValueError("No elapsed cycles found in text")
     return int(groups.group(1))
 
+
+def _read_baseline_metric_from_files(current_file_path: Path) -> float:
+    """Legacy file-based baseline lookup for ``update_optimization_result``.
+
+    Prefers ``<init>.profile.json`` (Phase 3c) if present, falls back to
+    the historical NCU-cycles regex parse of ``ncu/0_init_ncu_log.txt`` or
+    ``ncu_annot/init.cu``. Returns the primary metric (cycles for CUDA,
+    ms for OpenCL — via ``ProfileResult`` fields).
+
+    Raises ``ValueError`` / ``FileNotFoundError`` if no source is
+    available. Callers catch and fall back to percent-inference.
+    """
+    parent = current_file_path.parent
+
+    # Preferred: Phase 3c ``profile.json`` next to init kernel source. Try
+    # both extensions since this helper is called from CUDA (.cu) and OpenCL
+    # (.cl) code paths.
+    for ext in (".cu", ".cl"):
+        pj = parent / f"init{ext}.profile.json"
+        if pj.exists():
+            # Lazy import to avoid a database.py -> backends -> database cycle.
+            from ..backends import ProfileResult
+            pr = ProfileResult.read_json(pj)
+            # CUDA writes elapsed_cycles into raw_metrics; OpenCL populates
+            # total_time_ms. Fall through to whichever is non-zero.
+            cycles = pr.raw_metrics.get("elapsed_cycles")
+            if cycles:
+                return float(cycles)
+            if pr.total_time_ms > 0:
+                return float(pr.total_time_ms)
+
+    # Legacy CUDA-specific fallback.
+    baseline_ncu = parent / "ncu/0_init_ncu_log.txt"
+    init_cu = parent / "ncu_annot/init.cu"
+    if baseline_ncu.exists():
+        return float(get_elapsed_cycles_v2(baseline_ncu.read_text()))
+    return float(get_elapsed_cycles_v2(init_cu.read_text()))
+
+
+def _speedup_from_metrics(
+    baseline_metric: Optional[float], current_metric: Optional[float]
+) -> Optional[float]:
+    """Compute ``baseline / current`` when both are positive; else ``None``.
+
+    Direction is consistent across backends: for CUDA the primary metric is
+    elapsed-cycles (lower is faster), so ``baseline / current > 1`` when
+    current is faster. Same story for OpenCL ms.
+    """
+    if (
+        baseline_metric is None
+        or current_metric is None
+        or current_metric <= 0
+        or baseline_metric <= 0
+    ):
+        return None
+    return abs(float(baseline_metric) / float(current_metric))
+
 # NB: ``get_speedup_from_files`` was removed in Phase 3b — it had zero
-# callers in the repo. The live cycle-parsing path is ``get_elapsed_cycles_v2``
-# (above) called from ``update_optimization_result``; a future Phase 3c
-# may replace it with ``ProfileResult.from_dict(profile_json)`` once RL
-# agents write ``profile.json`` at every step.
+# callers in the repo. The live cycle-parsing path is
+# ``_read_baseline_metric_from_files`` (above) called from
+# ``update_optimization_result``; Phase 3c added a preferred
+# ``ProfileResult.read_json`` lookup so the regex-parse is now only a
+# back-compat fallback.
 
 
 class LLMInterface:
@@ -2209,91 +2267,130 @@ CODE IMPLEMENTATION:
             )
             self.composite_optimizations[state].append(composite)
 
-    def update_optimization_result(self, state: str, technique: str, actual_improvement: float,
-                                    current_file_path: Optional[Path] = None):
-            # Log the update attempt
-            # Update the optimization entry with actual results
-            if hasattr(self.llm_interface, 'logger') and self.llm_interface.logger:
-                self.llm_interface.logger.info(f"Attempting to update optimization result for {technique} in state {state} with actual improvement {actual_improvement}")
-            if state in self.optimization_strategies:
-                for opt in self.optimization_strategies[state].get("optimizations", []):
+    def update_optimization_result(
+        self,
+        state: str,
+        technique: str,
+        actual_improvement: float,
+        *,
+        current_metric: Optional[float] = None,
+        baseline_metric: Optional[float] = None,
+        current_file_path: Optional[Path] = None,
+    ):
+            """Record actuals + rolling speedup for an optimisation entry.
+
+            Speedup calc has three ranked paths (Phase 3c full):
+
+            1. **Direct metrics** — callers pass ``current_metric`` and
+               ``baseline_metric`` (backend primary metric, direction-consistent:
+               CUDA cycles, OpenCL ms; lower is faster in both). This is the
+               preferred path — no file I/O, no regex parsing, no unit
+               ambiguity. The unified RL agent (``RLAgentBase.run_rollout``)
+               passes both.
+            2. **File-based lookup** — if ``current_file_path`` is set but no
+               explicit ``baseline_metric``, ``_read_baseline_metric_from_files``
+               resolves the baseline. That helper prefers Phase 3c
+               ``init.profile.json`` and falls back to the legacy
+               ``ncu/0_init_ncu_log.txt`` regex parse. Used by
+               ``opt_ncu_rl_optimized`` which writes its own marker file.
+            3. **Percent-inference fallback** — when nothing else is
+               available, invert ``actual_improvement`` (percent) into a
+               speedup multiplier. Kept as a safety net; less accurate.
+            """
+            logger = getattr(self.llm_interface, "logger", None)
+            if logger:
+                logger.info(
+                    f"Attempting to update optimization result for {technique} "
+                    f"in state {state} with actual improvement {actual_improvement}"
+                )
+            if state not in self.optimization_strategies:
+                return  # nothing to update
+            for opt in self.optimization_strategies[state].get("optimizations", []):
                     if opt.technique == technique:
                         prev_usage = opt.usage_count
                         new_usage = prev_usage + 1
-                        # Store the most recent measurement
                         opt.actual_improvement = actual_improvement
                         opt.usage_count = new_usage
                         opt.last_updated = datetime.now().isoformat()
+                        if logger:
+                            logger.info(
+                                f"Updating database entry for {technique} in state {state}"
+                            )
 
-                        self.llm_interface.logger.info(f"Updating database entry for {technique} in state {state}")
                         # ----------------- Calculate speedup -----------------
-                        speedup_of_cur_optimization = 1.0  # Default to no speedup
-                        if current_file_path:
+                        speedup_of_cur_optimization: Optional[float] = None
+
+                        # Path 1: direct metrics (preferred).
+                        if current_metric is not None and baseline_metric is not None:
+                            if opt.initial_elapsed_cycles is None:
+                                opt.initial_elapsed_cycles = float(baseline_metric)
+                            speedup_of_cur_optimization = _speedup_from_metrics(
+                                opt.initial_elapsed_cycles, current_metric
+                            )
+                            if logger and speedup_of_cur_optimization is not None:
+                                logger.info(
+                                    f"Speedup calc (metrics): baseline={opt.initial_elapsed_cycles} "
+                                    f"current={current_metric} -> {speedup_of_cur_optimization:.4f}x"
+                                )
+
+                        # Path 2: file-based lookup (legacy back-compat).
+                        if speedup_of_cur_optimization is None and current_file_path:
                             try:
-                                if hasattr(self.llm_interface, 'logger') and self.llm_interface.logger:
-                                    self.llm_interface.logger.info(
-                                        f"Speedup calc: current_file_path={current_file_path}"
+                                if logger:
+                                    logger.info(
+                                        f"Speedup calc (files): current_file_path={current_file_path}"
                                     )
-                                # For first iteration, get initial baseline from files
                                 if opt.initial_elapsed_cycles is None:
-                                    baseline_ncu = current_file_path.parent / "ncu/0_init_ncu_log.txt"
-                                    init_cu = current_file_path.parent / "ncu_annot/init.cu"
-                                    if hasattr(self.llm_interface, 'logger') and self.llm_interface.logger:
-                                        self.llm_interface.logger.info(
-                                            f"Speedup calc: baseline paths exist? ncu={baseline_ncu.exists()} init_cu={init_cu.exists()}"
-                                        )
-                                    if baseline_ncu.exists():
-                                        initial_text = baseline_ncu.read_text()
-                                        used_path = baseline_ncu
-                                    else:
-                                        initial_text = init_cu.read_text()
-                                        used_path = init_cu
-                                    opt.initial_elapsed_cycles = get_elapsed_cycles_v2(initial_text)
-                                    if hasattr(self.llm_interface, 'logger') and self.llm_interface.logger:
-                                        self.llm_interface.logger.info(
-                                            f"Speedup calc: parsed initial_elapsed_cycles={opt.initial_elapsed_cycles} from {used_path}"
-                                        )
-                                # Calculate speedup using the passed in actual_improvement as current elapsed cycles
-                                # and the stored initial_elapsed_cycles as baseline
-                                if hasattr(self.llm_interface, 'logger') and self.llm_interface.logger:
-                                    self.llm_interface.logger.info(
-                                        f"Speedup calc: actual_improvement arg value={actual_improvement} (type={type(actual_improvement)})"
+                                    opt.initial_elapsed_cycles = _read_baseline_metric_from_files(
+                                        current_file_path
                                     )
-                                current_elapsed_cycles = int(actual_improvement)
-                                if hasattr(self.llm_interface, 'logger') and self.llm_interface.logger:
-                                    self.llm_interface.logger.info(
-                                        f"Speedup calc: current_elapsed_cycles={current_elapsed_cycles}, baseline={opt.initial_elapsed_cycles}"
-                                    )
-                                if current_elapsed_cycles <= 0:
-                                    raise ValueError(f"Non-positive current_elapsed_cycles={current_elapsed_cycles}")
-                                speedup_of_cur_optimization = abs(float(opt.initial_elapsed_cycles) / float(current_elapsed_cycles))
-                                opt.actual_speedup = speedup_of_cur_optimization
+                                    if logger:
+                                        logger.info(
+                                            f"Speedup calc (files): parsed baseline={opt.initial_elapsed_cycles}"
+                                        )
+                                # NB: legacy contract — the caller stuffed
+                                # current_elapsed_cycles into ``actual_improvement``
+                                # (opt_ncu_rl_optimized still does this). Kept
+                                # for back-compat until that call site migrates
+                                # to the direct-metrics path.
+                                current_val = current_metric if current_metric is not None else float(actual_improvement)
+                                if current_val <= 0:
+                                    raise ValueError(f"Non-positive current metric={current_val}")
+                                speedup_of_cur_optimization = _speedup_from_metrics(
+                                    opt.initial_elapsed_cycles, current_val
+                                )
                             except (ValueError, FileNotFoundError, AttributeError) as e:
-                                # Fall back to no speedup calculation if files can't be read
-                                if hasattr(self.llm_interface, 'logger') and self.llm_interface.logger:
-                                    self.llm_interface.logger.warning(f"Could not calculate speedup (baseline flow): {e}")
-                                speedup_of_cur_optimization = 1.0
-                        else:
-                            # No file path provided, cannot read baseline. Attempt to infer from percent improvement if applicable.
-                            if hasattr(self.llm_interface, 'logger') and self.llm_interface.logger:
-                                self.llm_interface.logger.info("Speedup calc: no current_file_path provided; attempting percent-based inference.")
+                                if logger:
+                                    logger.warning(
+                                        f"Could not calculate speedup (baseline flow): {e}"
+                                    )
+
+                        # Path 3: percent-inference fallback.
+                        if speedup_of_cur_optimization is None:
+                            if logger:
+                                logger.info(
+                                    "Speedup calc (percent): no metrics/file baseline; "
+                                    "inferring from actual_improvement."
+                                )
                             try:
                                 denom = 1.0 - (float(actual_improvement) / 100.0)
                                 if abs(denom) < 1e-6:
                                     denom = 1e-6 if denom >= 0 else -1e-6
-                                inferred_speedup = abs(1.0 / denom)
-                                # Use inferred speedup as measured value when baseline file path is unavailable
-                                speedup_of_cur_optimization = inferred_speedup
-                                opt.actual_speedup = inferred_speedup
-                                if hasattr(self.llm_interface, 'logger') and self.llm_interface.logger:
-                                    self.llm_interface.logger.info(
-                                        f"Speedup calc: inferred speedup from percent improvement={inferred_speedup:.4f}x (actual_improvement={actual_improvement})"
+                                speedup_of_cur_optimization = abs(1.0 / denom)
+                                if logger:
+                                    logger.info(
+                                        f"Speedup calc (percent): inferred={speedup_of_cur_optimization:.4f}x "
+                                        f"(actual_improvement={actual_improvement})"
                                     )
                             except Exception as e:
-                                if hasattr(self.llm_interface, 'logger') and self.llm_interface.logger:
-                                    self.llm_interface.logger.info(
-                                        f"Speedup calc: percent-based inference failed: {e} (actual_improvement={actual_improvement})"
+                                if logger:
+                                    logger.info(
+                                        f"Speedup calc (percent): inference failed: {e} "
+                                        f"(actual_improvement={actual_improvement})"
                                     )
+                                speedup_of_cur_optimization = 1.0
+
+                        opt.actual_speedup = speedup_of_cur_optimization
                         # Log measured speedups
                         if hasattr(self.llm_interface, 'logger') and self.llm_interface.logger:
                             self.llm_interface.logger.info(
