@@ -63,6 +63,30 @@ async def lifespan(app):
     env = os.environ.copy()
     env.setdefault("NVIDIA_TF32_OVERRIDE", "0")
 
+    # Prepend the venv's ``torch/lib`` to ``LD_LIBRARY_PATH`` so binaries
+    # compiled against THIS torch's libraries find the same ones at
+    # runtime. Without this, containers where the venv torch differs
+    # from the system torch (e.g. NGC images with a preinstalled
+    # ``/usr/local/lib/.../torch`` shadowing the venv's) hit
+    # ``symbol lookup error`` at driver-binary load — the missing symbols
+    # exist in the venv's libtorch but not the system's.
+    try:
+        import torch as _torch
+        torch_lib = os.path.join(os.path.dirname(_torch.__file__), "lib")
+        if os.path.isdir(torch_lib):
+            existing = env.get("LD_LIBRARY_PATH", "")
+            # Only prepend if not already the first entry (idempotent).
+            if not existing.startswith(torch_lib):
+                env["LD_LIBRARY_PATH"] = (
+                    f"{torch_lib}:{existing}" if existing else torch_lib
+                )
+            logger.info(f"GPU Server LD_LIBRARY_PATH pinned to venv libtorch: {torch_lib}")
+    except Exception as e:
+        logger.warning(
+            f"Failed to pin LD_LIBRARY_PATH to venv libtorch (binaries may hit "
+            f"ABI mismatch if the runtime torch differs from the compile-time one): {e}"
+        )
+
     # Determine which GPUs (and how many workers) to use.
     # Examples:
     #   KERNELBLASTER_GPU_SERVER_GPU_IDS="0,1,2,3"
