@@ -97,19 +97,21 @@ class RLNodeConfig:
     """Per-backend configuration consumed by the unified RL-optimization graph node.
 
     Carries the bits that genuinely diverge between the CUDA and OpenCL
-    optimization-graph nodes (curated-artifact root, state-dict keys, agent
-    class wiring, final filename, etc.). Each backend produces one of these
-    so ``graph/nodes/_rl_node.py`` can drive both flows from a single
-    function body — Phase 4e of the backend abstraction refactor.
+    optimization-graph nodes: which state keys carry the kernel /
+    driver paths through the graph, which agent class to instantiate,
+    and the OpenCL-only global-best output preference. See
+    ``graph/nodes/_rl_node.py`` for the single node body that consumes
+    this — Phase 4e of the backend abstraction refactor.
+
+    Step 1c cleanup: dropped the dataset-layout fields
+    (``curated_root_state_key``, ``curated_root_default``,
+    ``kernel_filename``, ``tier_resolver``). They only fed the
+    legacy "derive kernel path from run-folder parent name" fallback,
+    which had no live callers after run_RL.py + serve_api.py both
+    migrated onto ``state["problem"]``. Sources own dataset layout
+    now (:class:`data.sources.ProblemSource`); the graph node stays
+    purely state-driven.
     """
-
-    # Curated artifact resolution (state-driven, with sensible defaults).
-    curated_root_state_key: str          # state.get(this) overrides curated_root_default
-    curated_root_default: "Path"
-
-    # On-disk filenames inside a curated <root>/<tier>/<problem>/ directory.
-    kernel_filename: str                 # e.g. "init.cu" / "kernel.cl"
-    # ``driver_filename`` reuses ``Backend.driver_filename``.
 
     # State dict keys consumed/produced by the node.
     state_kernel_fp_input: str           # state[key] -> kernel-source path
@@ -127,11 +129,6 @@ class RLNodeConfig:
     # ``best_filename`` (e.g. global_best_rl_optimization.cl) is read off
     # ``Backend.best_filename()`` directly.
     use_global_best_preference: bool = False  # OpenCL prefers global_best over per-traj best
-
-    # Tier mapping: maps base_folder.parent.name to the directory under
-    # ``curated_root_default`` that holds the problem. CUDA: identity
-    # (level1/level2/...); OpenCL: tier-aware (sol-level2 -> L2 etc.).
-    tier_resolver: "Callable[[str], str] | None" = None
 
 
 class Backend(ABC):

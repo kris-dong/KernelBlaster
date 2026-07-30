@@ -276,18 +276,14 @@ class CUDABackend(Backend):
     def rl_node_config(self):
         """Per-backend wiring for the unified RL-optimization graph node.
 
-        CUDA curated layout: ``<root>/<level>/<problem>/{driver.cpp, init.cu}``
-        where ``<level>`` is the parent-folder name verbatim
-        (``level1``/``level2``/``level3``).
+        Curated-artifact resolution now lives on ``ProblemSource`` — see
+        :class:`data.sources.KernelBenchCUDASource` +
+        :class:`data.sources.SOLExecBenchCUDASource`.
         """
         from .base import RLNodeConfig
         from ..agents.opt_ncu_rl import RLNCUAgent
 
-        repo_root = Path(__file__).resolve().parents[3]
         return RLNodeConfig(
-            curated_root_state_key="kernelbench_cuda_root",
-            curated_root_default=repo_root / "data" / "kernelbench-cuda",
-            kernel_filename="init.cu",
             state_kernel_fp_input="cuda_fp",
             state_perf_fp_output="rl_ncu_cuda_fp",
             agent_class=RLNCUAgent,
@@ -296,7 +292,6 @@ class CUDABackend(Backend):
             num_pgen=4,
             final_filename="final_rl_cuda_perf.cu",
             use_global_best_preference=False,
-            tier_resolver=lambda parent_name: parent_name,  # identity
         )
 
     # ---- LLM response handling ----

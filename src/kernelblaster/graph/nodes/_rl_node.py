@@ -30,16 +30,20 @@ async def _run_rl_optimization_node(state: GraphState, backend) -> dict:
     """Unified RL-optimization graph node body.
 
     Resolves curated artifacts (kernel source + driver) then instantiates
-    the per-backend RL agent. Two resolution paths, tried in order:
+    the per-backend RL agent. Two resolution mechanisms, tried in order:
 
-      1. **Problem-driven** (Item 2, Phase 5). If ``state["problem"]`` is
-         set — a :class:`data.sources.Problem` — reads
-         ``problem.curated_artifacts["kernel"]`` and ``["driver"]``
-         directly. No parent-name derivation, no tier-map lookup, no
-         backend-specific ``RLNodeConfig`` disk-layout constants.
-      2. **Legacy path**. Derives paths from ``base_folder.parent.name``
-         via ``RLNodeConfig.tier_resolver`` + ``curated_root_default``.
-         Kept for callers not yet migrated onto ``get_source()``.
+      1. **State override**. If ``state[cfg.state_kernel_fp_input]`` /
+         ``state[cfg.state_test_code_fp_key]`` are set (typically by an
+         upstream kgen node in the same graph), use them verbatim.
+      2. **Problem-driven** (Item 2, Phase 5). If ``state["problem"]``
+         is set — a :class:`data.sources.Problem` — read
+         ``problem.curated_artifacts["kernel"]`` and ``["driver"]``.
+
+    The pre-Step-1c "derive-from-run-folder-parent-name" fallback was
+    deleted once every in-tree caller was migrated: run_RL.py always
+    sets ``state["problem"]``; the HTTP API (serve_api.py) sets it too
+    since Step 1b; the intermediate kgen node populates the state
+    override keys.
 
     Returns a dict with the backend-specific state-output key so
     existing downstream nodes don't need to change.
@@ -54,7 +58,7 @@ async def _run_rl_optimization_node(state: GraphState, backend) -> dict:
     kernel_fp = state.get(cfg.state_kernel_fp_input)
     test_code_fp = state.get(cfg.state_test_code_fp_key)
 
-    if problem is not None and (kernel_fp is None or test_code_fp is None):
+    if problem is not None:
         # Problem-driven resolution: role-keyed artifacts, no derivation.
         problem_name = problem.problem_name
         if kernel_fp is None:
@@ -72,75 +76,22 @@ async def _run_rl_optimization_node(state: GraphState, backend) -> dict:
                     f"{cfg.state_test_code_fp_key}: {test_code_fp}"
                 )
 
-    if kernel_fp is None or test_code_fp is None:
-        # Legacy path: derive from parent name + curated-root defaults.
-        # Repo root: .../src/kernelblaster/graph/nodes/_rl_node.py — parents[4].
-        repo_root = Path(__file__).resolve().parents[4]
-        curated_root = Path(
-            state.get(cfg.curated_root_state_key, cfg.curated_root_default)
+    if kernel_fp is None:
+        state["logger"].error(
+            f"No {cfg.state_kernel_fp_input} available and no Problem-"
+            f"provided kernel artifact. Set state[{cfg.state_kernel_fp_input!r}] "
+            f"upstream (e.g. via kgen) or provide state['problem'] with a "
+            f"'kernel' curated artifact."
         )
-        if not curated_root.exists():
-            alt = repo_root / "data" / f"kernelbench-{backend.name}"
-            if alt.exists():
-                state["logger"].warning(
-                    f"Curated root missing at {curated_root}; falling back to {alt}"
-                )
-                curated_root = alt
-
-        parent_name = base_folder.parent.name
-        tier_dir = cfg.tier_resolver(parent_name) if cfg.tier_resolver else parent_name
-        problem_name = problem_name or base_folder.name
-        curated_dir = curated_root / tier_dir / problem_name
-
-        curated_driver = curated_dir / backend.driver_filename
-        curated_kernel = curated_dir / cfg.kernel_filename
-
-        run_driver = base_folder / backend.driver_filename
-        run_kernel = base_folder / cfg.kernel_filename
-
-        if kernel_fp is None:
-            if curated_kernel.exists():
-                kernel_fp = curated_kernel
-                state["logger"].info(
-                    f"Using curated {cfg.kernel_filename} from {curated_dir} "
-                    f"as {cfg.state_kernel_fp_input}: {kernel_fp}"
-                )
-            elif run_kernel.exists():
-                kernel_fp = run_kernel
-                state["logger"].info(
-                    f"Using run-folder {cfg.kernel_filename} as "
-                    f"{cfg.state_kernel_fp_input}: {kernel_fp}"
-                )
-            else:
-                state["logger"].error(
-                    f"No {cfg.state_kernel_fp_input} available. Required files not found:\n"
-                    f"  - Curated: {curated_kernel}\n"
-                    f"  - Run folder: {run_kernel}\n"
-                    f"Skipping problem {problem_name} - curated {backend.name} files are required."
-                )
-                return {cfg.state_perf_fp_output: None}
-
-        if test_code_fp is None:
-            if curated_driver.exists():
-                test_code_fp = curated_driver
-                state["logger"].info(
-                    f"Using curated {backend.driver_filename} from {curated_dir} "
-                    f"as {cfg.state_test_code_fp_key}: {test_code_fp}"
-                )
-            elif run_driver.exists():
-                test_code_fp = run_driver
-                state["logger"].info(
-                    f"Using run-folder {backend.driver_filename} as "
-                    f"{cfg.state_test_code_fp_key}: {test_code_fp}"
-                )
-            else:
-                state["logger"].error(
-                    f"No {cfg.state_test_code_fp_key} available. Required files not found:\n"
-                    f"  - Curated: {curated_driver}\n"
-                    f"  - Run folder: {run_driver}\n"
-                    f"Skipping problem {problem_name} - curated {backend.driver_filename} is required."
-                )
-                return {cfg.state_perf_fp_output: None}
+        return {cfg.state_perf_fp_output: None}
+    if test_code_fp is None:
+        state["logger"].error(
+            f"No {cfg.state_test_code_fp_key} available and no Problem-"
+            f"provided driver artifact. Set state[{cfg.state_test_code_fp_key!r}] "
+            f"upstream (e.g. via kgen) or provide state['problem'] with a "
+            f"'driver' curated artifact."
+        )
+        return {cfg.state_perf_fp_output: None}
 
     kernel_fp = Path(kernel_fp)
     test_code_fp = Path(test_code_fp)

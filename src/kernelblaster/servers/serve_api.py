@@ -337,6 +337,29 @@ async def process_task(task_id: str, params: WorkflowRequest):
                 gpu=params.gpu if params.gpu else GPUType.current(),
             )
 
+            # Step 1b: build a synthetic ``Problem`` from the API request
+            # so downstream graph nodes can consume the same
+            # role-keyed artifact API as run_RL.py's process_problem.
+            # The API supplies the torch reference inline (no curated
+            # driver/kernel); ``curated_artifacts`` stays empty and the
+            # graph populates ``state["cuda_fp"]`` / ``state["test_code_fp"]``
+            # via the kgen node before the RL node runs.
+            from data.sources import Problem
+            problem = Problem(
+                id=f"custom:api/{task_id}",
+                source="custom",
+                tier="custom",
+                problem_num=0,
+                problem_name=f"api_{task_id}",
+                curated_artifacts={},
+                reference_code=params.reference_code,
+                metadata={
+                    "user_id": task.user_id,
+                    "http_task_id": task_id,
+                },
+                backends_supported=frozenset({"cuda", "opencl"}),
+            )
+
             result = await run_workflow(
                 task_id,
                 params.user_message,
@@ -345,6 +368,7 @@ async def process_task(task_id: str, params: WorkflowRequest):
                 workflow_config,
                 job_logger,
                 params.timeout,
+                problem=problem,
             )
 
             if result.timeout:

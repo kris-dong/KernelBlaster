@@ -266,38 +266,18 @@ class OpenCLBackend(Backend):
     def rl_node_config(self):
         """Per-backend wiring for the unified RL-optimization graph node.
 
-        OpenCL curated layout: ``<root>/<bench_tier>/<problem>/{driver.c, kernel.cl}``.
-        ``bench_tier`` is derived from the run-output parent folder name via
-        ``data.kernelbench_opencl.run_output_parent_to_benchmark_dir`` (e.g.
-        ``sol-level2 -> L2``).
+        OpenCL prefers ``global_best_rl_optimization.cl`` over
+        per-trajectory best when it exists — a verification-pool
+        optimization that CUDA doesn't currently use.
 
-        The OpenCL flow also prefers ``global_best_rl_optimization.cl`` over
-        per-trajectory best when it exists — a verification-pool optimization
-        that CUDA doesn't currently use.
+        Curated-artifact resolution lives on ``ProblemSource`` (see
+        :class:`data.sources.KernelBenchOpenCLSource`), not on this
+        config object.
         """
         from .base import RLNodeConfig
         from ..agents.opt_opencl_rl import RLOpenCLAgent
 
-        # Item 2 cleanup Phase 3: migrated off the ``data.kernelbench_opencl``
-        # back-compat shim. Lazy import kept — some server-only import paths
-        # don't have ``data`` on ``sys.path``.
-        try:
-            from data.sources.kernelbench_opencl_source import (
-                KernelBenchOpenCLSource,
-                _SUBSET_TO_BENCHMARK_DIR,
-            )
-            default_root = KernelBenchOpenCLSource._default_benchmark_root()
-            tier_fn = lambda parent: _SUBSET_TO_BENCHMARK_DIR.get(parent, parent)
-        except Exception:
-            # Fallback if data.sources isn't importable.
-            repo_root = Path(__file__).resolve().parents[3]
-            default_root = repo_root / "data" / "kernelbench-opencl"
-            tier_fn = lambda parent_name: parent_name
-
         return RLNodeConfig(
-            curated_root_state_key="kernelbench_opencl_root",
-            curated_root_default=default_root,
-            kernel_filename="kernel.cl",
             state_kernel_fp_input="kernel_cl_fp",
             state_perf_fp_output="rl_opencl_perf_fp",
             agent_class=RLOpenCLAgent,
@@ -306,7 +286,6 @@ class OpenCLBackend(Backend):
             num_pgen=1,
             final_filename="final_rl_opencl_perf.cl",
             use_global_best_preference=True,
-            tier_resolver=tier_fn,
         )
 
     # ---- LLM response handling ----
