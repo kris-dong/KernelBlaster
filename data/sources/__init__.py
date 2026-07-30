@@ -24,7 +24,7 @@ phased migration plan.
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 from .base import Problem, ProblemSource
 from .kernelbench_source import KernelBenchSource
@@ -38,7 +38,38 @@ __all__ = [
     "KernelBenchCUDASource",
     "KernelBenchOpenCLSource",
     "get_source",
+    "parse_problem_numbers",
 ]
+
+
+def parse_problem_numbers(spec: Optional[str]) -> Optional[list[int]]:
+    """Parse a ``--problem-numbers``-style CLI spec into a sorted-unique list.
+
+    Accepts comma-separated numbers and inclusive ranges. Example:
+    ``"1,3,5-9"`` -> ``[1, 3, 5, 6, 7, 8, 9]``. Whitespace tolerated.
+    Duplicates are removed (identical entries -> one item). Returns
+    ``None`` when ``spec`` is falsy — matches the pre-Phase-6 convention
+    where "no filter" is signalled by ``None``.
+
+    Item 2, Phase 6: replaces four near-identical inline parsers
+    (``data/__init__.py``, ``scripts/run_kgen_opencl.py``,
+    ``scripts/run_opt_ncu_rl_optimized.py``, and one in
+    ``scripts/run_reprofile.py`` that returned strings — that one is
+    NOT migrated onto this helper because its consumer expects strings).
+    """
+    if not spec:
+        return None
+    parsed: set[int] = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part and not part.startswith("-"):
+            lo, hi = part.split("-", 1)
+            parsed.update(range(int(lo), int(hi) + 1))
+        else:
+            parsed.add(int(part))
+    return sorted(parsed)
 
 
 _SOURCE_REGISTRY: dict[str, type[ProblemSource]] = {

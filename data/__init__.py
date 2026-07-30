@@ -47,19 +47,9 @@ def get_dataset(
     Returns:
         tuple: (dataset, dataset_iterator)
     """
-    if problem_numbers:
-        # Parse problem_numbers to support both comma-separated and range syntax
-        parsed_numbers = []
-        for part in problem_numbers.split(","):
-            part = part.strip()
-            if "-" in part and not part.startswith("-"):
-                # Handle range syntax like "8-60"
-                start_num, end_num = part.split("-", 1)
-                parsed_numbers.extend(range(int(start_num), int(end_num) + 1))
-            else:
-                # Handle individual numbers
-                parsed_numbers.append(int(part))
-        problem_numbers = parsed_numbers
+    # Item 2, Phase 6: shared parse_problem_numbers helper.
+    from .sources import parse_problem_numbers
+    problem_numbers = parse_problem_numbers(problem_numbers)
 
     match name:
         case "kernelbench":

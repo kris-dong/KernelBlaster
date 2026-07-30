@@ -275,19 +275,11 @@ def collect_problems(args) -> list[dict]:
     if not base.is_dir():
         raise SystemExit(f"Subset directory not found: {base}")
 
-    # Parse --problem-numbers like "1,3,5-9"
-    wanted: set[int] | None = None
-    if args.problem_numbers:
-        wanted = set()
-        for part in args.problem_numbers.split(","):
-            part = part.strip()
-            if not part:
-                continue
-            if "-" in part and not part.startswith("-"):
-                a, b = part.split("-", 1)
-                wanted.update(range(int(a), int(b) + 1))
-            else:
-                wanted.add(int(part))
+    # Item 2, Phase 6: shared parse_problem_numbers helper. Consumer uses a
+    # set for ``in`` membership checks; convert once here.
+    from data.sources import parse_problem_numbers
+    _nums = parse_problem_numbers(args.problem_numbers)
+    wanted: set[int] | None = set(_nums) if _nums is not None else None
 
     out: list[dict] = []
     for prob_dir in sorted(p for p in base.iterdir() if p.is_dir()):

@@ -110,18 +110,12 @@ def collect_problems(args) -> list[dict]:
         })
         return problems
 
-    # Parse problem numbers
-    problem_numbers = None
-    if args.problem_numbers:
-        parsed = []
-        for part in args.problem_numbers.split(","):
-            part = part.strip()
-            if "-" in part and not part.startswith("-"):
-                s, e = part.split("-", 1)
-                parsed.extend(range(int(s), int(e) + 1))
-            else:
-                parsed.append(int(part))
-        problem_numbers = set(parsed)
+    # Item 2, Phase 6: shared parse_problem_numbers helper.
+    # The local ``problem_numbers`` used to be a set; keep it as a set for
+    # the ``in`` membership checks below (helper returns a sorted list).
+    from data.sources import parse_problem_numbers
+    _nums = parse_problem_numbers(args.problem_numbers)
+    problem_numbers = set(_nums) if _nums is not None else None
 
     subset = args.subset or "L1"
     level_map = {
