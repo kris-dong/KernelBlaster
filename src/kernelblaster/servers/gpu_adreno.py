@@ -4,23 +4,17 @@ GPU execution server for Qualcomm Adreno targets.
 Executes compiled OpenCL binaries on the remote Adreno board via SSH.
 Supports profiling via OpenCL event timing (--profile flag on binaries).
 """
-import argparse
 import asyncio
-from contextlib import asynccontextmanager
 import os
 import time
-from fastapi import FastAPI, HTTPException, File, UploadFile, Form
 import logging
 from pydantic import BaseModel
 from pathlib import Path
-import uvicorn
 import json
 import tempfile
 import uuid
 from typing import Optional
 
-from .server_logging import get_log_config
-from .utils.queue_server import worker_pool
 from .utils.subprocess import run_subprocess_shell
 
 logger = logging.getLogger("uvicorn")
@@ -166,181 +160,7 @@ async def upload_and_exec_binary(
             )
 
 
-async def _adreno_binary_job(worker_id: int, job_args: tuple) -> AdrenoExecutionResult:
-    """Handler for one ``/gpu/binary`` request against the Adreno board.
 
-    Called by :func:`worker_pool`. ``job_args`` shape (7-tuple):
-    ``(binary_data, filename, kernel_files, args_str, n_runs, profile, timeout)``
-
-    Same "catch inside and return AdrenoExecutionResult(success=False)"
-    contract as the CUDA gpu server — the HTTP client destructures
-    ``result["success"]`` from a 200-OK JSON body.
-    """
-    binary_data, filename, kernel_files, args_str, n_runs, profile, timeout = job_args
-
-    logger.info(
-        f"[Worker {worker_id}]: Executing on Adreno board {_BOARD_HOST} "
-        f"(file={filename}, n_runs={n_runs}, profile={profile})"
-    )
-
-    try:
-        stdout, stderr = await upload_and_exec_binary(
-            binary_data=binary_data,
-            filename=filename,
-            board_host=_BOARD_HOST,
-            kernel_files=kernel_files,
-            args_str=args_str,
-            timeout=timeout,
-            n_runs=n_runs,
-            profile=profile,
-        )
-        logger.info(f"[Worker {worker_id}]: Execution successful")
-        return AdrenoExecutionResult(success=True, stdout=stdout, stderr=stderr)
-    except AdrenoExecutionError as e:
-        logger.error(f"[Worker {worker_id}]: Execution error: {e.error_message}")
-        return AdrenoExecutionResult(success=False, message=e.error_message)
-    except Exception as e:
-        logger.error(f"[Worker {worker_id}]: Unexpected error: {e}")
-        return AdrenoExecutionResult(success=False, message=f"Internal error: {e}")
-
-
-@asynccontextmanager
-async def lifespan(app):
-    global _BOARD_HOST
-    _BOARD_HOST = args.board_host
-    logger.info(f"Adreno GPU server starting: board={_BOARD_HOST}, workers={args.num_workers}")
-
-    # Verify SSH connectivity to board
-    try:
-        stdout, _ = await exec_remote_command("echo ok && ls /dev/kgsl-3d0", _BOARD_HOST, timeout=15)
-        logger.info(f"Board connectivity verified: {_BOARD_HOST}")
-    except Exception as e:
-        logger.warning(f"Board connectivity check failed: {e} (server will start anyway)")
-
-    # Ensure remote work dir exists AND wipe any orphan run dirs left behind
-    # by previously crashed processes. Without this, the board's /tmp (a 3.8
-    # GiB tmpfs) stays full of stale reference_output.bin files (~128 MiB
-    # each) from old SIGKILL'd / network-dropped runs and the new run quickly
-    # hits ENOSPC again. Pre-flight reset is safe: a fresh server start
-    # implies any prior run is dead, so its remote_dir is guaranteed orphan.
-    try:
-        await exec_remote_command(
-            f"rm -rf {_REMOTE_WORK_DIR} && mkdir -p {_REMOTE_WORK_DIR}",
-            _BOARD_HOST,
-            timeout=30,
-        )
-        # Also reap stragglers from the host-side `_generate_reference` path
-        # (opt_opencl_rl.py uses /tmp/kernelblaster_refgen_<host_pid>) — those
-        # leak when the host RL process dies before the post-step rm fires.
-        await exec_remote_command(
-            f"rm -rf /tmp/kernelblaster_refgen_*",
-            _BOARD_HOST,
-            timeout=15,
-        )
-        # Probe free space now so the log shows what we recovered.
-        df_out, _ = await exec_remote_command(
-            "df -h /tmp | tail -1", _BOARD_HOST, timeout=10
-        )
-        logger.info(f"Pre-flight cleanup of {_BOARD_HOST}:/tmp done: {df_out.strip()}")
-    except Exception as e:
-        logger.warning(
-            f"Pre-flight cleanup failed (continuing anyway): {e}"
-        )
-
-    async with worker_pool(
-        num_workers=args.num_workers,
-        queue=QUEUE,
-        handler=_adreno_binary_job,
-        domain_error=AdrenoExecutionError,
-        logger=logger,
-    ):
-        yield
-
-
-APP = FastAPI(lifespan=lifespan)
-
-
-@APP.get("/health")
-async def health_check():
-    return {"status": "healthy", "service": "adreno-gpu-server", "board": _BOARD_HOST}
-
-
-@APP.post("/gpu/binary", response_model=AdrenoExecutionResult)
-async def execute_gpu_binary(
-    binary: UploadFile = File(..., description="Binary executable to run on Adreno GPU"),
-    args: Optional[str] = Form("", description="Command line arguments for the binary"),
-    env_vars: Optional[str] = Form(None, description="Environment variables (JSON)"),
-    prefix_command: Optional[str] = Form(None, description="Unused for Adreno (ignored)"),
-    n_runs: Optional[int] = Form(1, description="Number of times to run the binary"),
-    timeout: Optional[float] = Form(3600, description="Timeout in seconds"),
-    kernel_files: Optional[str] = Form(None, description="JSON list of .cl kernel file paths to copy"),
-    profile: Optional[bool] = Form(False, description="Enable OpenCL event profiling"),
-):
-    """Execute a binary on the remote Adreno GPU board via SSH."""
-    logger.info(
-        f"/gpu/binary (Adreno) - Binary: {binary.filename}, Args: {args}, "
-        f"n_runs: {n_runs}, profile: {profile}, Queue backlog: {QUEUE.qsize()}"
-    )
-
-    try:
-        binary_data = await binary.read()
-        if not binary_data:
-            raise HTTPException(status_code=400, detail="Empty binary file provided")
-
-        parsed_kernel_files = None
-        if kernel_files:
-            try:
-                parsed_kernel_files = json.loads(kernel_files)
-            except json.JSONDecodeError:
-                parsed_kernel_files = [kernel_files]
-
-        completion_future = asyncio.Future()
-        # Queue-item shape matches ``queue_worker_loop`` convention:
-        # ``(*job_args, completion_future, enqueue_ts)``.
-        await QUEUE.put((
-            binary_data,
-            binary.filename or "adreno_executable",
-            parsed_kernel_files,
-            args or "",
-            n_runs,
-            profile or False,
-            timeout,
-            completion_future,
-            time.time(),
-        ))
-
-        await completion_future
-        return completion_future.result()
-
-    except asyncio.CancelledError:
-        raise HTTPException(status_code=500, detail="Request was cancelled")
-    except Exception as e:
-        logger.error(f"Error processing Adreno execution request: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
-
-
-def run_server(host: str, port: int, log_filepath: str = None):
-    log_config = get_log_config(log_filepath=log_filepath)
-    uvicorn.run(APP, host=host, port=port, log_config=log_config, timeout_graceful_shutdown=0.1)
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--host", type=str, default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=2004)
-    parser.add_argument("--num-workers", type=int, default=1)
-    from ..backends.opencl import default_board_host
-    parser.add_argument(
-        "--board-host", type=str,
-        default=default_board_host(),
-        help="SSH target for the Adreno dev board",
-    )
-    parser.add_argument(
-        "--log_path", type=Path, default=Path("/tmp/kernelblaster/adreno_gpu_server.log"),
-    )
-    args = parser.parse_args()
-
-    if args.log_path:
-        args.log_path.parent.mkdir(parents=True, exist_ok=True)
-
-    run_server(args.host, args.port, log_filepath=str(args.log_path) if args.log_path else None)
+# FastAPI parts (_adreno_binary_job, lifespan, APP, endpoints, run_server,
+# __main__) deleted in the Exec unification arc — callers now hit
+# servers.exec_server which invokes RemoteExecStrategy internally.

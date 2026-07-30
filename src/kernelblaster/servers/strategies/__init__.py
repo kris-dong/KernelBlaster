@@ -18,8 +18,11 @@ from ..utils.compile_strategy import (
     get_compile_strategy,
     register_compile_strategy,
 )
+from ..utils.exec_strategy import ExecStrategy
 from .cuda_compile import CUDACompileStrategy
 from .opencl_compile import OpenCLCompileStrategy
+from .local_exec import LocalExecStrategy
+from .remote_exec import RemoteExecStrategy
 
 # Self-registration on import — the unified server just imports
 # this package and can dispatch immediately.
@@ -27,9 +30,15 @@ register_compile_strategy(CUDACompileStrategy())
 register_compile_strategy(OpenCLCompileStrategy())
 
 __all__ = [
+    # Compile strategies
     "CompileStrategy",
     "CUDACompileStrategy",
     "OpenCLCompileStrategy",
     "get_compile_strategy",
     "register_compile_strategy",
+    # Exec strategies (no registry — the exec server picks at startup
+    # based on --board-host, not per-request).
+    "ExecStrategy",
+    "LocalExecStrategy",
+    "RemoteExecStrategy",
 ]

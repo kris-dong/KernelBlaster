@@ -189,9 +189,12 @@ def initialize_gpu_server(
         logger.info(f"Using existing GPU server at {gpu_server_url} for {gpu}")
         return None, gpu_server_url
 
+    # Exec unification: spawn the unified exec_server (local strategy —
+    # no --board-host arg = LocalExecStrategy). Same URL/endpoint as
+    # before (``/gpu/binary``); clients don't change.
     process, gpu_server_url = _spawn_server(
         label="GPU command server",
-        module="src.kernelblaster.servers.gpu",
+        module="src.kernelblaster.servers.exec_server",
         log_file=log_file,
         port=port,
         default_port=2002,
@@ -252,9 +255,11 @@ def initialize_adreno_gpu_server(
         from ..backends.opencl import default_board_host
         board_host = default_board_host()
 
+    # Exec unification: spawn the unified exec_server with --board-host
+    # (RemoteExecStrategy). Same /gpu/binary endpoint.
     return _spawn_server(
         label="Adreno GPU server",
-        module="src.kernelblaster.servers.gpu_adreno",
+        module="src.kernelblaster.servers.exec_server",
         log_file=log_file,
         port=port,
         default_port=2004,
@@ -284,7 +289,7 @@ def start_standalone_gpu_server(port: int = None, log_file_path: str = None) -> 
     gpu_server_cmd = [
         sys.executable,
         "-m",
-        "src.kernelblaster.servers.gpu",
+        "src.kernelblaster.servers.exec_server",
         "--port",
         str(port),
     ]

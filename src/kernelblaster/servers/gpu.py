@@ -12,24 +12,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import argparse
 import asyncio
 from contextlib import asynccontextmanager
 import os
 import time
 import psutil
-from fastapi import FastAPI, HTTPException, File, UploadFile, Form
 import logging
 from pydantic import BaseModel
 from pathlib import Path
-import uvicorn
 import json
 import tempfile
 import stat
 from typing import Optional
 
-from .server_logging import get_log_config
-from .utils.queue_server import worker_pool
 from .utils.subprocess import run_subprocess_shell
 
 env = None
@@ -54,92 +49,6 @@ def get_temp_dir():
 
 
 # Start worker tasks in the background
-@asynccontextmanager
-async def lifespan(app):
-    global logger, env, GPU_IDS
-
-    # Base environment for subprocesses launched by this server.
-    # NOTE: per-worker GPU pinning is applied at execution time via env vars.
-    env = os.environ.copy()
-    env.setdefault("NVIDIA_TF32_OVERRIDE", "0")
-
-    # Prepend the venv's ``torch/lib`` to ``LD_LIBRARY_PATH`` so binaries
-    # compiled against THIS torch's libraries find the same ones at
-    # runtime. Without this, containers where the venv torch differs
-    # from the system torch (e.g. NGC images with a preinstalled
-    # ``/usr/local/lib/.../torch`` shadowing the venv's) hit
-    # ``symbol lookup error`` at driver-binary load — the missing symbols
-    # exist in the venv's libtorch but not the system's.
-    try:
-        import torch as _torch
-        torch_lib = os.path.join(os.path.dirname(_torch.__file__), "lib")
-        if os.path.isdir(torch_lib):
-            existing = env.get("LD_LIBRARY_PATH", "")
-            # Only prepend if not already the first entry (idempotent).
-            if not existing.startswith(torch_lib):
-                env["LD_LIBRARY_PATH"] = (
-                    f"{torch_lib}:{existing}" if existing else torch_lib
-                )
-            logger.info(f"GPU Server LD_LIBRARY_PATH pinned to venv libtorch: {torch_lib}")
-    except Exception as e:
-        logger.warning(
-            f"Failed to pin LD_LIBRARY_PATH to venv libtorch (binaries may hit "
-            f"ABI mismatch if the runtime torch differs from the compile-time one): {e}"
-        )
-
-    # Determine which GPUs (and how many workers) to use.
-    # Examples:
-    #   KERNELBLASTER_GPU_SERVER_GPU_IDS="0,1,2,3"
-    #   KERNELBLASTER_GPU_SERVER_NUM_WORKERS=4
-    gpu_ids_raw = os.getenv("KERNELBLASTER_GPU_SERVER_GPU_IDS", "").strip()
-    if gpu_ids_raw:
-        GPU_IDS = [s.strip() for s in gpu_ids_raw.split(",") if s.strip()]
-    else:
-        num_workers = int(os.getenv("KERNELBLASTER_GPU_SERVER_NUM_WORKERS", "1"))
-        GPU_IDS = [str(i) for i in range(max(1, num_workers))]
-
-    logger.info(
-        f"GPU Server worker config: num_workers={len(GPU_IDS)} GPU_IDS={GPU_IDS} "
-        f"(override via KERNELBLASTER_GPU_SERVER_NUM_WORKERS / KERNELBLASTER_GPU_SERVER_GPU_IDS)"
-    )
-
-    # Print the current user (whoami) at server startup
-    logger.info(f"GPU Server running as user: {os.getuid()}")
-    logger.info(f"GPU Server running as user: {os.geteuid()}")
-
-    # Diagnostic-only — don't crash startup if the container's user/group DB
-    # has holes (e.g. a mounted GID that isn't in /etc/group; `groups` exits
-    # non-zero in that case, which used to abort the whole lifespan).
-    try:
-        stdout, stderr = await exec_command("whoami")
-        logger.info(f"GPU Server running as user: {stdout}\n{stderr}")
-    except Exception as diag_err:
-        logger.warning(f"Diagnostic `whoami` failed (non-fatal): {diag_err}")
-
-    try:
-        stdout, stderr = await exec_command("groups")
-        logger.info(f"User groups: {stdout}\n{stderr}")
-    except Exception as diag_err:
-        logger.warning(f"Diagnostic `groups` failed (non-fatal): {diag_err}")
-    
-    # Print nvidia-smi information before starting the server
-    await print_nvidia_smi(logger)
-
-    # Check for pre-existing GPU processes
-    await check_gpu_processes()
-    # Start worker tasks on startup (one per GPU id). ``worker_pool``
-    # cancels the workers on lifespan exit — no more leaked coroutines.
-    async with worker_pool(
-        num_workers=len(GPU_IDS),
-        queue=QUEUE,
-        handler=_gpu_binary_job,
-        domain_error=GpuCommandError,
-        logger=logger,
-    ):
-        yield
-
-
-APP = FastAPI(lifespan=lifespan)
 
 
 class GpuExecutionRequest(BaseModel):
@@ -378,208 +287,7 @@ def cleanup_temp_file(binary_path: str):
         logger.warning(f"Failed to cleanup temporary file: {e}")
 
 
-async def _gpu_binary_job(worker_id: int, job_args: tuple) -> GpuCommandResult:
-    """Handler for one ``/gpu/binary`` request.
 
-    Called by :func:`worker_pool` for each item dequeued from
-    ``QUEUE``. The handler catches ``GpuCommandError`` internally and
-    returns a ``GpuCommandResult(success=False)`` on failure so the
-    HTTP client sees a valid JSON body — matches the pre-Phase-B
-    behaviour where the endpoint always returned 200 with an inline
-    success flag.
-
-    ``job_args`` shape (6-tuple):
-    ``(binary_path, args, env_vars, prefix_command, n_runs, timeout)``
-    """
-    binary_path, cmd_args, env_vars, prefix_command, n_runs, timeout = job_args
-
-    # Pin this worker to a specific GPU by injecting CUDA_VISIBLE_DEVICES.
-    # If the caller explicitly passed CUDA_VISIBLE_DEVICES, respect it.
-    eff_env_vars = dict(env_vars or {})
-    if "CUDA_VISIBLE_DEVICES" not in eff_env_vars:
-        gpu_id = str(worker_id)
-        if GPU_IDS and worker_id < len(GPU_IDS):
-            gpu_id = str(GPU_IDS[worker_id])
-        eff_env_vars["CUDA_VISIBLE_DEVICES"] = gpu_id
-    # Ensure TF32 override is stable unless caller requested otherwise.
-    eff_env_vars.setdefault("NVIDIA_TF32_OVERRIDE", "0")
-    gpu_visible = eff_env_vars.get("CUDA_VISIBLE_DEVICES", "<unset>")
-
-    logger.info(
-        f"[Worker {worker_id}]: Assigned GPU CUDA_VISIBLE_DEVICES="
-        f"{gpu_visible} for binary {binary_path}"
-    )
-    logger.info(
-        f"[Worker {worker_id}]: Executing binary {binary_path} with "
-        f"args: {cmd_args}, env_vars: {eff_env_vars}, "
-        f"prefix: {prefix_command}, n_runs: {n_runs}, timeout: {timeout}"
-    )
-
-    try:
-        stdout_list, stderr_list = await exec_binary(
-            binary_path,
-            cmd_args,
-            timeout=timeout,
-            env_vars=eff_env_vars,
-            prefix_command=prefix_command,
-            n_runs=n_runs,
-        )
-        logger.info(
-            f"[Worker {worker_id}]: Successfully executed binary on "
-            f"CUDA_VISIBLE_DEVICES={gpu_visible}: "
-            f"{f'{prefix_command} ' if prefix_command else ''}{binary_path} "
-            f"with {n_runs} runs"
-        )
-        return GpuCommandResult(success=True, stdout=stdout_list, stderr=stderr_list)
-    except GpuCommandError as e:
-        logger.error(
-            f"[Worker {worker_id}]: Error executing binary {binary_path} "
-            f"on CUDA_VISIBLE_DEVICES={gpu_visible}: {e.error_message}"
-        )
-        return GpuCommandResult(success=False, message=e.error_message)
-    except Exception as e:
-        logger.error(f"[Worker {worker_id}]: Unexpected error: {e}")
-        return GpuCommandResult(success=False, message=f"Internal error: {e}")
-    finally:
-        # Always clean up the temp binary — success or failure.
-        cleanup_temp_file(binary_path)
-
-
-@APP.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {"status": "healthy", "service": "gpu-server"}
-
-
-@APP.post("/gpu/binary", response_model=GpuCommandResult)
-async def execute_gpu_binary(
-    binary: UploadFile = File(..., description="Binary executable to run on GPU"),
-    args: Optional[str] = Form("", description="Command line arguments for the binary"),
-    env_vars: Optional[str] = Form(
-        None, description="Environment variables in JSON format"
-    ),
-    prefix_command: Optional[str] = Form(
-        None,
-        description="Command to prefix before the binary (e.g., 'ncu', 'nsys profile')",
-    ),
-    n_runs: Optional[int] = Form(
-        1,
-        description="Number of times to run the binary",
-    ),
-    timeout: Optional[float] = Form(
-        3600,
-        description="Timeout in seconds for command execution",
-    ),
-):
-    """Execute a binary file on the GPU server"""
-
-    logger.info(
-        f"/gpu/binary - Binary: {binary.filename}, Args: {args}, Env vars: {env_vars}, Prefix: {prefix_command}, Timeout: {timeout}s, Queue backlog: {QUEUE.qsize()}"
-    )
-
-    try:
-        # Read binary data
-        binary_data = await binary.read()
-        if not binary_data:
-            raise HTTPException(status_code=400, detail="Empty binary file provided")
-
-        # Parse environment variables if provided
-        parsed_env_vars = None
-        if env_vars:
-            try:
-                parsed_env_vars = json.loads(env_vars)
-                if not isinstance(parsed_env_vars, dict):
-                    raise ValueError("Environment variables must be a JSON object")
-            except (json.JSONDecodeError, ValueError) as e:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Invalid environment variables JSON: {str(e)}",
-                )
-
-        # Save binary to temporary location
-        binary_path = save_binary_to_temp(
-            binary_data, binary.filename or "gpu_executable"
-        )
-
-        # Create a future to track completion
-        completion_future = asyncio.Future()
-
-        # Queue-item shape matches ``queue_worker_loop``'s convention:
-        # ``(*job_args, completion_future, enqueue_ts)``. ``_gpu_binary_job``
-        # unpacks the 6-tuple job_args.
-        await QUEUE.put(
-            (
-                binary_path,
-                args,
-                parsed_env_vars,
-                prefix_command,
-                n_runs,
-                timeout,
-                completion_future,
-                time.time(),
-            )
-        )
-
-        # Wait for completion
-        await completion_future
-        return completion_future.result()
-
-    except asyncio.CancelledError:
-        logger.info(f"Request for binary {binary.filename} was cancelled")
-        raise HTTPException(status_code=500, detail="Request was cancelled")
-    except Exception as e:
-        logger.error(f"Error processing binary execution request: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
-
-
-# /gpu/cmd endpoint deleted in Phase B — zero in-tree callers per
-# ``notes/server_unification_audit.md``. The unified exec server keeps
-# only /gpu/binary.
-
-
-def run_server(host: str, port: int, log_filepath: str = None):
-    """
-    Run the compilation server with REST API
-
-    Args:
-        host: Host to bind the server to
-        port: Port to bind the server to
-        log_filepath: Optional path to log file for uvicorn logging
-    """
-    # Run the FastAPI server
-    log_config = get_log_config(log_filepath=log_filepath)
-    uvicorn.run(
-        APP, host=host, port=port, log_config=log_config, timeout_graceful_shutdown=0.1
-    )
-
-
-def main(args):
-    # Ensure log directory exists if log path is provided
-    if args.log_path:
-        log_dir = args.log_path.parent
-        if log_dir:
-            log_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Run the REST API compilation server
-    run_server(
-        args.host,
-        args.port,
-        log_filepath=str(args.log_path) if args.log_path else None,
-    )
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--host", type=str, default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=2002)
-    parser.add_argument(
-        "--log_path", type=Path, default=Path("/tmp/kernelblaster/gpu_server.log")
-    )
-    args = parser.parse_args()
-
-    # Define base environment variables for GPU subprocesses.
-    # Per-worker CUDA_VISIBLE_DEVICES pinning is applied in gpu_worker().
-    env = os.environ.copy()
-    env.setdefault("NVIDIA_TF32_OVERRIDE", "0")
-
-    main(args)
+# FastAPI parts (lifespan, APP, endpoints, worker handler, run_server, main,
+# __main__) deleted in the Exec unification arc — callers now hit
+# servers.exec_server which invokes LocalExecStrategy internally.

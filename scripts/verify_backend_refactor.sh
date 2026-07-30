@@ -327,8 +327,8 @@ if [ "${SKIP_T2:-0}" != "1" ]; then
             >"$TMPDIR/cuda_compile.log" 2>&1 &
         SPAWNED_PIDS+=($!)
 
-        # Spawn GPU server
-        "$PY" -m src.kernelblaster.servers.gpu \
+        # Spawn unified exec server (no --board-host → LocalExecStrategy).
+        "$PY" -m src.kernelblaster.servers.exec_server \
             --port 22201 \
             --log_path "$TMPDIR/cuda_gpu.log" \
             >"$TMPDIR/cuda_gpu_stdout.log" 2>&1 &
@@ -494,8 +494,8 @@ if [ "${SKIP_T3:-0}" != "1" ]; then
             >"$TMPDIR/ocl_compile.log" 2>&1 &
         SPAWNED_PIDS+=($!)
 
-        # Spawn Adreno GPU server
-        "$PY" -m src.kernelblaster.servers.gpu_adreno \
+        # Spawn unified exec server (--board-host → RemoteExecStrategy).
+        "$PY" -m src.kernelblaster.servers.exec_server \
             --port 22203 \
             --board-host "$KERNELBLASTER_ADRENO_BOARD_HOST" \
             --log_path "$TMPDIR/ocl_gpu.log" \
