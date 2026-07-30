@@ -16,22 +16,18 @@ import argparse
 import asyncio
 from contextlib import asynccontextmanager
 import os
-from fastapi import FastAPI, HTTPException
 from pathlib import Path
 from pydantic import BaseModel
 import logging
 import shutil
 import tempfile
 import uuid
-import uvicorn
-import uvicorn.config
 import re
 import sysconfig
 import time
 from torch.utils import cmake_prefix_path
 
-from .server_logging import get_log_config
-from .utils.queue_server import queue_worker_loop, worker_pool
+from .utils.queue_server import queue_worker_loop
 from .utils.subprocess import run_subprocess_shell
 from ..agents.utils import find_kernel_launch_header
 
@@ -115,23 +111,6 @@ def build_cmake_command(
 
 # Lifespan defined at module import time; reads `args` lazily on startup
 # (after __main__ has parsed them).
-@asynccontextmanager
-async def lifespan(app):
-    logger.info(
-        f"Started compilation server on {args.host}:{args.port} with {args.num_workers} workers"
-    )
-    async with worker_pool(
-        num_workers=args.num_workers,
-        queue=QUEUE,
-        handler=_cuda_compile_job,
-        domain_error=CompilationError,
-        logger=logger,
-        on_shutdown=free_cuda_envs,
-    ):
-        yield
-
-
-APP = FastAPI(lifespan=lifespan)
 
 
 def get_cuda_env_root(thread_id: int) -> Path:
@@ -315,207 +294,8 @@ async def exec_compilation(
     return sm_build_dir / "main"
 
 
-async def _cuda_compile_job(worker_id: int, job_args: tuple) -> bool:
-    """Single CUDA compile job — delegates to :class:`CUDACompileStrategy`.
-
-    Phase C extracted the body into the strategy. This handler now just
-    unpacks the queue tuple, invokes the strategy, and returns the
-    ``queue_worker_loop`` success sentinel.
-    """
-    from .strategies import get_compile_strategy
-
-    (
-        job_name,
-        main_file,
-        cuda_file,
-        sm_version,
-        persistent_artifacts,
-        output_path,
-    ) = job_args
-
-    await get_compile_strategy("cuda").compile(
-        worker_id=worker_id,
-        job_name=job_name,
-        main_file=main_file,
-        source_file=cuda_file,
-        backend_version=sm_version,
-        backend_flag=persistent_artifacts,
-        output_path=output_path,
-        artifacts_dir=_ARTIFACTS_DIR,
-        debug=args.compile_debug,
-    )
-    return True
+# _cuda_compile_job removed in Phase E — was the legacy queue handler
+# for the /compile endpoint. Callers now hit compile_server.py which
+# invokes CUDACompileStrategy directly.
 
 
-@APP.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {"status": "healthy", "service": "compile-server"}
-
-
-@APP.get("/compile", response_model=CompilationResult)
-async def process_compilation_request(
-    job_name: str,
-    main_file: str,
-    cuda_file: str,
-    sm_version: str,
-    persistent_artifacts: int = 0,
-):
-    logger.info(f"/compile request received: job_name={job_name}, main_file={main_file}, cuda_file={cuda_file}, sm_version={sm_version}, backlog: {QUEUE.qsize()}")
-    
-    try:
-        if not Path(main_file).exists():
-            error_msg = f"File {main_file} not found"
-            logger.error(f"/compile error: {error_msg}")
-            return CompilationResult(
-                job_name=job_name,
-                main_file=main_file,
-                cuda_file=cuda_file,
-                success=False,
-                message=error_msg,
-            )
-
-        if cuda_file and not Path(cuda_file).exists():
-            error_msg = f"File {cuda_file} not found"
-            logger.error(f"/compile error: {error_msg}")
-            return CompilationResult(
-                job_name=job_name,
-                main_file=main_file,
-                cuda_file=cuda_file,
-                success=False,
-                message=error_msg,
-            )
-
-        # Create a future to track completion
-        completion_future = asyncio.Future()
-
-        # Calculate the output path that will be used
-        with tempfile.NamedTemporaryFile(delete=False, dir=OUT_DIR) as f:
-            output_path = Path(f.name)
-
-        logger.info(f"Queueing compilation: {job_name} -> {output_path}")
-
-        # Create a special queue item with the future
-        await QUEUE.put(
-            (
-                job_name,
-                main_file,
-                cuda_file,
-                sm_version,
-                bool(persistent_artifacts),
-                output_path,
-                completion_future,
-                time.time(),
-            )
-        )
-
-        # Wait for the compilation to complete
-        try:
-            await completion_future
-
-            result = CompilationResult(
-                job_name=job_name,
-                main_file=main_file,
-                cuda_file=cuda_file,
-                success=True,
-                message="Compilation successful",
-                output_path=str(output_path),
-            )
-
-            if persistent_artifacts:
-                persistent_artifacts_dir = (
-                    args.artifacts_dir / "persistent_artifacts" / output_path.name
-                )
-                result.persistent_artifacts_dir = str(persistent_artifacts_dir)
-
-            logger.info(f"/compile success: {job_name} -> {output_path}")
-            return result
-        except CompilationError as e:
-            error_msg = str(e)
-            logger.error(f"/compile CompilationError for {job_name}: {error_msg}")
-            result = CompilationResult(
-                job_name=job_name,
-                main_file=main_file,
-                cuda_file=cuda_file,
-                success=False,
-                message=error_msg,
-            )
-
-            if persistent_artifacts:
-                persistent_artifacts_dir = (
-                    args.artifacts_dir / "persistent_artifacts" / output_path.name
-                )
-                result.persistent_artifacts_dir = str(persistent_artifacts_dir)
-
-            return result
-        except asyncio.CancelledError:
-            logger.warning(f"Compilation {job_name} was cancelled")
-            raise HTTPException(status_code=500, detail="Compilation was cancelled")
-        except Exception as e:
-            error_msg = f"Unexpected error during compilation: {str(e)}"
-            logger.error(f"/compile unexpected error for {job_name}: {error_msg}", exc_info=True)
-            raise HTTPException(status_code=500, detail=error_msg)
-    except Exception as e:
-        error_msg = f"Error processing compilation request: {str(e)}"
-        logger.error(f"/compile request processing error for {job_name}: {error_msg}", exc_info=True)
-        raise HTTPException(status_code=500, detail=error_msg)
-
-
-def run_compilation_server(host: str, port: int):
-    """
-    Run the compilation server with REST API
-
-    Args:
-        host: Host to bind the server to
-        port: Port to bind the server to
-        num_workers: Number of parallel compilation workers
-        debug: Whether to compile in debug mode
-    """
-
-    # Run the FastAPI server
-    log_config = get_log_config()
-    uvicorn.run(
-        APP, host=host, port=port, log_config=log_config, timeout_graceful_shutdown=0.1
-    )
-
-
-def main():
-    # Run the REST API compilation server
-    run_compilation_server(
-        args.host,
-        args.port,
-    )
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--host", type=str, default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=2001)
-    parser.add_argument("--num-workers", type=int, default=8)
-    parser.add_argument(
-        "--compile-timeout",
-        type=int,
-        default=int(os.getenv("KERNELBLASTER_COMPILE_TIMEOUT_S", "360")),
-        help="Per-compile timeout in seconds (default: env KERNELBLASTER_COMPILE_TIMEOUT_S or 360).",
-    )
-    parser.add_argument("--compile-debug", action="store_true")
-    parser.add_argument(
-        "--artifacts-dir",
-        type=Path,
-        help="Path to directory to store artifacts",
-        default=Path("/tmp/kernelblaster"),
-    )
-    args = parser.parse_args()
-
-    ENV_DIR = args.artifacts_dir / str(uuid.uuid4())
-    OUT_DIR = ENV_DIR / "out"
-    OUT_DIR.mkdir(exist_ok=True, parents=True)
-    
-    # Store artifacts_dir in module-level variable for use in endpoint handlers
-    import src.kernelblaster.servers.compile as compile_module
-    compile_module._ARTIFACTS_DIR = args.artifacts_dir
-    logger.info(
-        f"Compile server config: host={args.host} port={args.port} workers={args.num_workers} compile_timeout={args.compile_timeout}s artifacts_dir={args.artifacts_dir}"
-    )
-
-    main()

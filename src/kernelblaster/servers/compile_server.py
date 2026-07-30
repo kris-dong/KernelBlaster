@@ -291,6 +291,8 @@ def main():
     _ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     _BOARD_HOST = args.board_host
 
+    # Ensure log dir exists before uvicorn tries to open the file handler.
+    args.log_path.parent.mkdir(parents=True, exist_ok=True)
     run_server(args.host, args.port, log_filepath=str(args.log_path))
 
 

@@ -221,16 +221,20 @@ async def _compile_cu(
         logger.info(f"  persistent_artifacts: {persistent_artifacts}")
         logger.info(f"  sm_version: {gpu.sm}")
         
-        logger.info(f"Submitted {job_name} to {url}/compile")
+        logger.info(f"Submitted {job_name} to {url}/compile?backend=cuda")
         client_timeout = aiohttp.ClientTimeout(total=timeout + 3600)
+        # Phase E: unified compile endpoint. ``backend_flag`` carries
+        # ``persistent_artifacts`` for CUDA. Response shape:
+        # ``UnifiedCompilationResult`` (``output_path`` + role-keyed ``extras``).
         async with TCPClient.get_session().get(
             f"{url}/compile",
             params={
+                "backend": "cuda",
                 "job_name": job_name,
                 "main_file": str(main_filepath_abs),
-                "cuda_file": str(cuda_filepath_abs) if cuda_filepath_abs else "",
-                "persistent_artifacts": int(persistent_artifacts),
-                "sm_version": gpu.sm,
+                "source_file": str(cuda_filepath_abs) if cuda_filepath_abs else "",
+                "backend_version": gpu.sm,
+                "backend_flag": int(persistent_artifacts),
             },
             timeout=client_timeout,
         ) as response:
@@ -399,6 +403,8 @@ async def compile_opencl(
     When remote=True, the compile server SSH's to the Adreno board and produces
     an ARM64 binary there.
     """
+    # Phase E: unified compile server. Legacy env var name preserved for
+    # deployment continuity; the URL now points at the unified endpoint.
     opencl_compile_url = os.getenv(
         "KERNELBLASTER_OPENCL_COMPILE_SERVER_URL",
         config.get("OPENCL_COMPILE_SERVER_URL", "http://localhost:2003"),
@@ -420,13 +426,14 @@ async def compile_opencl(
         # passed in the params, to account for queue wait time on the server.
         client_timeout = aiohttp.ClientTimeout(total=timeout + 3600)
         async with TCPClient.get_session().get(
-            f"{opencl_compile_url}/compile_opencl",
+            f"{opencl_compile_url}/compile",
             params={
+                "backend": "opencl",
                 "job_name": job_name,
                 "main_file": str(main_filepath_abs),
-                "kernel_file": str(kernel_filepath_abs),
-                "opencl_version": gpu.opencl_version,
-                "remote": int(remote),
+                "source_file": str(kernel_filepath_abs),
+                "backend_version": gpu.opencl_version,
+                "backend_flag": int(remote),
             },
             timeout=client_timeout,
         ) as response:

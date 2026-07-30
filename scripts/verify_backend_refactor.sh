@@ -311,7 +311,8 @@ if [ "${SKIP_T2:-0}" != "1" ]; then
         record "T2 CUDA E2E" FAIL
     else
         # Spawn compile server
-        "$PY" -m src.kernelblaster.servers.compile \
+        # Unified compile server (dispatches on ?backend=cuda|opencl).
+        "$PY" -m src.kernelblaster.servers.compile_server \
             --port 22200 \
             --num-workers 2 \
             --artifacts-dir "$CUDA_ARTIFACTS" \
@@ -341,13 +342,15 @@ if [ "${SKIP_T2:-0}" != "1" ]; then
             record "T2.b gpu server boot (port 22201)" FAIL
         fi
 
-        # Issue compile request
+        # Issue compile request via the unified endpoint
         COMPILE_RESP="$TMPDIR/cuda_compile_resp.json"
         if curl -sf --max-time 120 -G "http://localhost:22200/compile" \
+            --data-urlencode "backend=cuda" \
             --data-urlencode "job_name=verify_t2" \
             --data-urlencode "main_file=$PROBLEM_DIR/driver.cpp" \
-            --data-urlencode "cuda_file=$PROBLEM_DIR/init.cu" \
-            --data-urlencode "sm_version=sm_89" \
+            --data-urlencode "source_file=$PROBLEM_DIR/init.cu" \
+            --data-urlencode "backend_version=sm_89" \
+            --data-urlencode "backend_flag=0" \
             >"$COMPILE_RESP" 2>"$TMPDIR/cuda_compile_curl.err"; then
             if "$PY" -c "import json,sys; r=json.load(open(sys.argv[1])); sys.exit(0 if r.get('success') else 1)" "$COMPILE_RESP"; then
                 record "T2.c CUDA compile of 005_Matrix_scalar_multiplication" PASS
@@ -424,8 +427,8 @@ if [ "${SKIP_T3:-0}" != "1" ]; then
         mkdir -p "$OCL_ARTIFACTS"
         OCL_PROBLEM_DIR="$REPO_ROOT/data/benchmark-opencl/L1/19_ReLU"
 
-        # Spawn OpenCL compile server
-        "$PY" -m src.kernelblaster.servers.compile_opencl \
+        # Spawn unified compile server (dispatches on ?backend=cuda|opencl).
+        "$PY" -m src.kernelblaster.servers.compile_server \
             --port 22202 \
             --num-workers 1 \
             --board-host "$KERNELBLASTER_ADRENO_BOARD_HOST" \
@@ -457,18 +460,22 @@ if [ "${SKIP_T3:-0}" != "1" ]; then
             record "T3.b adreno gpu server boot (port 22203, board=$KERNELBLASTER_ADRENO_BOARD_HOST)" FAIL
         fi
 
-        # Issue OpenCL compile request
+        # Issue OpenCL compile request via the UNIFIED endpoint. Param
+        # names use the backend-neutral surface (source_file /
+        # backend_version / backend_flag); remote_binary_path comes back
+        # in ``extras``.
         OCL_COMPILE_RESP="$TMPDIR/ocl_compile_resp.json"
-        if curl -sf --max-time 120 -G "http://localhost:22202/compile_opencl" \
+        if curl -sf --max-time 120 -G "http://localhost:22202/compile" \
+            --data-urlencode "backend=opencl" \
             --data-urlencode "job_name=verify_t3" \
             --data-urlencode "main_file=$OCL_PROBLEM_DIR/driver.c" \
-            --data-urlencode "kernel_file=$OCL_PROBLEM_DIR/kernel.cl" \
-            --data-urlencode "opencl_version=opencl_2.0" \
-            --data-urlencode "remote=1" \
+            --data-urlencode "source_file=$OCL_PROBLEM_DIR/kernel.cl" \
+            --data-urlencode "backend_version=opencl_2.0" \
+            --data-urlencode "backend_flag=1" \
             >"$OCL_COMPILE_RESP" 2>"$TMPDIR/ocl_compile_curl.err"; then
             if "$PY" -c "import json,sys; r=json.load(open(sys.argv[1])); sys.exit(0 if r.get('success') else 1)" "$OCL_COMPILE_RESP"; then
                 record "T3.c OpenCL compile of 19_ReLU via SSH to board" PASS
-                REMOTE_BIN="$("$PY" -c "import json,sys; print(json.load(open(sys.argv[1])).get('remote_binary_path','') or '')" "$OCL_COMPILE_RESP")"
+                REMOTE_BIN="$("$PY" -c "import json,sys; print(json.load(open(sys.argv[1])).get('extras',{}).get('remote_binary_path','') or '')" "$OCL_COMPILE_RESP")"
                 echo "  -> remote binary: $REMOTE_BIN"
             else
                 echo "  opencl compile returned success=false; response:"
@@ -477,7 +484,7 @@ if [ "${SKIP_T3:-0}" != "1" ]; then
                 REMOTE_BIN=""
             fi
         else
-            echo "  curl /compile_opencl failed; stderr:"
+            echo "  curl /compile failed; stderr:"
             cat "$TMPDIR/ocl_compile_curl.err"
             record "T3.c OpenCL compile of 19_ReLU via SSH to board" FAIL
             REMOTE_BIN=""
@@ -733,13 +740,15 @@ if [ "${SKIP_T6:-0}" != "1" ] && [ "${SKIP_T3:-0}" != "1" ]; then
             mkdir -p "$TMPDIR/t6_kernel"
             cp "$REPO_ROOT/data/benchmark-opencl/L1/19_ReLU/kernel.cl" "$T6_KERNEL"
             T6_RESP="$TMPDIR/t6_exec_resp.json"
-            # Compile (T3.c-style) — quickly, with a fresh job name
-            if curl -sf --max-time 120 -G "http://localhost:22202/compile_opencl" \
+            # Compile (T3.c-style) — quickly, with a fresh job name.
+            # Uses unified compile server params.
+            if curl -sf --max-time 120 -G "http://localhost:22202/compile" \
+                --data-urlencode "backend=opencl" \
                 --data-urlencode "job_name=verify_t6" \
                 --data-urlencode "main_file=$REPO_ROOT/data/benchmark-opencl/L1/19_ReLU/driver.c" \
-                --data-urlencode "kernel_file=$T6_KERNEL" \
-                --data-urlencode "opencl_version=opencl_2.0" \
-                --data-urlencode "remote=1" \
+                --data-urlencode "source_file=$T6_KERNEL" \
+                --data-urlencode "backend_version=opencl_2.0" \
+                --data-urlencode "backend_flag=1" \
                 >"$TMPDIR/t6_compile_resp.json" 2>"$TMPDIR/t6_compile.err"; then
                 T6_BIN="$("$PY" -c "import json,sys; print(json.load(open(sys.argv[1])).get('output_path','') or '')" "$TMPDIR/t6_compile_resp.json")"
                 if [ -n "$T6_BIN" ] && curl -sf --max-time 120 -X POST "http://localhost:22203/gpu/binary" \

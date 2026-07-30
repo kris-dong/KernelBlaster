@@ -163,9 +163,11 @@ def initialize_compiler_server(
     if compile_timeout:
         extra_args.extend(["--compile-timeout", compile_timeout])
 
+    # Phase E: point launcher at the unified compile server. Dispatches
+    # on ``?backend=cuda|opencl``; CUDA callers hit ``/compile?backend=cuda``.
     return _spawn_server(
         label="compilation server",
-        module="src.kernelblaster.servers.compile",
+        module="src.kernelblaster.servers.compile_server",
         log_file=log_file,
         port=port,
         default_port=2001,
@@ -217,9 +219,12 @@ def initialize_opencl_compiler_server(
 
     num_workers = int(os.getenv("KERNELBLASTER_OPENCL_COMPILE_WORKERS", "4"))
 
+    # Phase E: unified compile server. OpenCL callers hit
+    # ``/compile?backend=opencl``. The unified server accepts
+    # ``--board-host`` so the same launcher CLI shape works.
     return _spawn_server(
         label="OpenCL compilation server",
-        module="src.kernelblaster.servers.compile_opencl",
+        module="src.kernelblaster.servers.compile_server",
         log_file=log_file,
         port=port,
         default_port=2003,

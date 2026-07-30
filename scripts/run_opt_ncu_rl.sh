@@ -412,7 +412,7 @@ if server_health "$COMPILE_SERVER_URL"; then
     echo "  ✓ compile already running at $COMPILE_SERVER_URL (reusing)"
 else
     echo "  → starting compile server on port $COMPILE_PORT (log: $COMPILE_LOG)"
-    nohup python -m src.kernelblaster.servers.compile --port "$COMPILE_PORT" \
+    nohup python -m src.kernelblaster.servers.compile_server --port "$COMPILE_PORT" \
         > "$COMPILE_LOG" 2>&1 &
     COMPILE_SERVER_PID=$!
     SERVERS_SPAWNED_BY_US=1

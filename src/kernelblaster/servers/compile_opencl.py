@@ -8,22 +8,17 @@ Supports two modes:
 
 The remote mode is the primary path for generating runnable binaries.
 """
-import argparse
 import asyncio
 from contextlib import asynccontextmanager
 import os
-from fastapi import FastAPI, HTTPException
 from pathlib import Path
 from pydantic import BaseModel
 import logging
 import shutil
 import tempfile
 import uuid
-import uvicorn
 import time
 
-from .server_logging import get_log_config
-from .utils.queue_server import queue_worker_loop, worker_pool
 from .utils.subprocess import run_subprocess_shell
 
 logger = logging.getLogger("uvicorn")
@@ -203,142 +198,7 @@ async def exec_remote_compilation(
     return remote_binary
 
 
-async def _opencl_compile_job(worker_id: int, job_args: tuple) -> str:
-    """Single OpenCL compile job — delegates to :class:`OpenCLCompileStrategy`.
+# _opencl_compile_job, lifespan, endpoints, run_server, and __main__
+# removed in Phase E — callers now hit compile_server.py which invokes
+# OpenCLCompileStrategy directly.
 
-    Phase C extracted the body into the strategy. Returns the strategy's
-    ``remote_binary_path`` (or the local path on x86 fallback) as the
-    string that the ``/compile_opencl`` endpoint surfaces.
-    """
-    from .strategies import get_compile_strategy
-
-    (
-        job_name,
-        main_file,
-        kernel_file,
-        opencl_version,
-        remote,
-        output_path,
-    ) = job_args
-
-    result = await get_compile_strategy("opencl").compile(
-        worker_id=worker_id,
-        job_name=job_name,
-        main_file=main_file,
-        source_file=kernel_file,
-        backend_version=opencl_version,
-        backend_flag=remote,
-        output_path=output_path,
-        artifacts_dir=_ARTIFACTS_DIR,
-        board_host=_BOARD_HOST,
-    )
-    return result if result is not None else str(output_path)
-
-
-@asynccontextmanager
-async def lifespan(app):
-    logger.info(
-        f"Started OpenCL compilation server on {args.host}:{args.port} "
-        f"with {args.num_workers} workers, board={args.board_host}"
-    )
-
-    def _cleanup_env_dir():
-        if ENV_DIR.exists():
-            shutil.rmtree(ENV_DIR, ignore_errors=True)
-
-    async with worker_pool(
-        num_workers=args.num_workers,
-        queue=QUEUE,
-        handler=_opencl_compile_job,
-        domain_error=OpenCLCompilationError,
-        logger=logger,
-        on_shutdown=_cleanup_env_dir,
-    ):
-        yield
-
-
-APP = FastAPI(lifespan=lifespan)
-
-
-@APP.get("/health")
-async def health_check():
-    return {"status": "healthy", "service": "opencl-compile-server", "board": _BOARD_HOST}
-
-
-@APP.get("/compile_opencl", response_model=OpenCLCompilationResult)
-async def process_compilation_request(
-    job_name: str,
-    main_file: str,
-    kernel_file: str,
-    opencl_version: str = "opencl_2.0",
-    remote: int = 1,
-):
-    logger.info(
-        f"/compile_opencl request: job_name={job_name}, main_file={main_file}, "
-        f"kernel_file={kernel_file}, remote={remote}, backlog={QUEUE.qsize()}"
-    )
-
-    if not Path(main_file).exists():
-        return OpenCLCompilationResult(
-            job_name=job_name, main_file=main_file, kernel_file=kernel_file,
-            success=False, message=f"File {main_file} not found",
-        )
-    if not Path(kernel_file).exists():
-        return OpenCLCompilationResult(
-            job_name=job_name, main_file=main_file, kernel_file=kernel_file,
-            success=False, message=f"File {kernel_file} not found",
-        )
-
-    completion_future = asyncio.Future()
-    with tempfile.NamedTemporaryFile(delete=False, dir=OUT_DIR) as f:
-        output_path = Path(f.name)
-
-    await QUEUE.put((
-        job_name, main_file, kernel_file, opencl_version,
-        bool(remote), output_path, completion_future, time.time(),
-    ))
-
-    try:
-        result_path = await completion_future
-        return OpenCLCompilationResult(
-            job_name=job_name, main_file=main_file, kernel_file=kernel_file,
-            success=True, message="Compilation successful",
-            output_path=str(output_path),
-            remote_binary_path=result_path if bool(remote) else None,
-        )
-    except OpenCLCompilationError as e:
-        return OpenCLCompilationResult(
-            job_name=job_name, main_file=main_file, kernel_file=kernel_file,
-            success=False, message=str(e),
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-def run_server(host: str, port: int):
-    log_config = get_log_config()
-    uvicorn.run(APP, host=host, port=port, log_config=log_config, timeout_graceful_shutdown=0.1)
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--host", type=str, default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=2003)
-    parser.add_argument("--num-workers", type=int, default=4)
-    from ..backends.opencl import default_board_host
-    parser.add_argument(
-        "--board-host", type=str,
-        default=default_board_host(),
-        help="SSH target for remote compilation on Adreno board",
-    )
-    parser.add_argument(
-        "--artifacts-dir", type=Path, default=Path("/tmp/kernelblaster"),
-    )
-    args = parser.parse_args()
-
-    _BOARD_HOST = args.board_host
-    ENV_DIR = args.artifacts_dir / f"opencl_{uuid.uuid4().hex[:8]}"
-    OUT_DIR = ENV_DIR / "out"
-    OUT_DIR.mkdir(exist_ok=True, parents=True)
-
-    run_server(args.host, args.port)
