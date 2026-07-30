@@ -74,9 +74,15 @@ def add_common_arguments(parser: argparse.ArgumentParser):
         help="Stores output in ./out/<dataset>/<exp_name>/<model>",
     )
     parser.add_argument(
-        "--dataset",
+        # Item 2, Phase 8: ``--source`` is the new preferred spelling
+        # (aligns with the ``data.sources.get_source(name)`` factory).
+        # ``--dataset`` retains as an alias for one release so existing
+        # scripts + docs keep working without churn. Value lands in
+        # ``args.dataset`` (unchanged).
+        "--dataset", "--source",
         type=str,
         default="kernelbench-cuda",
+        dest="dataset",
         choices=[
             "kernelbench",
             "kernelbench-cuda",
@@ -115,9 +121,12 @@ def add_common_arguments(parser: argparse.ArgumentParser):
         help="Run on a subset of the dataset",
     )
     parser.add_argument(
-        "--subset",
+        # Item 2, Phase 8: ``--source-tier`` is the new preferred spelling.
+        # ``--subset`` retains as an alias. Value lands in ``args.subset``.
+        "--subset", "--source-tier",
         type=str,
         default=None,
+        dest="subset",
         choices=[
             "cub",
             "thrust",
