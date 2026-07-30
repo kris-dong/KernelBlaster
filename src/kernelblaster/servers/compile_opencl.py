@@ -27,9 +27,27 @@ QUEUE = asyncio.Queue()
 OPENCL_ENV_PATH = Path(__file__).parent / "opencl_env"
 ENV_VARS = os.environ.copy()
 
-# Module-level variables set during startup
-_ARTIFACTS_DIR = None
-_BOARD_HOST = None  # SSH target for remote compilation (e.g., "root@192.0.2.201")
+# Module-level state set at server startup. Since Phase E,
+# ``compile_server.py::main`` calls ``set_opencl_env_root`` +
+# ``set_board_host``. Legacy ``compile_opencl.py::main`` used to set
+# these in its own ``__main__`` block; that block is gone now.
+ENV_DIR: Path | None = None
+_ARTIFACTS_DIR: Path | None = None
+_BOARD_HOST: str | None = None  # SSH target for remote compilation
+
+
+def set_opencl_env_root(env_dir: Path) -> None:
+    """Setter for the module-level ``ENV_DIR`` (used by
+    ``get_opencl_env_root`` + local-compile fallback)."""
+    global ENV_DIR
+    ENV_DIR = env_dir
+
+
+def set_board_host(board_host: str | None) -> None:
+    """Setter for the module-level ``_BOARD_HOST`` (used by
+    ``exec_remote_compilation`` via ``ssh``/``scp`` calls)."""
+    global _BOARD_HOST
+    _BOARD_HOST = board_host
 
 
 class OpenCLCompilationRequest(BaseModel):

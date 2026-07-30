@@ -14,12 +14,19 @@
 #        queue_worker_loop. No servers, no network.
 #   T2 — CUDA E2E: spawns compile + gpu servers, compiles a kernelbench-cuda
 #        L1 problem, executes the binary on the local NVIDIA GPU, checks the
-#        driver prints "passed". Tears the servers down on exit.
+#        driver prints "passed" (T2.d), then re-runs with an ``ncu`` prefix
+#        and parses the NCU stdout through ``CUDABackend.parse_profile`` to
+#        verify ``elapsed_cycles > 0`` (T2.e). Tears the servers down on exit.
 #   T3 — OpenCL E2E: spawns compile_opencl + gpu_adreno servers, compiles a
 #        benchmark-opencl L1 kernel via SSH to the Adreno board, verifies the
 #        remote binary exists on the board. (Full exec needs a precomputed
 #        reference_output.bin which the RL flow generates lazily — we skip
 #        that here to keep the test self-contained.)
+#   T7 — CUDA profile.json roundtrip: mirror of T6 for L40S. Runs the T2
+#        binary with an ``ncu`` prefix, parses via ``CUDABackend.parse_profile``,
+#        writes ``ProfileResult`` next to a synthetic kernel path, reads
+#        back, verifies ``raw_metrics["elapsed_cycles"]`` + ``raw_log``
+#        roundtrip intact.
 #
 # Required environment (set externally or sourced before running):
 #   AWS_BEARER_TOKEN_BEDROCK         — only consumed by full RL flow, not by
@@ -43,8 +50,9 @@
 #
 # Usage:
 #   bash scripts/verify_backend_refactor.sh         # run all tests
-#   SKIP_T2=1 bash scripts/verify_backend_refactor.sh   # skip CUDA tests
-#   SKIP_T3=1 bash scripts/verify_backend_refactor.sh   # skip OpenCL tests
+#   SKIP_T2=1 bash scripts/verify_backend_refactor.sh   # skip CUDA tests (also skips T7)
+#   SKIP_T3=1 bash scripts/verify_backend_refactor.sh   # skip OpenCL tests (also skips T6)
+#   SKIP_T7=1 bash scripts/verify_backend_refactor.sh   # skip CUDA profile.json roundtrip only
 #   KEEP_LOGS=1 bash scripts/verify_backend_refactor.sh # don't clean up /tmp logs
 
 set -u  # don't set -e — we want to count failures, not abort
@@ -401,6 +409,56 @@ sys.exit(0 if 'passed' in out.lower() else 2)
         else
             echo "  skipping execute — no binary"
             record "T2.d CUDA binary execute -> 'passed'" FAIL
+        fi
+
+        # T2.e — Execute the same binary with an NCU prefix, then parse
+        # the NCU stdout through ``CUDABackend.parse_profile``. Mirrors
+        # T3.f (Adreno [PROFILE] parse) on the CUDA side: proves the
+        # backend's profile-parse contract against a fresh NCU log from
+        # a real L40S run.
+        if [ -n "$BINARY_PATH" ] && [ -f "$BINARY_PATH" ]; then
+            NCU_RESP="$TMPDIR/cuda_ncu_resp.json"
+            if curl -sf --max-time 300 -X POST "http://localhost:22201/gpu/binary" \
+                -F "binary=@$BINARY_PATH" \
+                -F "args=" \
+                -F "n_runs=1" \
+                -F "timeout=120" \
+                -F 'prefix_command=NVIDIA_TF32_OVERRIDE=0 ncu' \
+                >"$NCU_RESP" 2>"$TMPDIR/cuda_ncu_curl.err"; then
+                if "$PY" - "$NCU_RESP" >"$TMPDIR/cuda_ncu.log" 2>&1 <<'PYEOF'
+import json, sys
+sys.path.insert(0, ".")
+from src.kernelblaster.backends import get_backend
+
+resp = json.load(open(sys.argv[1]))
+if not resp.get("success"):
+    sys.exit(f"ncu exec failed: {resp.get('message', '<no message>')}")
+stdout = resp.get("stdout", "")
+if isinstance(stdout, list):
+    stdout = "".join(stdout)
+if "Elapsed Cycles" not in stdout:
+    sys.exit(f"NCU stdout missing 'Elapsed Cycles' marker. Tail: {stdout[-500:]}")
+pr = get_backend("cuda").parse_profile(stdout)
+cycles = pr.raw_metrics.get("elapsed_cycles", 0)
+assert cycles > 0, f"parse_profile returned cycles={cycles}, expected > 0"
+print(f"parse_profile: elapsed_cycles={cycles}")
+PYEOF
+                then
+                    record "T2.e CUDA binary execute with ncu -> parse_profile" PASS
+                    tail -1 "$TMPDIR/cuda_ncu.log" | sed 's/^/  /'
+                else
+                    echo "  ncu parse failed:"
+                    tail -10 "$TMPDIR/cuda_ncu.log"
+                    record "T2.e CUDA binary execute with ncu -> parse_profile" FAIL
+                fi
+            else
+                echo "  curl /gpu/binary (ncu) failed; stderr:"
+                cat "$TMPDIR/cuda_ncu_curl.err"
+                record "T2.e CUDA binary execute with ncu -> parse_profile" FAIL
+            fi
+        else
+            echo "  skipping T2.e — no CUDA binary"
+            record "T2.e CUDA binary execute with ncu -> parse_profile" FAIL
         fi
     fi
 else
@@ -819,6 +877,106 @@ PYEOF
 else
     echo
     echo "==== T6 skipped ===="
+fi
+
+# ---------------------------------------------------------------------------
+# T7 — CUDA profile.json roundtrip (NCU cycles + parse_profile + read_json)
+# ---------------------------------------------------------------------------
+# Mirror of T6 for the CUDA/L40S path. Runs the T2 binary through the GPU
+# server with an ``ncu`` prefix, parses the NCU stdout via
+# ``CUDABackend.parse_profile``, writes a ProfileResult alongside a
+# synthetic kernel file, reads it back, and confirms
+# ``raw_metrics["elapsed_cycles"]`` round-trips intact. Depends on T2
+# having succeeded (needs ``$BINARY_PATH`` + running servers on
+# :22200/:22201).
+
+if [ "${SKIP_T7:-0}" != "1" ] && [ "${SKIP_T2:-0}" != "1" ]; then
+    echo
+    echo "==== T7: CUDA profile.json roundtrip (NCU cycles) ===="
+
+    # Reuse the T2 servers if still running; otherwise skip.
+    if curl -sf --max-time 2 "http://localhost:22200/health" >/dev/null 2>&1 && \
+       curl -sf --max-time 2 "http://localhost:22201/health" >/dev/null 2>&1; then
+        if [ -n "${BINARY_PATH:-}" ] && [ -f "$BINARY_PATH" ]; then
+            T7_KERNEL_DIR="$TMPDIR/t7_kernel"
+            T7_KERNEL="$T7_KERNEL_DIR/init.cu"
+            mkdir -p "$T7_KERNEL_DIR"
+            cp "$PROBLEM_DIR/init.cu" "$T7_KERNEL"
+            T7_RESP="$TMPDIR/t7_ncu_resp.json"
+            T7_OUT="$TMPDIR/t7.log"
+            if curl -sf --max-time 300 -X POST "http://localhost:22201/gpu/binary" \
+                -F "binary=@$BINARY_PATH" \
+                -F "args=" \
+                -F "n_runs=1" \
+                -F "timeout=120" \
+                -F 'prefix_command=NVIDIA_TF32_OVERRIDE=0 ncu' \
+                >"$T7_RESP" 2>"$TMPDIR/t7_curl.err"; then
+                if "$PY" - "$T7_RESP" "$T7_KERNEL" >"$T7_OUT" 2>&1 <<'PYEOF'
+import json, sys
+from pathlib import Path
+
+sys.path.insert(0, ".")
+from src.kernelblaster.backends import get_backend, ProfileResult
+
+resp_path, kernel_path = Path(sys.argv[1]), Path(sys.argv[2])
+resp = json.load(open(resp_path))
+assert resp.get("success"), f"ncu exec failed: {resp.get('message', '<no message>')}"
+stdout = resp.get("stdout", "")
+if isinstance(stdout, list):
+    stdout = "".join(stdout)
+assert "Elapsed Cycles" in stdout, (
+    f"NCU stdout missing 'Elapsed Cycles' marker; tail: {stdout[-500:]}"
+)
+
+# Parse into a ProfileResult, filter raw_log to just the cycles-bearing lines
+# (same shape as ``RLNCUAgent.gather_profile_result`` — a 1:1 mirror of the
+# OpenCL Phase 3c contract).
+backend = get_backend("cuda")
+pr = backend.parse_profile(stdout)
+pr.raw_log = "\n".join(ln for ln in stdout.splitlines() if "Elapsed Cycles" in ln)
+
+profile_json_path = kernel_path.with_suffix(".profile.json")
+pr.write_json(profile_json_path)
+assert profile_json_path.exists(), f"profile.json not written at {profile_json_path}"
+
+# Roundtrip: read back and verify parity on the primary metric.
+loaded = ProfileResult.read_json(profile_json_path)
+assert loaded.raw_metrics.get("elapsed_cycles") == pr.raw_metrics.get("elapsed_cycles"), (
+    f"cycles differ: wrote {pr.raw_metrics.get('elapsed_cycles')} "
+    f"read {loaded.raw_metrics.get('elapsed_cycles')}"
+)
+assert loaded.raw_log == pr.raw_log, "raw_log differs after roundtrip"
+
+print(
+    f"profile.json roundtrip OK: "
+    f"elapsed_cycles={pr.raw_metrics['elapsed_cycles']}, "
+    f"raw_log length: {len(pr.raw_log)} chars (vs full stdout: {len(stdout)} chars)"
+)
+PYEOF
+                then
+                    record "T7 CUDA profile.json roundtrip (NCU cycles)" PASS
+                    tail -2 "$T7_OUT" | sed 's/^/  /'
+                else
+                    echo "  profile.json roundtrip failed:"
+                    tail -15 "$T7_OUT"
+                    record "T7 CUDA profile.json roundtrip (NCU cycles)" FAIL
+                fi
+            else
+                echo "  curl /gpu/binary (ncu) failed; stderr:"
+                cat "$TMPDIR/t7_curl.err"
+                record "T7 CUDA profile.json roundtrip (NCU cycles)" FAIL
+            fi
+        else
+            echo "  T2 binary not available; T7 needs a successful T2 compile"
+            record "T7 CUDA profile.json roundtrip (NCU cycles)" SKIP
+        fi
+    else
+        echo "  T2 servers not running on :22200/:22201; T7 needs them"
+        record "T7 CUDA profile.json roundtrip (NCU cycles)" SKIP
+    fi
+else
+    echo
+    echo "==== T7 skipped ===="
 fi
 
 # ---------------------------------------------------------------------------

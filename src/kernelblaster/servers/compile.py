@@ -38,8 +38,20 @@ CMAKE_PREFIX_PATH = f'"{cmake_prefix_path};{sysconfig.get_path("include")}"'
 QUEUE = asyncio.Queue()
 CUDA_ENV_PATH = Path(__file__).parent / "cuda_env"
 ENV_VARS = os.environ.copy()
-# Module-level variables (will be set during server startup)
-_ARTIFACTS_DIR = None
+# Module-level state set at server startup. Since Phase E, the setter
+# lives in ``compile_server.py::main`` (was ``compile.py::main`` in the
+# legacy layout). ``ENV_DIR`` is the scratch root under which per-worker
+# CMake env clones live; ``_ARTIFACTS_DIR`` mirrors the CLI arg.
+ENV_DIR: Path | None = None
+_ARTIFACTS_DIR: Path | None = None
+
+
+def set_cuda_env_root(env_dir: Path) -> None:
+    """Set the module-level ``ENV_DIR`` used by ``get_cuda_env_root`` +
+    ``free_cuda_envs``. Called by the unified compile server at startup.
+    """
+    global ENV_DIR
+    ENV_DIR = env_dir
 
 
 def get_cmake_prefix_path() -> str:
@@ -257,7 +269,10 @@ async def exec_compilation(
     arch_version = extract_arch_version(sm_version)
 
     if timeout is None:
-        timeout = int(getattr(args, "compile_timeout", 360))
+        # Phase E: ``args`` global went away with the legacy ``__main__``
+        # block; read the CLI-tunable through the env var it was
+        # originally sourced from.
+        timeout = int(os.getenv("KERNELBLASTER_COMPILE_TIMEOUT_S", "360"))
 
     # this call is expensive, so only regenerate if the sm version is different
     sm_build_dir = work_dir / f"build_{sm_version}"

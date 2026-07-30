@@ -291,6 +291,17 @@ def main():
     _ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     _BOARD_HOST = args.board_host
 
+    # Push module-level state into the strategy backing modules. This
+    # replaces the ``ENV_DIR = ...`` global assignment that used to live
+    # in each legacy server's ``__main__`` block. Without these, the
+    # first compile crashes with ``NameError: 'ENV_DIR' is not defined``
+    # inside ``get_cuda_env_root`` / ``get_opencl_env_root``.
+    from . import compile as _compile_mod
+    from . import compile_opencl as _compile_opencl_mod
+    _compile_mod.set_cuda_env_root(_ARTIFACTS_DIR / "cuda_env")
+    _compile_opencl_mod.set_opencl_env_root(_ARTIFACTS_DIR / "opencl_env")
+    _compile_opencl_mod.set_board_host(_BOARD_HOST)
+
     # Ensure log dir exists before uvicorn tries to open the file handler.
     args.log_path.parent.mkdir(parents=True, exist_ok=True)
     run_server(args.host, args.port, log_filepath=str(args.log_path))
