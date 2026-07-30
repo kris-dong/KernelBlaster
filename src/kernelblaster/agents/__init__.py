@@ -30,4 +30,4 @@ except ImportError:
 from .utils.error import FeedbackError
 from .feedback import FeedbackConfig, FeedbackError
 from .database import OptimizationDatabase
-from .rl_agents import ReplayBuffer, PolicyEvaluationAgent, PerfGapAnalysisAgent, ParameterUpdateAgent
+from .rl_agents import ReplayBuffer

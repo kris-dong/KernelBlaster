@@ -17,10 +17,7 @@ from ..config import config
 from .feedback import FeedbackAgent, Feedback, FeedbackConfig
 from .opt_rl_base import RLAgentBase
 from .database import OptimizationDatabase, OptimizationEntry, CompositeOptimization
-from .rl_agents import (
-    ReplayBuffer, Trajectory, TrajectoryStep,
-    PolicyEvaluationAgent, PerfGapAnalysisAgent, ParameterUpdateAgent
-)
+from .rl_agents import ReplayBuffer, Trajectory, TrajectoryStep
 from .utils import (
     FeedbackError,
     compile_and_run_opencl,

@@ -30,10 +30,7 @@ from ..config import config
 from .feedback import FeedbackAgent, Feedback, FeedbackConfig
 from .opt_rl_base import RLAgentBase
 from .database import OptimizationDatabase, OptimizationEntry, CompositeOptimization
-from .rl_agents import (
-    ReplayBuffer, Trajectory, TrajectoryStep,
-    PolicyEvaluationAgent, PerfGapAnalysisAgent, ParameterUpdateAgent
-)
+from .rl_agents import ReplayBuffer, Trajectory, TrajectoryStep
 from .utils import (
     FeedbackError,
     compile_and_run_cu_file,
@@ -817,54 +814,10 @@ class RLNCUAgent(RLAgentBase):
 
     # calculate_reward lifted to RLAgentBase in Phase 4f.
 
-    async def policy_update_cycle(self):
-        """Run the policy evaluation and update cycle."""
-        if len(self.replay_buffer.trajectories) < 3:
-            return  # Need some trajectories to analyze
-        
-        self.agent_logger.info("Running policy update cycle...")
-        
-        try:
-            # Policy Evaluation
-            evaluation_result = await self.policy_evaluation_agent.evaluate_policy(
-                self.replay_buffer, self.database
-            )
-            
-            # Collect recent failures for gap analysis
-            recent_failures = []
-            for traj in self.replay_buffer.get_recent_trajectories(5):
-                for step in traj.steps:
-                    if step.reward < 0 or step.actual_improvement < step.predicted_improvement * 0.5:
-                        recent_failures.append(step)
-            
-            # Performance Gap Analysis
-            gap_analysis = await self.perf_gap_analysis_agent.analyze_performance_gaps(
-                evaluation_result, recent_failures
-            )
-            
-            # Parameter Update
-            updates = await self.parameter_update_agent.update_parameters(
-                gap_analysis, self.database
-            )
-            
-            # Save analysis results
-            analysis_file = self.folder / f"analysis_iteration_{self.iteration_count}.json"
-            analysis_data = {
-                'iteration': self.iteration_count,
-                'evaluation_result': evaluation_result,
-                'gap_analysis': gap_analysis,
-                'updates': updates,
-                'buffer_stats': self.replay_buffer.get_statistics(),
-                'database_stats': self.database.get_database_stats()
-            }
-            
-            with open(analysis_file, 'w') as f:
-                json.dump(analysis_data, f, indent=2)
-            
-            self.agent_logger.info(f"Policy update completed. Analysis saved to {analysis_file}")
-            
-        except Exception as e:
-            self.agent_logger.error(f"Error in policy update cycle: {e}")
+    # policy_update_cycle + its three sub-agents (PolicyEvaluationAgent,
+    # PerfGapAnalysisAgent, ParameterUpdateAgent) deleted in the
+    # Step-3 cleanup — the method was never called from the RL loop
+    # after Phase 4f, and no other consumer imported it.
 
     # get_feedback lifted to RLAgentBase in Phase 4f.3d. This subclass only
     # contributes the per-backend _build_feedback hook below (CUDA framing:

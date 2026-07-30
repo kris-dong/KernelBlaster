@@ -49,12 +49,7 @@ from .database import (
     CompositeOptimization,
     LLMInterface,
 )
-from .rl_agents import (
-    ReplayBuffer,
-    PolicyEvaluationAgent,
-    PerfGapAnalysisAgent,
-    ParameterUpdateAgent,
-)
+from .rl_agents import ReplayBuffer
 from ..backends import ProfileResult
 
 
@@ -120,10 +115,6 @@ class RLAgentBase(FeedbackAgent):
         self.replay_buffer = ReplayBuffer(max_size=replay_buffer_size)
         self.max_rollout_steps = max_rollout_steps
         self.update_frequency = update_frequency
-
-        self.policy_evaluation_agent = PolicyEvaluationAgent()
-        self.perf_gap_analysis_agent = PerfGapAnalysisAgent()
-        self.parameter_update_agent = ParameterUpdateAgent()
 
         # State tracking — unified naming since Phase 4d.
         self.iteration_count = 0
