@@ -278,17 +278,18 @@ class OpenCLBackend(Backend):
         from .base import RLNodeConfig
         from ..agents.opt_opencl_rl import RLOpenCLAgent
 
-        # Lazy import — kernelbench_opencl pulls dataset helpers that may not
-        # be on the import path for every consumer (e.g. server-only imports).
+        # Item 2 cleanup Phase 3: migrated off the ``data.kernelbench_opencl``
+        # back-compat shim. Lazy import kept — some server-only import paths
+        # don't have ``data`` on ``sys.path``.
         try:
-            from data.kernelbench_opencl import (
-                default_benchmark_opencl_root,
-                run_output_parent_to_benchmark_dir,
+            from data.sources.kernelbench_opencl_source import (
+                KernelBenchOpenCLSource,
+                _SUBSET_TO_BENCHMARK_DIR,
             )
-            default_root = default_benchmark_opencl_root()
-            tier_fn = run_output_parent_to_benchmark_dir
+            default_root = KernelBenchOpenCLSource._default_benchmark_root()
+            tier_fn = lambda parent: _SUBSET_TO_BENCHMARK_DIR.get(parent, parent)
         except Exception:
-            # Fallback if data.kernelbench_opencl isn't importable.
+            # Fallback if data.sources isn't importable.
             repo_root = Path(__file__).resolve().parents[3]
             default_root = repo_root / "data" / "kernelbench-opencl"
             tier_fn = lambda parent_name: parent_name

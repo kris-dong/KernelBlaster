@@ -1,12 +1,24 @@
 from pathlib import Path
 
-from data.kernelbench_opencl import (
-    default_benchmark_opencl_root,
-    run_output_parent_to_benchmark_dir,
+# Item 2 cleanup Phase 3: migrated off the ``data.kernelbench_opencl``
+# back-compat shim onto the canonical source class. The two functions
+# used to be free re-exports at the shim's module level — they're now
+# static methods on :class:`KernelBenchOpenCLSource`.
+from data.sources.kernelbench_opencl_source import (
+    KernelBenchOpenCLSource,
+    _SUBSET_TO_BENCHMARK_DIR,
 )
 
 from ...integration.kgen_opencl import run_kgen_opencl_pipeline
 from ..state import GraphState, save_state_to_json
+
+
+def default_benchmark_opencl_root() -> Path:
+    return KernelBenchOpenCLSource._default_benchmark_root()
+
+
+def run_output_parent_to_benchmark_dir(parent: str) -> str:
+    return _SUBSET_TO_BENCHMARK_DIR.get(parent, parent)
 
 
 async def kgen_opencl(state: GraphState):
