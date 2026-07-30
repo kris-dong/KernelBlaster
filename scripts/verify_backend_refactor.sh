@@ -275,8 +275,26 @@ if [ "${SKIP_T2:-0}" != "1" ]; then
     fi
     # Pre-flight: is the GPU busy with non-KB processes (vllm, training, etc.)?
     # The gpu server refuses to start in this case (safety check in gpu.py).
+    # When ``KERNELBLASTER_GPU_SERVER_GPU_IDS`` restricts the server to a
+    # specific subset of GPUs (shared-cluster scenario), only check those
+    # GPUs — matches the same scoping applied in gpu.py::check_gpu_processes.
     if [ -z "$SKIP_T2_REASON" ] && command -v nvidia-smi >/dev/null 2>&1; then
-        BUSY_PROCS="$(nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null | grep -v '^\s*$' || true)"
+        if [ -n "${KERNELBLASTER_GPU_SERVER_GPU_IDS:-}" ]; then
+            SCOPED_UUIDS="$(
+                nvidia-smi --query-gpu=index,uuid --format=csv,noheader 2>/dev/null \
+                | awk -F, -v ids="$KERNELBLASTER_GPU_SERVER_GPU_IDS" '
+                    BEGIN { n = split(ids, a, /,/); for (i = 1; i <= n; i++) want[a[i]] = 1 }
+                    { gsub(/ /, ""); if (want[$1]) print $2 }
+                  ' | tr '\n' '|' | sed 's/|$//'
+            )"
+            if [ -n "$SCOPED_UUIDS" ]; then
+                BUSY_PROCS="$(nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name --format=csv,noheader 2>/dev/null | grep -E "^($SCOPED_UUIDS)" || true)"
+            else
+                BUSY_PROCS="$(nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null | grep -v '^\s*$' || true)"
+            fi
+        else
+            BUSY_PROCS="$(nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null | grep -v '^\s*$' || true)"
+        fi
         if [ -n "$BUSY_PROCS" ]; then
             SKIP_T2_REASON="GPU has pre-existing compute processes (gpu.py safety check would reject startup): $(echo "$BUSY_PROCS" | head -1)..."
         fi

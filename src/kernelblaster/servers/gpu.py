@@ -81,11 +81,20 @@ async def lifespan(app):
     logger.info(f"GPU Server running as user: {os.getuid()}")
     logger.info(f"GPU Server running as user: {os.geteuid()}")
 
-    stdout, stderr = await exec_command("whoami")
-    logger.info(f"GPU Server running as user: {stdout}\n{stderr}")
+    # Diagnostic-only — don't crash startup if the container's user/group DB
+    # has holes (e.g. a mounted GID that isn't in /etc/group; `groups` exits
+    # non-zero in that case, which used to abort the whole lifespan).
+    try:
+        stdout, stderr = await exec_command("whoami")
+        logger.info(f"GPU Server running as user: {stdout}\n{stderr}")
+    except Exception as diag_err:
+        logger.warning(f"Diagnostic `whoami` failed (non-fatal): {diag_err}")
 
-    stdout, stderr = await exec_command("groups")
-    logger.info(f"User groups: {stdout}\n{stderr}")
+    try:
+        stdout, stderr = await exec_command("groups")
+        logger.info(f"User groups: {stdout}\n{stderr}")
+    except Exception as diag_err:
+        logger.warning(f"Diagnostic `groups` failed (non-fatal): {diag_err}")
     
     # Print nvidia-smi information before starting the server
     await print_nvidia_smi(logger)
@@ -135,15 +144,57 @@ async def print_nvidia_smi(logger):
         )
 
 
+async def _resolve_assigned_gpu_uuids() -> set[str] | None:
+    """Return the UUIDs of GPUs this server is assigned to (via ``GPU_IDS``).
+
+    Returns ``None`` if we can't map indices to UUIDs (nvidia-smi silent /
+    parse fails), signalling to the caller "fall back to the global check
+    to stay safe."
+    """
+    if not GPU_IDS:
+        return None
+    try:
+        stdout, _ = await exec_command(
+            "nvidia-smi --query-gpu=index,uuid --format=csv,noheader"
+        )
+    except Exception:
+        return None
+
+    index_to_uuid: dict[str, str] = {}
+    for raw_line in stdout.split("\n"):
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 2:
+            continue
+        index_to_uuid[parts[0]] = parts[1]
+
+    assigned = {index_to_uuid[i] for i in GPU_IDS if i in index_to_uuid}
+    return assigned or None
+
+
 async def check_gpu_processes():
-    """Check for any pre-existing processes on NVIDIA GPUs.
+    """Check for pre-existing processes on the GPUs this server is assigned to.
 
     Filters out stale or non-existent PIDs and entries where the process name is
     reported as "[Not Found]" by nvidia-smi, to avoid false positives.
+
+    When ``GPU_IDS`` restricts the server to a subset of GPUs (via
+    ``KERNELBLASTER_GPU_SERVER_GPU_IDS``), only processes running on THAT
+    subset are treated as conflicts — a shared cluster where the operator
+    explicitly pins to an idle GPU should not be blocked by unrelated
+    workloads on other GPUs. The scope-narrowing is opt-in: without a
+    ``GPU_IDS`` override the check remains global (safe default).
     """
     try:
+        assigned_uuids = await _resolve_assigned_gpu_uuids()
+        scoped = assigned_uuids is not None
+        query_fields = (
+            "gpu_uuid,pid,process_name" if scoped else "pid,process_name"
+        )
         stdout, _ = await exec_command(
-            "nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader"
+            f"nvidia-smi --query-compute-apps={query_fields} --format=csv,noheader"
         )
 
         active_processes: list[str] = []
@@ -156,8 +207,15 @@ async def check_gpu_processes():
             if not parts:
                 continue
 
-            pid_str = parts[0]
-            proc_name = parts[1] if len(parts) > 1 else ""
+            if scoped:
+                if len(parts) < 3:
+                    continue
+                gpu_uuid, pid_str, proc_name = parts[0], parts[1], parts[2]
+                if gpu_uuid not in assigned_uuids:
+                    continue
+            else:
+                pid_str = parts[0]
+                proc_name = parts[1] if len(parts) > 1 else ""
 
             # Skip entries with invalid PID format
             try:
@@ -172,8 +230,12 @@ async def check_gpu_processes():
             active_processes.append(f"{pid}, {proc_name or '[Unknown]'}")
 
         if active_processes:
+            scope_note = (
+                f" (scoped to assigned GPUs {sorted(GPU_IDS)})" if scoped else ""
+            )
             raise RuntimeError(
-                f"Found pre-existing GPU processes:\n{json.dumps(active_processes, indent=2)}"
+                f"Found pre-existing GPU processes{scope_note}:\n"
+                f"{json.dumps(active_processes, indent=2)}"
             )
 
     except Exception as e:
