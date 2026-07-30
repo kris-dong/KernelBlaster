@@ -204,11 +204,14 @@ async def exec_remote_compilation(
 
 
 async def _opencl_compile_job(worker_id: int, job_args: tuple) -> str:
-    """Single OpenCL compile job — runs either remote SSH compile or local x86 compile.
+    """Single OpenCL compile job — delegates to :class:`OpenCLCompileStrategy`.
 
-    Called by ``queue_worker_loop`` for each item dequeued from ``QUEUE``;
-    queue/error scaffolding lives in ``servers/utils/queue_server.py``.
+    Phase C extracted the body into the strategy. Returns the strategy's
+    ``remote_binary_path`` (or the local path on x86 fallback) as the
+    string that the ``/compile_opencl`` endpoint surfaces.
     """
+    from .strategies import get_compile_strategy
+
     (
         job_name,
         main_file,
@@ -218,35 +221,18 @@ async def _opencl_compile_job(worker_id: int, job_args: tuple) -> str:
         output_path,
     ) = job_args
 
-    if remote and _BOARD_HOST:
-        remote_binary = await exec_remote_compilation(
-            job_name,
-            main_file,
-            kernel_file,
-            opencl_version,
-            _BOARD_HOST,
-            output_path,
-        )
-        output_path.chmod(0o755)
-        logger.info(
-            f"[Worker {worker_id}]: Remote compilation success: {job_name} -> {remote_binary}"
-        )
-        return remote_binary
-
-    tmp_path = await exec_local_compilation(
-        job_name,
-        main_file,
-        kernel_file,
-        opencl_version,
-        worker_id,
-        output_path,
+    result = await get_compile_strategy("opencl").compile(
+        worker_id=worker_id,
+        job_name=job_name,
+        main_file=main_file,
+        source_file=kernel_file,
+        backend_version=opencl_version,
+        backend_flag=remote,
+        output_path=output_path,
+        artifacts_dir=_ARTIFACTS_DIR,
+        board_host=_BOARD_HOST,
     )
-    output_path.write_bytes(tmp_path.read_bytes())
-    output_path.chmod(0o755)
-    logger.info(
-        f"[Worker {worker_id}]: Local compilation success: {job_name} -> {output_path}"
-    )
-    return str(output_path)
+    return result if result is not None else str(output_path)
 
 
 @asynccontextmanager

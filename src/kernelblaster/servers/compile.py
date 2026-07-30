@@ -316,11 +316,14 @@ async def exec_compilation(
 
 
 async def _cuda_compile_job(worker_id: int, job_args: tuple) -> bool:
-    """Single CUDA compile job — runs CMake/make and writes the binary.
+    """Single CUDA compile job — delegates to :class:`CUDACompileStrategy`.
 
-    Called by ``queue_worker_loop`` for each item dequeued from ``QUEUE``;
-    queue/error scaffolding lives in ``servers/utils/queue_server.py``.
+    Phase C extracted the body into the strategy. This handler now just
+    unpacks the queue tuple, invokes the strategy, and returns the
+    ``queue_worker_loop`` success sentinel.
     """
+    from .strategies import get_compile_strategy
+
     (
         job_name,
         main_file,
@@ -329,37 +332,17 @@ async def _cuda_compile_job(worker_id: int, job_args: tuple) -> bool:
         persistent_artifacts,
         output_path,
     ) = job_args
-    logger.info(f"[Worker {worker_id}]: Compiling {job_name}")
-    if persistent_artifacts:
-        logger.info(
-            f"[Worker {worker_id}]: Using persistent_artifacts mode for {job_name}"
-        )
-    try:
-        main_sz = Path(main_file).stat().st_size
-    except Exception:
-        main_sz = -1
-    try:
-        cuda_sz = Path(cuda_file).stat().st_size if cuda_file else -1
-    except Exception:
-        cuda_sz = -1
-    logger.info(
-        f"[Worker {worker_id}]: input file sizes bytes main={main_sz} cuda={cuda_sz} sm={sm_version}"
-    )
 
-    tmp_path = await exec_compilation(
-        job_name,
-        main_file,
-        cuda_file,
-        sm_version,
-        worker_id,
-        output_path,
-        persistent_artifacts,
+    await get_compile_strategy("cuda").compile(
+        worker_id=worker_id,
+        job_name=job_name,
+        main_file=main_file,
+        source_file=cuda_file,
+        backend_version=sm_version,
+        backend_flag=persistent_artifacts,
+        output_path=output_path,
+        artifacts_dir=_ARTIFACTS_DIR,
         debug=args.compile_debug,
-    )
-    output_path.write_bytes(tmp_path.read_bytes())
-    output_path.chmod(0o755)  # make this file executable
-    logger.info(
-        f"[Worker {worker_id}]: Successfully compiled {job_name} and saved to {output_path}"
     )
     return True
 
