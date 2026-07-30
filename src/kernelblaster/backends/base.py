@@ -277,3 +277,92 @@ class Backend(ABC):
         the existing OpenCL hack of stuffing microseconds into the
         cycles parameter.
         """
+
+    # ---- Prompt + DB glue (Phase 4f.3d.a) ----
+    # Bits that vary per backend but are called from a lifted
+    # ``RLAgentBase.apply_optimization``. Kept on the backend so the RL loop
+    # body stays fully backend-agnostic.
+    @abstractmethod
+    def build_strategy_prompt(
+        self,
+        optimization_entry,
+        code: str,
+        profile_result: "ProfileResult",
+        database_content: str,
+        description: str = "",
+    ) -> str:
+        """Assemble the per-step LLM prompt that asks for optimised code.
+
+        Backends dispatch to their existing prompt generator internally
+        (CUDA: ``generate_strategy_guided_prompt``, OpenCL:
+        ``generate_opencl_strategy_prompt``) with the shape they expect.
+        ``profile_result`` carries the raw log + backend-specific extras
+        (CUDA's ``annotated_ncu`` lives in ``raw_metrics``).
+        """
+
+    @abstractmethod
+    def build_fix_prompt(
+        self,
+        code: str,
+        error_msg: str,
+        database_footer: str = "",
+    ) -> str:
+        """Assemble the "the previous code failed to compile, please fix it"
+        prompt. CUDA uses a ```cpp fence and mentions ``cuda_fp16.h`` etc.;
+        OpenCL uses a ```c fence and asks for the same signature."""
+
+    def database_update_kwargs(self) -> dict:
+        """Extra kwargs forwarded to ``database.update_optimization_result``.
+
+        CUDA passes nothing (relies on the DB's default baseline-file
+        speedup parse). OpenCL passes ``current_file_path=None`` to
+        suppress that parse because it tracks percent improvement from
+        measured ms directly.
+        """
+        return {}
+
+    # ---- Metric-shape glue (Phase 4f.3d.b) ----
+    # The trajectory loop holds two scalar state variables — ``current_metric``
+    # (backend primary metric) and ``last_raw_log`` (backend profile stdout /
+    # NCU report). These three hooks bridge the shape gap so the loop body
+    # can be lifted verbatim.
+    @abstractmethod
+    def parse_state_metrics(self, raw_log: str, current_metric) -> dict:
+        """Build the metrics dict that ``database.analyze_performance_state``
+        expects for THIS backend.
+
+        CUDA: ``parse_ncu_metrics(raw_log)`` (Speed-Of-Light section extract).
+        OpenCL: ``parse_opencl_profile(raw_log)`` + inject
+        ``total_kernel_time_ms=current_metric or 0.0`` — this is what the
+        legacy in-loop code did for the OpenCL path.
+        """
+
+    @abstractmethod
+    def state_cycles_from_metric(self, current_metric) -> int:
+        """Build the ``elapsed_cycles=`` int for ``analyze_performance_state``
+        from the loop's ``current_metric`` scalar (no ProfileResult available
+        here; the loop keeps the metric+raw_log pair, not the full result).
+
+        CUDA: ``int(current_metric or 0)`` (metric IS cycles).
+        OpenCL: ``int((current_metric or 0) * 1000)`` (ms -> microseconds-as-int).
+        """
+
+    @abstractmethod
+    def metric_to_traj_cycles(self, metric) -> int:
+        """Convert a backend primary metric into the value stored in
+        ``TrajectoryStep.cycles`` (typed ``int``).
+
+        CUDA: ``int(metric)`` — cycles are already integer-valued.
+        OpenCL: ``int(metric * 1000)`` — stuff microseconds into the field.
+
+        Inverse of ``metric_from_traj_cycles``.
+        """
+
+    @abstractmethod
+    def metric_from_traj_cycles(self, cycles: int) -> float:
+        """Inverse of ``metric_to_traj_cycles``. Used by the top-level
+        ``run()`` loop when it reads ``TrajectoryStep.cycles`` back out to
+        select the fastest iteration.
+
+        CUDA: ``float(cycles)``. OpenCL: ``cycles / 1000.0``.
+        """

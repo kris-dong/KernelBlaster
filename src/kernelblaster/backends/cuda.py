@@ -201,6 +201,77 @@ class CUDABackend(Backend):
     def state_cycles_arg(self, profile_result: ProfileResult) -> int:
         return int(profile_result.raw_metrics.get("elapsed_cycles", 0))
 
+    # ---- Prompt + DB glue (Phase 4f.3d.a) ----
+    def build_strategy_prompt(
+        self,
+        optimization_entry,
+        code: str,
+        profile_result: ProfileResult,
+        database_content: str,
+        description: str = "",
+    ) -> str:
+        from ..agents.opt_ncu_rl import generate_strategy_guided_prompt
+
+        annotated_ncu = profile_result.raw_metrics.get("annotated_ncu", "") or ""
+        return generate_strategy_guided_prompt(
+            optimization_entry,
+            annotated_ncu,
+            profile_result.raw_log,
+            database_content,
+            override_description=description or None,
+            original_code=code,
+            backend=self,
+        )
+
+    def build_fix_prompt(
+        self,
+        code: str,
+        error_msg: str,
+        database_footer: str = "",
+    ) -> str:
+        parts = [
+            "The previously generated CUDA code failed to compile or run.\n\n",
+            "COMPILER / RUNTIME ERROR LOG:\n```\n",
+            f"{error_msg}\n",
+            "```\n\n",
+            "ORIGINAL CUDA CODE (for reference – please modify in place):\n```cpp\n",
+            f"{code}\n",
+            "```\n\n",
+        ]
+        if database_footer:
+            parts.append("OPTIMIZATION DATABASE FOOTER (reference snippets):\n```\n")
+            parts.append(database_footer)
+            parts.append("\n```\n\n")
+        parts.extend(
+            [
+                "Please provide a corrected, fully compilable version of the kernel. Return **complete CUDA code** in one ```cpp``` block.",
+                " Please keep the code structure otherwise unchanged; it is compiled together with separate test code, so do NOT add a main function.\n\n",
+                "Include ALL necessary components:\n",
+                "   - #include statements (cuda_fp16.h, cuda_runtime.h, etc.)\n",
+                "   - #define constants – DEFINE ALL CONSTANTS BEFORE USING THEM\n",
+                "   - Complete __global__ kernel function with proper signature\n",
+                "   - Complete launch_gpu_implementation(void*, void*, void*, int64_t) function\n",
+            ]
+        )
+        return "".join(parts)
+
+    # CUDA relies on the database's default baseline-file speedup parse,
+    # so ``database_update_kwargs`` inherits the empty base default.
+
+    # ---- Metric-shape glue (Phase 4f.3d.b) ----
+    def parse_state_metrics(self, raw_log: str, current_metric) -> dict:
+        from ..agents.utils.parsing import parse_ncu_metrics
+        return parse_ncu_metrics(raw_log)
+
+    def state_cycles_from_metric(self, current_metric) -> int:
+        return int(current_metric or 0)
+
+    def metric_to_traj_cycles(self, metric) -> int:
+        return int(metric)
+
+    def metric_from_traj_cycles(self, cycles: int) -> float:
+        return float(cycles)
+
     # ---- RL graph-node config ----
     def rl_node_config(self):
         """Per-backend wiring for the unified RL-optimization graph node.

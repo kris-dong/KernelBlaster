@@ -203,6 +203,68 @@ class OpenCLBackend(Backend):
         # opt_opencl_rl.py:432 — kept verbatim for state-derivation parity).
         return int(profile_result.total_time_ms * 1000)
 
+    # ---- Prompt + DB glue (Phase 4f.3d.a) ----
+    def build_strategy_prompt(
+        self,
+        optimization_entry,
+        code: str,
+        profile_result: ProfileResult,
+        database_content: str,
+        description: str = "",
+    ) -> str:
+        from ..agents.opt_opencl_rl import generate_opencl_strategy_prompt
+
+        return generate_opencl_strategy_prompt(
+            optimization_entry,
+            code,
+            profile_result.raw_log,
+            database_content,
+            override_description=description or None,
+            original_code=code,
+            backend=self,
+        )
+
+    def build_fix_prompt(
+        self,
+        code: str,
+        error_msg: str,
+        database_footer: str = "",
+    ) -> str:
+        return (
+            "The previously generated OpenCL kernel failed to compile or run.\n\n"
+            f"ERROR LOG:\n```\n{error_msg}\n```\n\n"
+            f"ORIGINAL KERNEL CODE:\n```c\n{code}\n```\n\n"
+            "Please provide a corrected, fully compilable version of the kernel. "
+            "Return complete OpenCL C code in one ```c``` block.\n"
+            "Keep the same kernel function name and argument signature.\n"
+        )
+
+    def database_update_kwargs(self) -> dict:
+        # OpenCL RL tracks percent improvement from measured ms; suppress
+        # the CUDA baseline-file speedup parse the database defaults to.
+        return {"current_file_path": None}
+
+    # ---- Metric-shape glue (Phase 4f.3d.b) ----
+    def parse_state_metrics(self, raw_log: str, current_metric) -> dict:
+        # Historical shape from ``opt_opencl_rl.run_rollout``: per-kernel ms
+        # from the [PROFILE] markers plus ``total_kernel_time_ms`` derived
+        # from the current metric (ms).
+        from ..agents.opt_opencl_rl import parse_opencl_profile
+        metrics = parse_opencl_profile(raw_log)
+        metrics["total_kernel_time_ms"] = float(current_metric or 0.0)
+        return metrics
+
+    def state_cycles_from_metric(self, current_metric) -> int:
+        # Mirrors ``state_cycles_arg`` — pack microseconds-as-int into the
+        # cycles slot the CUDA-flavored database API expects.
+        return int((current_metric or 0) * 1000)
+
+    def metric_to_traj_cycles(self, metric) -> int:
+        return int(metric * 1000)
+
+    def metric_from_traj_cycles(self, cycles: int) -> float:
+        return cycles / 1000.0
+
     # ---- RL graph-node config ----
     def rl_node_config(self):
         """Per-backend wiring for the unified RL-optimization graph node.

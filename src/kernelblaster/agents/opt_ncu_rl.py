@@ -323,105 +323,33 @@ class RLNCUAgent(RLAgentBase):
                 f"Failed to write fallback 0_init_annotated.cu: {_e}"
             )
 
-    async def run(self) -> Path:
-        """
-        Override the base run method to implement RL-specific behavior.
-        Runs multiple RL iterations **in parallel** and returns the best result.
-        """
-        import asyncio as _asyncio
-        
-        best_filename = None
-        best_cycles = float('inf')
-
-        # Ensure initial profiling data is available ONCE before spawning tasks
-        if not hasattr(self, "last_profile_log") or not self.last_profile_log:
-            await self.initialize()
-        # Compute and share the initial state derived from the initial NCU log
-        initial_state_shared = await self.database.get_state_from_ncu_report(
-            self.last_profile_log,
-            parse_ncu_metrics(self.last_profile_log),
-            self.kernel_source,
-            elapsed_cycles=self.initial_metric,
-        )
-
-        async def _run_single_iteration(iteration_idx: int):
-            """Helper that performs one rollout and returns its trajectory."""
-            self.agent_logger.info(
-                f"[Async] RL Iteration {iteration_idx + 1}/{self.num_rl_iterations}")
-            try:
-                # Initial state derived once and shared across iterations
-                initial_state = initial_state_shared
-
-                trajectory = await self.run_rollout(self.kernel_source, initial_state)
-                return iteration_idx, trajectory
-            except Exception as exc:
-                self.agent_logger.error(
-                    f"RL iteration {iteration_idx + 1} failed: {exc}")
-                return iteration_idx, None
-
-        # Launch all iterations concurrently
-        tasks = [_asyncio.create_task(_run_single_iteration(i)) for i in range(self.num_rl_iterations)]
-
-        for coro in _asyncio.as_completed(tasks):
-            iteration_idx, trajectory = await coro
-            if trajectory is None:
-                continue
-
-            # Process trajectory results
-            if trajectory.steps:
-                best_step = min(trajectory.steps, key=lambda s: s.cycles)
-                if best_step.cycles < best_cycles:
-                    best_cycles = best_step.cycles
-                    best_filename_path = self.folder / f"rl_iter_{iteration_idx}_best.cu"
-                    best_filename_path.write_text(
-                        self.backend.format_result_artifact(best_step.code, best_step.cycles))
-                    best_filename = best_filename_path
-                    self.agent_logger.info(
-                        f"[Async] New best result from iter {iteration_idx}: {best_cycles} cycles")
-
-            # Update replay buffer & trajectory counters **after** trajectory is complete
-            if trajectory:
-                self.replay_buffer.add_trajectory(trajectory)
-                self.total_trajectories += 1
-
-        # After all tasks completed
-        # Persist a numbered snapshot of the optimisation database JSON
-        try:
-            # Ensure current DB state is persisted
-            self.database._persist_database()
-            persist_fp = self.database._persist_json_fp
-            snapshots_dir = persist_fp.parent / "snapshots"
-            snapshots_dir.mkdir(parents=True, exist_ok=True)
-            existing = sorted(snapshots_dir.glob("optimization_database_*.json"))
-            next_idx = len(existing)
-            snapshot_fp = snapshots_dir / f"optimization_database_{next_idx}.json"
-            snapshot_fp.write_text(persist_fp.read_text(encoding="utf-8"), encoding="utf-8")
-            self.agent_logger.info(f"Saved database snapshot to {snapshot_fp}")
-        except Exception as snap_exc:
-            self.agent_logger.warning(f"Failed to write database snapshot: {snap_exc}")
+    # run() lifted to RLAgentBase in Phase 4f.3d.f. This subclass only
+    # contributes the ``_finalize_run`` hook below (baseline-recompute
+    # fallback + backend.format_result_artifact for the failure file).
+    async def _finalize_run(self, best_filename, best_metric) -> Path:
+        ext = self.backend.kernel_ext
 
         if best_filename is not None:
-            # Ensure we have baseline cycles to judge improvement.
+            # Baseline recompute so we can judge improvement.
             try:
                 if self.initial_metric is None:
                     init_fp = getattr(self, "kernel_source_fp", None)
                     if not init_fp or not init_fp.exists():
-                        self.kernel_source_fp = self.folder / "init.cu"
+                        self.kernel_source_fp = self.folder / f"init{ext}"
                         self.kernel_source_fp.write_text(self.kernel_source)
-                    _, _, _, baseline_cycles = await self.gather_perf_metrics(self.kernel_source_fp)
-                    self.initial_metric = baseline_cycles
+                    pr = await self.gather_profile_result(self.kernel_source_fp)
+                    self.initial_metric = self.backend.extract_primary_metric(pr)
             except Exception as e:
                 self.agent_logger.warning(
                     f"Failed to obtain baseline cycles before finalizing result: {e}"
                 )
 
-            # Decide success vs failure based on improvement over baseline.
-            if self.initial_metric is not None and best_cycles < self.initial_metric:
-                final_filename = self.folder / "success_rl_optimization.cu"
+            if self.initial_metric is not None and best_metric < self.initial_metric:
+                final_filename = self.folder / f"success_rl_optimization{ext}"
                 final_filename.write_text(best_filename.read_text())
                 return final_filename
 
-            failure_file = self.folder / "failure_rl_optimization.cu"
+            failure_file = self.folder / f"failure_rl_optimization{ext}"
             baseline_str = self.initial_metric if self.initial_metric is not None else "N/A"
             try:
                 failure_file.write_text(
@@ -437,36 +365,47 @@ class RLNCUAgent(RLAgentBase):
                 except Exception:
                     pass
             self.agent_logger.error(
-                "RL did not produce an improvement; wrote failure_rl_optimization.cu with baseline (if available)"
+                f"RL did not produce an improvement; wrote failure_rl_optimization{ext} "
+                f"with baseline (if available)"
             )
             return failure_file
 
-        # No trajectory produced a candidate. Still write a failure file (with baseline if available).
+        # No trajectory produced a candidate.
         try:
             if self.initial_metric is None:
                 init_fp = getattr(self, "kernel_source_fp", None)
                 if not init_fp or not init_fp.exists():
-                    self.kernel_source_fp = self.folder / "init.cu"
+                    self.kernel_source_fp = self.folder / f"init{ext}"
                     self.kernel_source_fp.write_text(self.kernel_source)
-                _, _, _, cycles = await self.gather_perf_metrics(self.kernel_source_fp)
+                pr = await self.gather_profile_result(self.kernel_source_fp)
+                cycles = self.backend.extract_primary_metric(pr)
                 self.initial_metric = cycles
-                self.best_metric = min(self.best_metric, cycles) if self.best_metric else cycles
+                self.best_metric = (
+                    min(self.best_metric, cycles) if self.best_metric else cycles
+                )
         except Exception as e:
-            self.agent_logger.warning(f"Failed to obtain baseline cycles for original code: {e}")
+            self.agent_logger.warning(
+                f"Failed to obtain baseline cycles for original code: {e}"
+            )
 
-        fallback_cycles = self.initial_metric if self.initial_metric is not None else "N/A"
-        failure_file = self.folder / "failure_rl_optimization.cu"
+        fallback = self.initial_metric if self.initial_metric is not None else "N/A"
+        failure_file = self.folder / f"failure_rl_optimization{ext}"
         try:
-            failure_file.write_text(self.backend.format_result_artifact(self.kernel_source, fallback_cycles))
+            failure_file.write_text(
+                self.backend.format_result_artifact(self.kernel_source, fallback)
+            )
         except Exception:
             try:
                 init_fp = getattr(self, "kernel_source_fp", None)
                 if init_fp and init_fp.exists():
-                    failure_file.write_text(self.backend.format_result_artifact(init_fp.read_text(), fallback_cycles))
+                    failure_file.write_text(
+                        self.backend.format_result_artifact(init_fp.read_text(), fallback)
+                    )
             except Exception:
                 pass
         self.agent_logger.error(
-            "All RL iterations failed; wrote failure_rl_optimization.cu with baseline (if available)"
+            f"All RL iterations failed; wrote failure_rl_optimization{ext} "
+            f"with baseline (if available)"
         )
         return failure_file
 
@@ -848,498 +787,19 @@ class RLNCUAgent(RLAgentBase):
         
         return "\n\n".join(sections)
 
-    async def run_rollout(self, initial_code: str, initial_state: str) -> Trajectory:
-        """Run a single optimization rollout trajectory."""
-        import json as _json, random, uuid as _uuid
-        from dataclasses import asdict
-
-        # --------------------------------------------------------------
-        # Create per-trajectory folder for logs & artefacts
-        # --------------------------------------------------------------
-        async with self._trajectory_lock:
-            self.total_trajectories += 1
-            trajectory_index = self.total_trajectories  # Unique per agent instance
-
-        # Use uuid suffix to avoid folder name collisions in concurrent runs
-        _uid = _uuid.uuid4().hex[:8]
-        trajectory_dir = self.folder / f"trajectory_{trajectory_index}_{_uid}"
-        trajectory_dir.mkdir(parents=True, exist_ok=True)
-
-        # Initialise trajectory container
-        trajectory = Trajectory()
-
-        current_code: str = initial_code
-        current_state: str = initial_state
-        current_cycles: int = self.initial_metric
-        last_ncu_log: str = getattr(self, "last_profile_log", "")
-        
-        self.agent_logger.info(f"Starting rollout from state: {current_state}")
-        
-
-        for step in range(self.max_rollout_steps):
-            # ----------------------------------------------------------
-            # 1) Analyse current performance state using the LLM helper
-            # ----------------------------------------------------------
-            metrics = parse_ncu_metrics(last_ncu_log)
-            # print("CURRENT CODE: ", current_code)
-            # exit(0)
-            try:
-                profile = await self.database.analyze_performance_state(
-                    last_ncu_log, metrics, current_code, elapsed_cycles=current_cycles
-                )
-                analysis_json_str = _json.dumps(asdict(profile), indent=2)
-
-                # --------------------------------------------------
-                # 2) Ask the DB to generate a ranked optimisation plan
-                # --------------------------------------------------
-                # Dynamic top_n based on rollout step (1-based)
-                cur_iter = step + 1
-                plan = await self.database.generate_optimization_plan(
-                    analysis_json_str, current_code, top_n= max(4,(self.max_rollout_steps-int(cur_iter))))
-                
-            except Exception as exc:
-                self.agent_logger.warning(f"Plan generation failed, falling back: {exc}")
-                plan = []
-
-            # ----------------------------------------------------------
-            # 3) Pick one technique randomly weighted by relevance score
-            # ----------------------------------------------------------
-            optimization_entry = None
-            if plan:
-                def _safe_rel(x):
-                    try:
-                        r = float(x)
-                    except (TypeError, ValueError):
-                        r = 0.05
-                    return min(max(r, 0.0), 1.0)
-                # Optional deterministic selection for reproducibility/debugging.
-                # If set, choose the single highest-relevance item instead of sampling.
-                force_top1 = os.getenv("KERNELAGENT_DB_FALLBACK_TOP1", "0") in (
-                    "1",
-                    "true",
-                    "True",
-                    "yes",
-                    "YES",
-                    "y",
-                    "on",
-                    "ON",
-                )
-                if force_top1:
-                    chosen_plan = max(
-                        plan,
-                        key=lambda p: _safe_rel(p.get("relevance_score", 0.05)),
-                    )
-                    self.agent_logger.info(
-                        f"KERNELAGENT_DB_FALLBACK_TOP1 is set; deterministically selecting top-1 from LLM plan: "
-                        f"{chosen_plan.get('technique')} (relevance {chosen_plan.get('relevance_score', 0.0)})"
-                    )
-                else:
-                    # Cube the relevance to downweight low-relevance options
-                    weights = [max(_safe_rel(p.get("relevance_score", 0.05)) ** 3, 0.001) for p in plan]
-                    chosen_plan = random.choices(plan, weights=weights, k=1)[0]
-                technique_name = chosen_plan.get("technique")
-
-                # Helper to locate the corresponding entry in the DB
-                optimization_entry = self._lookup_optim_entry_by_name(technique_name)
-                strategy_description = chosen_plan.get("description", "")
-
-                self.agent_logger.info(
-                    f"Selected technique from optimisation plan: {technique_name} (relevance {chosen_plan.get('relevance_score', 0.0):.2f})"
-                )
-
-            # ----------------------------------------------------------
-            # 4) Fallback to legacy database chooser if needed
-            # ----------------------------------------------------------
-            if optimization_entry is None:
-                optimization_entry = self.database.select_best_optimization(current_state)
-                if optimization_entry is None:
-                    # Try to find unused optimizations
-                    optimization_entry = self.database.select_best_optimization(current_state, exclude_used=True)
-                    if optimization_entry is None:
-                        # Try to find any optimization from all states as fallback
-                        all_states_with_optimizations = [
-                            state for state, state_data in self.database.optimization_strategies.items()
-                            if len(state_data.get("optimizations", [])) > 0
-                        ]
-                        
-                        for state_name in all_states_with_optimizations:
-                            optimization_entry = self.database.select_best_optimization(state_name)
-                            if optimization_entry is not None:
-                                self.agent_logger.info(f"Using fallback optimization from state: {state_name}")
-                                break
-                        
-                        if optimization_entry is None:
-                            # Last resort: try to add default optimizations for the discovered state
-                            if self._try_add_default_optimizations(current_state):
-                                optimization_entry = self.database.select_best_optimization(current_state)
-                                if optimization_entry is not None:
-                                    self.agent_logger.info(f"Using default optimization for new state: {current_state}")
-                    
-                    if optimization_entry is None:
-                        self.agent_logger.warning(f"No optimization found for state: {current_state}, stopping rollout at step {step}")
-                        break
-                else:
-                    self.agent_logger.info(f"Using unused optimization for state: {current_state}")
-            else:
-                self.agent_logger.info(f"Using best optimization for state: {current_state}")
-
-            # Get the technique name based on the optimization type
-            if isinstance(optimization_entry, CompositeOptimization):
-                technique_name = optimization_entry.get_composite_id()
-            elif hasattr(optimization_entry, "technique"):
-                technique_name = optimization_entry.technique
-            else:
-                technique_name = str(optimization_entry)
-            
-            # Safe predicted value for logging
-            _pred_impr = getattr(optimization_entry, "predicted_improvement", None)
-            pred_log = f" (predicted: {_pred_impr}%)" if _pred_impr is not None else ""
-            self.agent_logger.info(
-                f"Step {step}: Applying {technique_name}{pred_log} | entry_type={type(optimization_entry).__name__}"
-            )
-            
-            try:
-                # Apply optimization
-                optimized_code, new_cycles, new_state, new_ncu_log = await self.apply_optimization(
-                    current_code,
-                    optimization_entry,
-                    step,
-                    trajectory_dir,
-                    strategy_description if 'strategy_description' in locals() else "",
-                )
-                
-                # Calculate actual improvement
-                if current_cycles is not None and current_cycles > 0:
-                    actual_improvement = ((current_cycles - new_cycles) / current_cycles) * 100
-                else:
-                    # Baseline unknown; treat improvement as 0 for reward/logging purposes
-                    actual_improvement = 0.0
-                reward = self.calculate_reward(
-                    getattr(optimization_entry, "predicted_improvement", None), 
-                    actual_improvement,
-                    (current_cycles is not None and new_cycles < current_cycles)
-                )
-                
-                # Create trajectory step
-                action_name = (
-                    optimization_entry.get_composite_id()
-                    if isinstance(optimization_entry, CompositeOptimization)
-                    else getattr(optimization_entry, "technique", str(optimization_entry))
-                )
-                
-                traj_step = TrajectoryStep(
-                    state=current_state,
-                    action=action_name,
-                    code=optimized_code,
-                    cycles=new_cycles,
-                    predicted_improvement=getattr(optimization_entry, "predicted_improvement", 0.0),
-                    actual_improvement=actual_improvement,
-                    reward=reward
-                )
-                self.agent_logger.info(f"Adding trajectory step: {traj_step}")
-                trajectory.add_step(traj_step)
-
-                self.agent_logger.info(f"Updating database with actual results for {technique_name} in state {current_state} with actual improvement {actual_improvement}")
-                # Update database with actual results
-                if isinstance(optimization_entry, CompositeOptimization):
-                    self.database.update_composite_optimization_result(
-                        current_state,
-                        technique_name,
-                        actual_improvement
-                    )
-                else:
-                    # Log this with logger
-                    self.agent_logger.info(f"Updating optimization result for {technique_name} in state {current_state} with actual improvement {actual_improvement}")
-                    self.database.update_optimization_result(
-                        current_state, 
-                        technique_name,
-                        actual_improvement
-                    )
-                
-                self.agent_logger.info(
-                    f"Step {step} result: {new_cycles} cycles "
-                    f"({actual_improvement:.1f}% improvement, reward: {reward:.2f})"
-                )
-                
-                # Update for next step
-                current_code = optimized_code
-                current_state = new_state
-                current_cycles = new_cycles
-                last_ncu_log = new_ncu_log or last_ncu_log  # keep for next iteration
-                
-                # Early stopping if severe degradation (relaxed from -20% to -50% to -500%)
-                if actual_improvement < -500:  # More than 500% slower
-                    self.agent_logger.warning(f"Stopping rollout due to severe degradation: {actual_improvement:.1f}%")
-                    break
-                    
-            except Exception as e:
-                import traceback
-                tb = traceback.format_exc()
-                # Log detailed traceback and context
-                try:
-                    self.agent_logger.error(
-                        f"Error in step {step}: {e}\n"
-                        f"Technique: {technique_name} | Entry type: {type(optimization_entry).__name__}\n"
-                        f"Raw optimization entry: {optimization_entry}\n"
-                        f"Traceback:\n{tb}"
-                    )
-                except Exception:
-                    # Fallback if logger formatting fails
-                    print(f"Error in step {step}: {e}\n{tb}")
-                break
-        
-        return trajectory
-
+    # run_rollout lifted to RLAgentBase in Phase 4f.3d.e. Backend hooks
+    # (parse_state_metrics, state_cycles_from_metric, metric_to_traj_cycles,
+    # database_update_kwargs) supply the CUDA-flavoured bits — no override
+    # needed here.
     # ------------------------------------------------------------------
     # Helper to find an optimisation entry by its technique/composite ID
     # ------------------------------------------------------------------
     # _lookup_optim_entry_by_name lifted to RLAgentBase in Phase 4f.
 
-    async def apply_optimization(
-        self,
-        code: str,
-        optimization_entry: OptimizationEntry | CompositeOptimization,
-        step: int,
-        trajectory_dir: Path | None = None,
-        strategy_description: str = "",
-    ) -> Tuple[str, int, str, str]:
-        """Apply a specific optimization and return the optimized code, cycles, new state."""
-        # --------------------------------------------------------------
-        # Helper to persist prompt/response pairs for agentic inspection
-        # --------------------------------------------------------------
-        def _save_agentic_log(label: str, prompt_text: str, response_text: str):
-            if trajectory_dir is None:
-                return  # Logging disabled if no directory provided
-            log_fp = trajectory_dir / "agentic_steps_log.txt"
-            with open(log_fp, "a", encoding="utf-8") as f:
-                f.write(f"=== {label} ===\n")
-                f.write("--- PROMPT ---\n")
-                f.write(prompt_text.rstrip() + "\n")
-                f.write("--- RESPONSE ---\n")
-                f.write(response_text.rstrip() + "\n\n")
-        
-        # Create temporary file for this optimization attempt
-        if isinstance(optimization_entry, CompositeOptimization):
-            technique_name = optimization_entry.get_composite_id()
-        else:
-            technique_name = getattr(optimization_entry, "technique", str(optimization_entry))
-        base_label = f"step_{step}_{technique_name}"
-        # Route all per-step artifacts into the trajectory directory when available
-        base_dir = trajectory_dir if trajectory_dir is not None else self.folder
-        temp_file = base_dir / f"step_{step}_{technique_name}.cu"
-        temp_file.write_text(code)
-        
-        # Gather current profiling data; tolerate numeric-verification failures
-        try:
-            annotated_ncu, ncu_log, _, _ = await self.gather_perf_metrics(temp_file)
-        except FeedbackError as prof_err:
-            self.agent_logger.warning(
-                f"Profiling failed at step {step} with FeedbackError; using empty NCU log. Details: {prof_err}"
-            )
-            annotated_ncu, ncu_log = "", ""
-        except Exception as prof_other:
-            self.agent_logger.warning(
-                f"Unexpected profiling error at step {step}: {prof_other}; continuing with empty logs."
-            )
-            annotated_ncu, ncu_log = "", ""
-        
-        # Generate strategy-guided prompt with full database content
-        try:
-            database_content = self.database.get_database_md_text()
-            # Fallback to footer if full database is empty
-            if not database_content or database_content.strip() == "":
-                self.agent_logger.warning("Database markdown is empty, trying footer")
-                database_content = self.database.get_database_footer_text()
-                if not database_content or database_content.strip() == "":
-                    self.agent_logger.warning("Database footer is also empty, using GPU optimization knowledge")
-                    # Final fallback: use GPU optimization report
-                    database_content = getattr(self.database, 'gpu_optimization_knowledge', '')[:6000] or ""
-        except Exception as e:
-            self.agent_logger.warning(f"Failed to load database content: {e}")
-            try:
-                database_content = self.database.get_database_footer_text()
-            except Exception:
-                # Final fallback
-                database_content = getattr(self.database, 'gpu_optimization_knowledge', '')[:6000] or ""
-        
-        # Log database content size for debugging
-        if database_content:
-            self.agent_logger.debug(f"Using database content: {len(database_content)} characters")
-        else:
-            self.agent_logger.warning("No database content available for prompt")
-        prompt = generate_strategy_guided_prompt(
-            optimization_entry,
-            annotated_ncu,
-            ncu_log,
-            database_content,
-            override_description=strategy_description or None,
-            original_code=code,  # Pass original code as fallback when annotated_ncu is empty
-            backend=self.backend,
-        )
-
-        # Persist initial prompt/response
-        # (logging occurs after LLM response is available)
-        
-        # Get optimized code from LLM
-        from .utils import generate_code_retry
-        response = await generate_code_retry(
-            messages=[{"role": "user", "content": prompt}],
-            model=self.model,
-            logger=self.agent_logger,
-            max_retries=3
-        )
-
-        # Persist initial prompt/response
-        _save_agentic_log(f"{base_label}_initial", prompt, response.generations[0])
-        
-        # Extract and test optimized code
-        optimized_code, filepath = self.get_code_from_response(
-            response.generations[0], step, 0, self.agent_logger
-        )
-        # Relocate the intermediate file produced by get_code_from_response into the trajectory folder to avoid collisions
-        try:
-            target_fp = base_dir / f"{base_label}_initial.cu"
-            # If the source and destination differ, move contents
-            if filepath != target_fp:
-                # Prefer rename; fallback to rewrite if cross-device
-                try:
-                    filepath.rename(target_fp)
-                except Exception:
-                    target_fp.write_text(optimized_code)
-                    try:
-                        filepath.unlink()
-                    except Exception:
-                        pass
-            filepath = target_fp
-        except Exception:
-            # Best-effort; continue even if relocation fails
-            pass
-
-        # --------------------------------------------------------------
-        # 2) Compile / run profiling with automatic fix attempts
-        # --------------------------------------------------------------
-        MAX_FIX_ATTEMPTS = 4  # How many times to attempt auto-repairs
-
-        attempt_idx = 0
-        compile_success = False
-        run_success = False
-        new_cycles = 0
-        new_ncu_log = ""
-
-        while attempt_idx < MAX_FIX_ATTEMPTS:
-            # Write the (potentially fixed) code to a unique file
-            filepath = base_dir / f"{base_label}_attempt{attempt_idx}.cu"
-            filepath.write_text(optimized_code)
-
-            try:
-                # Profile the optimized code (this implicitly compiles + runs it)
-                _, new_ncu_log, _, new_cycles = await self.gather_perf_metrics(filepath)
-
-                # If we reach here, compilation and run were successful
-                compile_success = True
-                run_success = True
-
-                # Log compile / run success for inspection
-                if trajectory_dir is not None:
-                    log_fp = trajectory_dir / "agentic_steps_log.txt"
-                    with open(log_fp, "a", encoding="utf-8") as f:
-                        f.write(f"Compile success: {compile_success}\n")
-                        f.write(f"Run success    : {run_success}\n")
-                        f.write(f"Elapsed cycles  : {new_cycles}\n\n")
-
-                break  # Exit retry loop – success
-
-            except Exception as e:
-                # Compilation or runtime failed – capture error message
-                error_msg = str(e)
-
-                # Append failure info to agentic log
-                if trajectory_dir is not None:
-                    log_fp = trajectory_dir / "agentic_steps_log.txt"
-                    with open(log_fp, "a", encoding="utf-8") as f:
-                        f.write(f"Compile/Run failed on attempt {attempt_idx}: {error_msg}\n\n")
-
-                attempt_idx += 1
-                if attempt_idx >= MAX_FIX_ATTEMPTS:
-                    # Give up and propagate the error – outer caller will handle
-                    raise
-
-                # ------------------------------------------------------
-                # Build a fix prompt for the LLM using the error message
-                # ------------------------------------------------------
-                # Try to include the Optimization Database footer (contains useful code snippets)
-                db_footer_text = ""
-                try:
-                    if hasattr(self.database, "optimization_db_footer_path") and self.database.optimization_db_footer_path.exists():
-                        db_footer_text = self.database.optimization_db_footer_path.read_text(encoding="utf-8")
-                except Exception:
-                    db_footer_text = ""
-
-                fix_prompt_parts = [
-                    "The previously generated CUDA code failed to compile or run.\n\n",
-                    "COMPILER / RUNTIME ERROR LOG:\n```\n",
-                    f"{error_msg}\n",
-                    "```\n\n",
-                    "ORIGINAL CUDA CODE (for reference – please modify in place):\n```cpp\n",
-                    f"{optimized_code}\n",
-                    "```\n\n",
-                ]
-                if db_footer_text:
-                    fix_prompt_parts.append("OPTIMIZATION DATABASE FOOTER (reference snippets):\n```\n")
-                    fix_prompt_parts.append(db_footer_text)
-                    fix_prompt_parts.append("\n```\n\n")
-                fix_prompt_parts.extend([
-                    "Please provide a corrected, fully compilable version of the kernel. Return **complete CUDA code** in one ```cpp``` block.",
-                    " Please keep the code structure otherwise unchanged; it is compiled together with separate test code, so do NOT add a main function.\n\n",
-                    "Include ALL necessary components:\n",
-                    "   - #include statements (cuda_fp16.h, cuda_runtime.h, etc.)\n",
-                    "   - #define constants – DEFINE ALL CONSTANTS BEFORE USING THEM\n",
-                    "   - Complete __global__ kernel function with proper signature\n",
-                    "   - Complete launch_gpu_implementation(void*, void*, void*, int64_t) function\n",
-                ])
-                fix_prompt = "".join(fix_prompt_parts)
-
-                # Ask the LLM to fix the code
-                fix_response = await generate_code_retry(
-                    messages=[{"role": "user", "content": fix_prompt}],
-                    model=self.model,
-                    logger=self.agent_logger,
-                    max_retries=2,
-                )
-
-                # Log the fix attempt prompt/response
-                _save_agentic_log(
-                    f"{base_label}_fix_attempt_{attempt_idx}",
-                    fix_prompt,
-                    fix_response.generations[0],
-                )
-
-                # Extract new code for next iteration
-                optimized_code, fix_fp = self.get_code_from_response(
-                    fix_response.generations[0], step, attempt_idx, self.agent_logger
-                )
-                # Relocate the intermediate fix file to the trajectory directory to avoid collisions
-                try:
-                    fix_target_fp = base_dir / f"{base_label}_attempt{attempt_idx}_llm.cu"
-                    if fix_fp != fix_target_fp:
-                        try:
-                            fix_fp.rename(fix_target_fp)
-                        except Exception:
-                            fix_target_fp.write_text(optimized_code)
-                            try:
-                                fix_fp.unlink()
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-
-        # ------------------------------------------------------------------
-        # 3) Determine new state (only if compilation/run succeeded)
-        # ------------------------------------------------------------------
-        new_metrics = parse_ncu_metrics(new_ncu_log)
-        # new_state = await self.database.get_state_from_ncu_report(new_ncu_log, new_metrics)
-        new_state = None  # TODO: Temp Disable state update
-        return optimized_code, new_cycles, new_state, new_ncu_log
+    # apply_optimization lifted to RLAgentBase in Phase 4f.3d. Backend
+    # picks the prompt via ``build_strategy_prompt`` / ``build_fix_prompt``.
+    # The base method returns a float metric; ``run_rollout`` in this
+    # class still casts to ``int`` before writing TrajectoryStep.cycles.
 
     # calculate_reward lifted to RLAgentBase in Phase 4f.
 
@@ -1392,49 +852,36 @@ class RLNCUAgent(RLAgentBase):
         except Exception as e:
             self.agent_logger.error(f"Error in policy update cycle: {e}")
 
-    async def get_feedback(self, response, attempt_id, task_id, logger) -> Feedback:
-        """Main feedback loop implementing the RL algorithm."""
-        
-        # Initialize if this is the first call
-        if self.initial_metric is None:
-            await self.initialize()
-        
-        # Start a new trajectory for this task
-        logger.info(f"Starting RL optimization trajectory for task {task_id}")
-        
-        # Get initial state
-        temp_file = self.folder / f"temp_task_{task_id}.cu"
-        code, filepath = self.get_code_from_response(response, attempt_id, task_id, logger)
-        
-        try:
-            # Profile initial code to determine state
-            annotated_ncu, ncu_log, _, cycles = await self.gather_perf_metrics(filepath)
-            metrics = parse_ncu_metrics(ncu_log)
-            initial_state = await self.database.get_state_from_ncu_report(ncu_log, metrics, code, elapsed_cycles=cycles)
-            
-            # Run optimization rollout
-            trajectory = await self.run_rollout(code, initial_state)
-            
-            # Add trajectory to replay buffer
-            self.replay_buffer.add_trajectory(trajectory)
-            self.total_trajectories += 1
-            
-            # Update best performance
-            if trajectory.final_cycles < self.best_metric:
-                self.best_metric = trajectory.final_cycles
-                is_faster = True
+    # get_feedback lifted to RLAgentBase in Phase 4f.3d. This subclass only
+    # contributes the per-backend _build_feedback hook below (CUDA framing:
+    # cycles, ncu_log, annotated_ncu). The trajectory-min best-step
+    # selection is the base default (_get_verified_best).
+    def _build_feedback(
+        self,
+        *,
+        response,
+        task_id,
+        code: str,
+        initial_metric: float,
+        profile_result,
+        initial_state: str,
+        trajectory,
+    ) -> Feedback:
+        ncu_log = profile_result.raw_log
+        annotated_ncu = profile_result.raw_metrics.get("annotated_ncu", "") or ""
+
+        # Best-perf side-effect (preserved from the pre-refactor path).
+        if trajectory.final_cycles < self.best_metric:
+            self.best_metric = trajectory.final_cycles
+
+        if trajectory.steps:
+            best_step = min(trajectory.steps, key=lambda s: s.cycles)
+            if self.initial_metric is not None and self.initial_metric > 0:
+                improvement_pct = ((self.initial_metric - best_step.cycles) / self.initial_metric) * 100
             else:
-                is_faster = False
-            
-            # Prepare feedback messages
-            if trajectory.steps:
-                best_step = min(trajectory.steps, key=lambda s: s.cycles)
-                if self.initial_metric is not None and self.initial_metric > 0:
-                    improvement_pct = ((self.initial_metric - best_step.cycles) / self.initial_metric) * 100
-                else:
-                    improvement_pct = 0.0
-                
-                feedback_msg = f"""Optimization trajectory completed with {len(trajectory.steps)} steps.
+                improvement_pct = 0.0
+
+            feedback_msg = f"""Optimization trajectory completed with {len(trajectory.steps)} steps.
 
 BEST RESULT:
 - Cycles: {best_step.cycles} (vs initial: {self.initial_metric})
@@ -1448,53 +895,41 @@ FINAL OPTIMIZED CODE:
 ```
 
 The optimization process is learning and adapting. Continue with further optimizations."""
-                
-                new_messages = [
-                    {"role": "assistant", "content": response},
-                    {"role": "user", "content": feedback_msg}
-                ]
-                
-                # Save best result
-                best_file = self.folder / f"best_task_{task_id}.cu"
-                best_file.write_text(best_step.code)
-                
-                return RLNCUFeedback(
-                    new_messages=new_messages,
-                    success=True,  # Consider successful if we completed a trajectory
-                    filename=str(best_file),
-                    contents=best_step.code,
-                    metric=best_step.cycles,
-                    ncu_log=ncu_log,
-                    annotated_ncu=annotated_ncu,
-                    optimization_technique=best_step.action,
-                    predicted_improvement=best_step.predicted_improvement,
-                    actual_improvement=best_step.actual_improvement,
-                    state=initial_state
-                )
-            else:
-                # No successful optimization steps
-                return RLNCUFeedback(
-                    new_messages=[
-                        {"role": "assistant", "content": response},
-                        {"role": "user", "content": "No successful optimization steps completed. Please try a different approach."}
-                    ],
-                    success=False,
-                    metric=cycles,
-                    ncu_log=ncu_log,
-                    annotated_ncu=annotated_ncu,
-                    state=initial_state
-                )
-                
-        except FeedbackError as e:
-            logger.error(f"Error in RL optimization: {e}")
-            return Feedback(
+
+            best_file = self.folder / f"best_task_{task_id}.cu"
+            best_file.write_text(best_step.code)
+
+            return RLNCUFeedback(
                 new_messages=[
                     {"role": "assistant", "content": response},
-                    {"role": "user", "content": f"Optimization failed: {str(e)}. Please fix the issues and try again."}
+                    {"role": "user", "content": feedback_msg},
                 ],
-                success=False,
-                feedback=e.feedback if hasattr(e, 'feedback') else str(e)
+                success=True,
+                filename=str(best_file),
+                contents=best_step.code,
+                metric=best_step.cycles,
+                ncu_log=ncu_log,
+                annotated_ncu=annotated_ncu,
+                optimization_technique=best_step.action,
+                predicted_improvement=best_step.predicted_improvement,
+                actual_improvement=best_step.actual_improvement,
+                state=initial_state,
             )
+
+        return RLNCUFeedback(
+            new_messages=[
+                {"role": "assistant", "content": response},
+                {
+                    "role": "user",
+                    "content": "No successful optimization steps completed. Please try a different approach.",
+                },
+            ],
+            success=False,
+            metric=initial_metric,
+            ncu_log=ncu_log,
+            annotated_ncu=annotated_ncu,
+            state=initial_state,
+        )
 
     # _try_add_default_optimizations lifted to RLAgentBase in Phase 4f.
 
