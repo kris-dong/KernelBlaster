@@ -16,6 +16,7 @@ import argparse
 import asyncio
 from contextlib import asynccontextmanager
 import os
+import time
 import psutil
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form
 import logging
@@ -28,6 +29,7 @@ import stat
 from typing import Optional
 
 from .server_logging import get_log_config
+from .utils.queue_server import worker_pool
 from .utils.subprocess import run_subprocess_shell
 
 env = None
@@ -101,10 +103,16 @@ async def lifespan(app):
 
     # Check for pre-existing GPU processes
     await check_gpu_processes()
-    # Start worker tasks on startup (one per GPU id)
-    for wid in range(len(GPU_IDS)):
-        _ = asyncio.create_task(gpu_worker(wid))
-    yield
+    # Start worker tasks on startup (one per GPU id). ``worker_pool``
+    # cancels the workers on lifespan exit — no more leaked coroutines.
+    async with worker_pool(
+        num_workers=len(GPU_IDS),
+        queue=QUEUE,
+        handler=_gpu_binary_job,
+        domain_error=GpuCommandError,
+        logger=logger,
+    ):
+        yield
 
 
 APP = FastAPI(lifespan=lifespan)
@@ -346,108 +354,71 @@ def cleanup_temp_file(binary_path: str):
         logger.warning(f"Failed to cleanup temporary file: {e}")
 
 
-async def gpu_worker(worker_id: int) -> GpuCommandResult:
-    """Process GPU execution requests from the queue"""
-    while True:
-        queue_item = await QUEUE.get()
-        completion_future = queue_item[-1]  # Future is always the last item
+async def _gpu_binary_job(worker_id: int, job_args: tuple) -> GpuCommandResult:
+    """Handler for one ``/gpu/binary`` request.
 
-        try:
-            if len(queue_item) == 7:
-                # Binary execution with prefix: (binary_path, args, env_vars, prefix_command, n_runs, timeout, completion_future)
-                binary_path, args, env_vars, prefix_command, n_runs, timeout, _ = queue_item
-            elif len(queue_item) == 6:
-                # Backward compatibility: (binary_path, args, env_vars, prefix_command, n_runs, completion_future)
-                binary_path, args, env_vars, prefix_command, n_runs, _ = queue_item
-                timeout = 3600  # Default timeout
-            
-            # Common execution code for both 6-item and 7-item formats
-            if len(queue_item) in (6, 7):
-                # Pin this worker to a specific GPU by injecting CUDA_VISIBLE_DEVICES.
-                # If the caller explicitly passed CUDA_VISIBLE_DEVICES, respect it.
-                eff_env_vars = dict(env_vars or {})
-                if "CUDA_VISIBLE_DEVICES" not in eff_env_vars:
-                    gpu_id = str(worker_id)
-                    if GPU_IDS and worker_id < len(GPU_IDS):
-                        gpu_id = str(GPU_IDS[worker_id])
-                    eff_env_vars["CUDA_VISIBLE_DEVICES"] = gpu_id
-                # Ensure TF32 override is stable unless caller requested otherwise.
-                eff_env_vars.setdefault("NVIDIA_TF32_OVERRIDE", "0")
-                gpu_visible = eff_env_vars.get("CUDA_VISIBLE_DEVICES", "<unset>")
-                logger.info(
-                    f"[Worker {worker_id}]: Assigned GPU CUDA_VISIBLE_DEVICES={gpu_visible} for binary {binary_path}"
-                )
-                logger.info(
-                    f"[Worker {worker_id}]: Executing binary {binary_path} with args: {args}, env_vars: {eff_env_vars}, prefix: {prefix_command}, n_runs: {n_runs}, timeout: {timeout}"
-                )
+    Called by :func:`worker_pool` for each item dequeued from
+    ``QUEUE``. The handler catches ``GpuCommandError`` internally and
+    returns a ``GpuCommandResult(success=False)`` on failure so the
+    HTTP client sees a valid JSON body — matches the pre-Phase-B
+    behaviour where the endpoint always returned 200 with an inline
+    success flag.
 
-                stdout_list, stderr_list = await exec_binary(
-                    binary_path,
-                    args,
-                    timeout=timeout,
-                    env_vars=eff_env_vars,
-                    prefix_command=prefix_command,
-                    n_runs=n_runs,
-                )
-                logger.info(
-                    f"[Worker {worker_id}]: Successfully executed binary on CUDA_VISIBLE_DEVICES={gpu_visible}: {f'{prefix_command} ' if prefix_command else ''}{binary_path} with {n_runs} runs"
-                )
+    ``job_args`` shape (6-tuple):
+    ``(binary_path, args, env_vars, prefix_command, n_runs, timeout)``
+    """
+    binary_path, cmd_args, env_vars, prefix_command, n_runs, timeout = job_args
 
-                # Clean up temporary binary file
-                cleanup_temp_file(binary_path)
+    # Pin this worker to a specific GPU by injecting CUDA_VISIBLE_DEVICES.
+    # If the caller explicitly passed CUDA_VISIBLE_DEVICES, respect it.
+    eff_env_vars = dict(env_vars or {})
+    if "CUDA_VISIBLE_DEVICES" not in eff_env_vars:
+        gpu_id = str(worker_id)
+        if GPU_IDS and worker_id < len(GPU_IDS):
+            gpu_id = str(GPU_IDS[worker_id])
+        eff_env_vars["CUDA_VISIBLE_DEVICES"] = gpu_id
+    # Ensure TF32 override is stable unless caller requested otherwise.
+    eff_env_vars.setdefault("NVIDIA_TF32_OVERRIDE", "0")
+    gpu_visible = eff_env_vars.get("CUDA_VISIBLE_DEVICES", "<unset>")
 
-            elif len(queue_item) == 2:
-                # CLI command execution: (command, completion_future)
-                command, _ = queue_item
-                logger.info(f"[Worker {worker_id}]: Executing CLI command: {command}")
-                stdout_list, stderr_list = await exec_command(command)
-                logger.info(
-                    f"[Worker {worker_id}]: Successfully executed CLI command: {command}"
-                )
+    logger.info(
+        f"[Worker {worker_id}]: Assigned GPU CUDA_VISIBLE_DEVICES="
+        f"{gpu_visible} for binary {binary_path}"
+    )
+    logger.info(
+        f"[Worker {worker_id}]: Executing binary {binary_path} with "
+        f"args: {cmd_args}, env_vars: {eff_env_vars}, "
+        f"prefix: {prefix_command}, n_runs: {n_runs}, timeout: {timeout}"
+    )
 
-            else:
-                raise ValueError(f"Invalid queue item format: {len(queue_item)} items")
-
-            completion_future.set_result(
-                GpuCommandResult(success=True, stdout=stdout_list, stderr=stderr_list)
-            )
-
-        except GpuCommandError as e:
-            if len(queue_item) == 6:
-                binary_path = queue_item[0]
-                # Best-effort GPU attribution for failures too
-                gpu_visible = None
-                try:
-                    gpu_visible = (env_vars or {}).get("CUDA_VISIBLE_DEVICES")
-                except Exception:
-                    gpu_visible = None
-                logger.error(
-                    f"[Worker {worker_id}]: Error executing binary {binary_path}"
-                    f"{' on CUDA_VISIBLE_DEVICES=' + str(gpu_visible) if gpu_visible is not None else ''}: {e.error_message}"
-                )
-                # Clean up on error too
-                cleanup_temp_file(binary_path)
-            else:
-                command = queue_item[0]
-                logger.error(
-                    f"[Worker {worker_id}]: Error executing CLI command {command}: {e.error_message}"
-                )
-
-            completion_future.set_result(
-                GpuCommandResult(success=False, message=e.error_message)
-            )
-        except Exception as e:
-            logger.error(f"[Worker {worker_id}]: Unexpected error: {str(e)}")
-
-            # Clean up binary file if this was a binary execution
-            if len(queue_item) >= 4:
-                cleanup_temp_file(queue_item[0])
-
-            completion_future.set_result(
-                GpuCommandResult(success=False, message=f"Internal error: {str(e)}")
-            )
-        finally:
-            QUEUE.task_done()
+    try:
+        stdout_list, stderr_list = await exec_binary(
+            binary_path,
+            cmd_args,
+            timeout=timeout,
+            env_vars=eff_env_vars,
+            prefix_command=prefix_command,
+            n_runs=n_runs,
+        )
+        logger.info(
+            f"[Worker {worker_id}]: Successfully executed binary on "
+            f"CUDA_VISIBLE_DEVICES={gpu_visible}: "
+            f"{f'{prefix_command} ' if prefix_command else ''}{binary_path} "
+            f"with {n_runs} runs"
+        )
+        return GpuCommandResult(success=True, stdout=stdout_list, stderr=stderr_list)
+    except GpuCommandError as e:
+        logger.error(
+            f"[Worker {worker_id}]: Error executing binary {binary_path} "
+            f"on CUDA_VISIBLE_DEVICES={gpu_visible}: {e.error_message}"
+        )
+        return GpuCommandResult(success=False, message=e.error_message)
+    except Exception as e:
+        logger.error(f"[Worker {worker_id}]: Unexpected error: {e}")
+        return GpuCommandResult(success=False, message=f"Internal error: {e}")
+    finally:
+        # Always clean up the temp binary — success or failure.
+        cleanup_temp_file(binary_path)
 
 
 @APP.get("/health")
@@ -509,7 +480,9 @@ async def execute_gpu_binary(
         # Create a future to track completion
         completion_future = asyncio.Future()
 
-        # Add to execution queue (7-item tuple format: binary_path, args, env_vars, prefix_command, n_runs, timeout, completion_future)
+        # Queue-item shape matches ``queue_worker_loop``'s convention:
+        # ``(*job_args, completion_future, enqueue_ts)``. ``_gpu_binary_job``
+        # unpacks the 6-tuple job_args.
         await QUEUE.put(
             (
                 binary_path,
@@ -519,6 +492,7 @@ async def execute_gpu_binary(
                 n_runs,
                 timeout,
                 completion_future,
+                time.time(),
             )
         )
 
@@ -534,24 +508,9 @@ async def execute_gpu_binary(
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
-# Keep the old endpoint for backward compatibility (deprecated)
-@APP.get("/gpu/cmd", response_model=GpuCommandResult)
-async def process_command_request(command: str):
-    """Execute a CLI command on the GPU server"""
-    logger.info(f"/gpu/cmd - Command: {command}, Queue backlog: {QUEUE.qsize()}")
-
-    # Create a future to track completion
-    completion_future = asyncio.Future()
-
-    # Add CLI command to the queue (2-item tuple format)
-    await QUEUE.put((command, completion_future))
-
-    try:
-        await completion_future
-        return completion_future.result()
-    except asyncio.CancelledError:
-        logger.info(f"Request {command} was cancelled")
-        raise HTTPException(status_code=500, detail="Request was cancelled")
+# /gpu/cmd endpoint deleted in Phase B — zero in-tree callers per
+# ``notes/server_unification_audit.md``. The unified exec server keeps
+# only /gpu/binary.
 
 
 def run_server(host: str, port: int, log_filepath: str = None):

@@ -8,6 +8,7 @@ import argparse
 import asyncio
 from contextlib import asynccontextmanager
 import os
+import time
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form
 import logging
 from pydantic import BaseModel
@@ -19,6 +20,7 @@ import uuid
 from typing import Optional
 
 from .server_logging import get_log_config
+from .utils.queue_server import worker_pool
 from .utils.subprocess import run_subprocess_shell
 
 logger = logging.getLogger("uvicorn")
@@ -164,51 +166,42 @@ async def upload_and_exec_binary(
             )
 
 
-async def gpu_worker(worker_id: int):
-    """Process Adreno GPU execution requests from the queue."""
-    while True:
-        queue_item = await QUEUE.get()
-        completion_future = queue_item[-1]
+async def _adreno_binary_job(worker_id: int, job_args: tuple) -> AdrenoExecutionResult:
+    """Handler for one ``/gpu/binary`` request against the Adreno board.
 
-        try:
-            if len(queue_item) == 8:
-                binary_data, filename, kernel_files, args_str, n_runs, profile, timeout, _ = queue_item
-            else:
-                raise ValueError(f"Invalid queue item format: {len(queue_item)} items")
+    Called by :func:`worker_pool`. ``job_args`` shape (7-tuple):
+    ``(binary_data, filename, kernel_files, args_str, n_runs, profile, timeout)``
 
-            logger.info(
-                f"[Worker {worker_id}]: Executing on Adreno board {_BOARD_HOST} "
-                f"(file={filename}, n_runs={n_runs}, profile={profile})"
-            )
+    Same "catch inside and return AdrenoExecutionResult(success=False)"
+    contract as the CUDA gpu server — the HTTP client destructures
+    ``result["success"]`` from a 200-OK JSON body.
+    """
+    binary_data, filename, kernel_files, args_str, n_runs, profile, timeout = job_args
 
-            stdout, stderr = await upload_and_exec_binary(
-                binary_data=binary_data,
-                filename=filename,
-                board_host=_BOARD_HOST,
-                kernel_files=kernel_files,
-                args_str=args_str,
-                timeout=timeout,
-                n_runs=n_runs,
-                profile=profile,
-            )
+    logger.info(
+        f"[Worker {worker_id}]: Executing on Adreno board {_BOARD_HOST} "
+        f"(file={filename}, n_runs={n_runs}, profile={profile})"
+    )
 
-            logger.info(f"[Worker {worker_id}]: Execution successful")
-            completion_future.set_result(
-                AdrenoExecutionResult(success=True, stdout=stdout, stderr=stderr)
-            )
-
-        except AdrenoExecutionError as e:
-            logger.error(f"[Worker {worker_id}]: Execution error: {e.error_message}")
-            completion_future.set_result(
-                AdrenoExecutionResult(success=False, message=e.error_message)
-            )
-        except Exception as e:
-            logger.error(f"[Worker {worker_id}]: Unexpected error: {str(e)}")
-            completion_future.set_result(
-                AdrenoExecutionResult(success=False, message=f"Internal error: {str(e)}")
-            )
-        finally:
-            QUEUE.task_done()
+    try:
+        stdout, stderr = await upload_and_exec_binary(
+            binary_data=binary_data,
+            filename=filename,
+            board_host=_BOARD_HOST,
+            kernel_files=kernel_files,
+            args_str=args_str,
+            timeout=timeout,
+            n_runs=n_runs,
+            profile=profile,
+        )
+        logger.info(f"[Worker {worker_id}]: Execution successful")
+        return AdrenoExecutionResult(success=True, stdout=stdout, stderr=stderr)
+    except AdrenoExecutionError as e:
+        logger.error(f"[Worker {worker_id}]: Execution error: {e.error_message}")
+        return AdrenoExecutionResult(success=False, message=e.error_message)
+    except Exception as e:
+        logger.error(f"[Worker {worker_id}]: Unexpected error: {e}")
+        return AdrenoExecutionResult(success=False, message=f"Internal error: {e}")
 
 
 @asynccontextmanager
@@ -254,9 +247,14 @@ async def lifespan(app):
             f"Pre-flight cleanup failed (continuing anyway): {e}"
         )
 
-    for wid in range(args.num_workers):
-        asyncio.create_task(gpu_worker(wid))
-    yield
+    async with worker_pool(
+        num_workers=args.num_workers,
+        queue=QUEUE,
+        handler=_adreno_binary_job,
+        domain_error=AdrenoExecutionError,
+        logger=logger,
+    ):
+        yield
 
 
 APP = FastAPI(lifespan=lifespan)
@@ -297,6 +295,8 @@ async def execute_gpu_binary(
                 parsed_kernel_files = [kernel_files]
 
         completion_future = asyncio.Future()
+        # Queue-item shape matches ``queue_worker_loop`` convention:
+        # ``(*job_args, completion_future, enqueue_ts)``.
         await QUEUE.put((
             binary_data,
             binary.filename or "adreno_executable",
@@ -306,6 +306,7 @@ async def execute_gpu_binary(
             profile or False,
             timeout,
             completion_future,
+            time.time(),
         ))
 
         await completion_future
