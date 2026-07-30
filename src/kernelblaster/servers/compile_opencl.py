@@ -23,7 +23,7 @@ import uvicorn
 import time
 
 from .server_logging import get_log_config
-from .utils.queue_server import queue_worker_loop
+from .utils.queue_server import queue_worker_loop, worker_pool
 from .utils.subprocess import run_subprocess_shell
 
 logger = logging.getLogger("uvicorn")
@@ -255,25 +255,20 @@ async def lifespan(app):
         f"Started OpenCL compilation server on {args.host}:{args.port} "
         f"with {args.num_workers} workers, board={args.board_host}"
     )
-    tasks = [
-        asyncio.create_task(
-            queue_worker_loop(
-                worker_id=wid,
-                queue=QUEUE,
-                handler=_opencl_compile_job,
-                domain_error=OpenCLCompilationError,
-                logger=logger,
-            )
-        )
-        for wid in range(args.num_workers)
-    ]
-    try:
-        yield
-    finally:
-        for t in tasks:
-            t.cancel()
+
+    def _cleanup_env_dir():
         if ENV_DIR.exists():
             shutil.rmtree(ENV_DIR, ignore_errors=True)
+
+    async with worker_pool(
+        num_workers=args.num_workers,
+        queue=QUEUE,
+        handler=_opencl_compile_job,
+        domain_error=OpenCLCompilationError,
+        logger=logger,
+        on_shutdown=_cleanup_env_dir,
+    ):
+        yield
 
 
 APP = FastAPI(lifespan=lifespan)

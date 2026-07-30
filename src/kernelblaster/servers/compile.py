@@ -31,7 +31,7 @@ import time
 from torch.utils import cmake_prefix_path
 
 from .server_logging import get_log_config
-from .utils.queue_server import queue_worker_loop
+from .utils.queue_server import queue_worker_loop, worker_pool
 from .utils.subprocess import run_subprocess_shell
 from ..agents.utils import find_kernel_launch_header
 
@@ -120,24 +120,15 @@ async def lifespan(app):
     logger.info(
         f"Started compilation server on {args.host}:{args.port} with {args.num_workers} workers"
     )
-    tasks = [
-        asyncio.create_task(
-            queue_worker_loop(
-                worker_id=wid,
-                queue=QUEUE,
-                handler=_cuda_compile_job,
-                domain_error=CompilationError,
-                logger=logger,
-            )
-        )
-        for wid in range(args.num_workers)
-    ]
-    try:
+    async with worker_pool(
+        num_workers=args.num_workers,
+        queue=QUEUE,
+        handler=_cuda_compile_job,
+        domain_error=CompilationError,
+        logger=logger,
+        on_shutdown=free_cuda_envs,
+    ):
         yield
-    finally:
-        for t in tasks:
-            t.cancel()
-        free_cuda_envs()
 
 
 APP = FastAPI(lifespan=lifespan)

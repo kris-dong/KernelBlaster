@@ -30,11 +30,63 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Awaitable, Callable
+from contextlib import asynccontextmanager
+from typing import Any, Awaitable, Callable, Optional
 
 
 JobHandler = Callable[[int, tuple], Awaitable[Any]]
 """Async ``(worker_id, job_args) -> result`` callable. ``result`` is set on the future."""
+
+
+@asynccontextmanager
+async def worker_pool(
+    *,
+    num_workers: int,
+    queue: asyncio.Queue,
+    handler: JobHandler,
+    domain_error: type[Exception],
+    logger: logging.Logger | None = None,
+    on_shutdown: Optional[Callable[[], Any]] = None,
+):
+    """Async context manager that spawns N workers around
+    :func:`queue_worker_loop` and cancels them on exit.
+
+    Replaces the ``create_task``+``cancel``-in-``finally`` boilerplate
+    that each compile/exec server used to hand-roll. Optional
+    ``on_shutdown`` fires after workers are cancelled — CUDA uses this
+    to release GPU envs; OpenCL uses it to rm the compile-scratch dir.
+
+    Both compile servers (compile.py, compile_opencl.py) and both exec
+    servers (gpu.py, gpu_adreno.py) now use this helper. Step 5
+    tactical cleanup for the eventual endpoint unification into a
+    single compile server + single exec server (each parameterised
+    on a backend strategy).
+    """
+    tasks = [
+        asyncio.create_task(
+            queue_worker_loop(
+                worker_id=wid,
+                queue=queue,
+                handler=handler,
+                domain_error=domain_error,
+                logger=logger,
+            )
+        )
+        for wid in range(num_workers)
+    ]
+    try:
+        yield tasks
+    finally:
+        for t in tasks:
+            t.cancel()
+        if on_shutdown is not None:
+            try:
+                result = on_shutdown()
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as e:
+                log = logger or logging.getLogger("uvicorn")
+                log.warning(f"worker_pool on_shutdown raised: {e}")
 
 
 async def queue_worker_loop(
