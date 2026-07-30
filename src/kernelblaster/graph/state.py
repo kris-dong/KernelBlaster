@@ -12,14 +12,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Optional, TypedDict, Any, Dict
+from typing import Optional, TypedDict, Any, Dict, TYPE_CHECKING
 from pathlib import Path
 import json
 
 from ..config import GPUType
 
+if TYPE_CHECKING:
+    from data.sources import Problem
 
-class GraphState(TypedDict):
+
+class GraphState(TypedDict, total=False):
+    """Graph state.
+
+    ``total=False``: all keys are optional (matches how the graph nodes
+    actually consume state — most reads go through ``state.get(...)``).
+    That lets ``problem`` and other Phase-5+ additions land without
+    breaking callers that don't populate every field.
+    """
     model: str  # model to use for generation
     gpu: GPUType  # GPU type to use for generation
 
@@ -33,7 +43,7 @@ class GraphState(TypedDict):
     user_message: str  # user message
     folder: Path  # folder to save the generated code
     logger: Any  # logger for the problem
-    
+
     # RL optimization parameters
     rl_iterations: int  # number of RL iterations to run
     rl_rollout_steps: int  # number of rollout steps per RL iteration
@@ -49,6 +59,14 @@ class GraphState(TypedDict):
         Path  # Path to the optimized CUDA code based on NCU profiling and benchmarking
     )
     rl_ncu_cuda_fp: Path  # Path to the RL-optimized CUDA code
+
+    # Item 2, Phase 5: the source-native problem descriptor. When set, the
+    # RL graph node reads curated artifact paths from ``problem.curated_artifacts``
+    # instead of re-deriving them from ``folder.parent.name`` + the backend
+    # ``RLNodeConfig``'s tier resolver. Populated by callers migrated to
+    # ``data.sources.get_source()``; legacy callers keep working via the
+    # unchanged fallback path.
+    problem: "Problem"
 
 
 def save_state_to_json(state: GraphState, output_path: str) -> None:
