@@ -287,7 +287,18 @@ class SpikeExecStrategy(ExecStrategy):
             fused_elf = await self._link_batch_elf(
                 worker_id=worker_id, td=Path(td), jobs=jobs,
             )
-            model_names = [_kernel_id_for(j) for j in jobs]
+            # Same-problem batching (harness_shared_input): jobs carry
+            # KB_MULTI_MID; emit ``<mid>@<tag>`` model names to match
+            # the harness's marker format. Cross-problem path falls
+            # back to plain per-job kernel ids.
+            tags = [_kernel_id_for(j) for j in jobs]
+            mid = None
+            if jobs and jobs[0].env_vars:
+                mid = jobs[0].env_vars.get("KB_MULTI_MID")
+            if mid:
+                model_names = [f"{mid}@{t}" for t in tags]
+            else:
+                model_names = tags
             io_paths = self._collect_io_paths(jobs, model_names)
 
             # Longest per-job timeout dominates.
@@ -450,20 +461,34 @@ class SpikeExecStrategy(ExecStrategy):
         assert self._multi_link_script is not None
         model_names = [_kernel_id_for(j) for j in jobs]
 
-        # Drop each job's binary into a per-model staging dir. The link
-        # script decides how to consume them (west build with --models,
-        # generate_multi_main.py, etc.).
+        # Drop each job's kernel source (or ELF, for legacy per-ELF
+        # fuse scripts) into a per-model staging dir. New same-problem
+        # batching (kernel_files carries a .c) writes kernels.c
+        # directly for harness_shared_input's west build to consume;
+        # older ELF-fuse scripts still work via the binary_data
+        # fallback.
         manifest_lines: list[str] = []
         for j, name in zip(jobs, model_names):
             staged = td / name
             staged.mkdir()
-            (staged / "prebuilt.elf").write_bytes(j.binary_data)
+            src_c = self._pick_source_c(j.kernel_files) if hasattr(self, "_pick_source_c") else None
+            if src_c is not None and src_c.exists():
+                (staged / "kernels.c").write_bytes(src_c.read_bytes())
+            else:
+                (staged / "prebuilt.elf").write_bytes(j.binary_data)
             manifest_lines.append(f"{name} {staged}")
 
         fused_out = td / "fused.elf"
         env = os.environ.copy()
         env["FUSED_OUT"] = str(fused_out)
         env["FUSE_WORKER_ID"] = str(worker_id)
+        # Propagate the shared-input harness env vars from the FIRST
+        # job (all jobs in a same-problem batch share these). Same
+        # convention as firesim_exec.
+        if jobs and jobs[0].env_vars:
+            for k, v in jobs[0].env_vars.items():
+                if k.startswith("KB_MULTI_"):
+                    env[k] = str(v)
 
         proc = await asyncio.create_subprocess_exec(
             str(self._multi_link_script),
@@ -576,6 +601,20 @@ class SpikeExecStrategy(ExecStrategy):
             return None
         for f in kernel_files:
             if f.endswith(".npz"):
+                p = Path(f)
+                if p.exists():
+                    return p
+        return None
+
+    def _pick_source_c(
+        self, kernel_files: Optional[list[str]],
+    ) -> Optional[Path]:
+        """First ``.c`` in ``kernel_files`` — the LLM's kernel source
+        for same-problem batching. Absent = legacy per-ELF batching."""
+        if not kernel_files:
+            return None
+        for f in kernel_files:
+            if f.endswith(".c"):
                 p = Path(f)
                 if p.exists():
                     return p

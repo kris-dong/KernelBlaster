@@ -1015,6 +1015,51 @@ async def compile_and_run_riscv_batched(
     # rollouts by construction.
     kernel_id = Path(compiled_path).stem
 
+    # Same-problem batching: derive base stage + model id from the
+    # io.npz path (canonical layout ``<stage>/<mid>/<quant>/generated/
+    # io.npz``). Passed through the batch client so the strategy's
+    # fuse script can invoke harness_shared_input with the shared
+    # MODEL_DIR. Skipped when io_npz_path is absent — degrades
+    # gracefully to per-ELF batching.
+    base_stage_dir: Optional[Path] = None
+    mid: Optional[str] = None
+    target: str = "rvv"
+    if io_npz_path is not None:
+        _io_abs = io_npz_path.resolve()
+        # io.npz lives at <stage>/generated/io.npz, so:
+        #   parent = <stage>/generated
+        #   parent.parent = <stage> = kb_<name>/<quant>
+        #   parent.parent.parent.name = kb_<name>
+        base_stage_dir = _io_abs.parent.parent  # <stage>/generated/rvv
+        # Actually we want the per-target generated dir. Try to infer
+        # target from the kernel source path (KernelBlaster writes
+        # RL candidates alongside `<stage>/generated/<target>/`).
+        try:
+            # kernel_filepath is the LLM's out .c, not under stage.
+            # target comes from GPU.zephyr_board via the compile server
+            # dispatch — fall back to 'rvv' which is the default target
+            # for the current RISC-V flows.
+            target = gpu.zephyr_board.split("/")[0].replace(
+                "_riscv64", ""
+            ).replace("spike_", "").replace("chipyard_", "")
+            # Normalise: "" / unexpected → 'rvv'
+            if not target or target in ("chipyard", "spike"):
+                target = "rvv"
+        except Exception:
+            target = "rvv"
+        base_stage_dir = _io_abs.parent / target  # <stage>/generated/<target>
+        # mid = the kb_<name> segment two levels up from <stage>/generated
+        try:
+            mid = _io_abs.parent.parent.parent.name  # kb_<name>
+        except Exception:
+            mid = None
+
+    board: Optional[str] = None
+    try:
+        board = gpu.zephyr_board
+    except Exception:
+        board = None
+
     timer.start("kernel_executions")
     result = await batch_client.submit_riscv(
         binary_path=Path(compiled_path),
@@ -1023,6 +1068,11 @@ async def compile_and_run_riscv_batched(
         spike_args_str=spike_args_str,
         kernel_id=kernel_id,
         n_runs=num_runs,
+        source_c_path=kernel_filepath,
+        base_stage_dir=base_stage_dir,
+        mid=mid,
+        target=target,
+        board=board,
     )
     logger.info(
         f"RISC-V batched execution completed in "

@@ -368,7 +368,21 @@ class FireSimExecStrategy(ExecStrategy):
             fused_elf = await self._link_batch_elf(
                 worker_id=worker_id, td=Path(td), jobs=jobs,
             )
-            model_names = [_kernel_id_for(j) for j in jobs]
+            # Model names sent to firesim_runner. When same-problem
+            # batching is active (jobs carry KB_MULTI_MID env var),
+            # harness_shared_input emits per-variant markers under
+            # ``<mid>@<tag>`` — construct the model list to match so
+            # the runner's ``--models`` parses cleanly. Otherwise fall
+            # back to the plain kernel-id-per-job shape used by the
+            # cross-problem path.
+            tags = [_kernel_id_for(j) for j in jobs]
+            mid = None
+            if jobs and jobs[0].env_vars:
+                mid = jobs[0].env_vars.get("KB_MULTI_MID")
+            if mid:
+                model_names = [f"{mid}@{t}" for t in tags]
+            else:
+                model_names = tags
             io_paths = self._collect_io_paths(jobs, model_names)
 
             # Longest per-job timeout dominates the fused run.
@@ -401,11 +415,22 @@ class FireSimExecStrategy(ExecStrategy):
         td: Path,
         jobs: list[ExecJob],
     ) -> Path:
-        """Invoke ``_multi_link_script`` to fuse N kernel ELFs into
-        one ``fused.elf``. Same protocol as spike's fuser:
+        """Invoke ``_multi_link_script`` (typically
+        ``scripts/riscv/multi_link.sh``) to fuse N kernel drop-ins into
+        one ``fused.elf`` via ``modelblaster/harness_shared_input``.
 
-        * Reads a manifest of ``<model_name> <staged_dir>`` lines
-          from stdin.
+        Protocol:
+
+        * Each ``jobs[i]``'s ``binary_data`` IS the LLM's kernels.c
+          source bytes (not a compiled ELF). We write it as
+          ``<staged_dir>/kernels.c`` for the fuse script.
+        * Manifest lines ``<tag> <staged_dir>`` on stdin — one per job.
+        * Shared-input env vars propagated from job.env_vars:
+          ``KB_MULTI_MODEL_DIR`` (base per-problem generated dir),
+          ``KB_MULTI_TARGET`` (backend), ``KB_MULTI_MID`` (mangled
+          model name — used later for the ``--models <mid>@<tag>``
+          spike/firesim_runner call), ``KB_MULTI_BOARD`` (Zephyr
+          board id).
         * Writes fused ELF to ``$FUSED_OUT``.
         * Non-zero rc + reloc marker in stderr →
           :class:`BatchTooLargeError`.
@@ -417,17 +442,31 @@ class FireSimExecStrategy(ExecStrategy):
         for j, name in zip(jobs, model_names):
             staged = td / name
             staged.mkdir()
-            (staged / "prebuilt.elf").write_bytes(j.binary_data)
+            # Prefer the source .c from kernel_files (new same-problem
+            # batching path) so the fuse script can build variants
+            # against the shared base stage. Falls back to writing the
+            # binary_data as-is when no .c is provided (legacy per-ELF
+            # path — kept working for spike_exec parity).
+            src_c = self._pick_source_c(j.kernel_files)
+            if src_c is not None and src_c.exists():
+                (staged / "kernels.c").write_bytes(src_c.read_bytes())
+            else:
+                (staged / "prebuilt.elf").write_bytes(j.binary_data)
             manifest_lines.append(f"{name} {staged}")
 
         fused_out = td / "fused.elf"
         env = os.environ.copy()
         env["FUSED_OUT"] = str(fused_out)
         env["FUSE_WORKER_ID"] = str(worker_id)
-        # firesim wants a chipyard_riscv64 board; spike wants
-        # spike_riscv64. Advertise which so the shared script can
-        # branch.
         env["FUSE_TARGET"] = "firesim"
+        # Propagate the shared-input harness env vars from the FIRST
+        # job (all jobs in a batch share a base problem). The fuse
+        # script keys on these to invoke harness_shared_input's
+        # west build with the right MODEL_DIR + backend + board.
+        if jobs and jobs[0].env_vars:
+            for k, v in jobs[0].env_vars.items():
+                if k.startswith("KB_MULTI_"):
+                    env[k] = str(v)
 
         proc = await asyncio.create_subprocess_exec(
             str(self._multi_link_script),
@@ -625,6 +664,19 @@ class FireSimExecStrategy(ExecStrategy):
             return None
         for kf in kernel_files:
             if kf.endswith(".npz") and Path(kf).exists():
+                return Path(kf)
+        return None
+
+    def _pick_source_c(
+        self, kernel_files: Optional[list[str]]
+    ) -> Optional[Path]:
+        """The first ``.c`` in ``kernel_files`` is the LLM-emitted
+        kernel source (same-problem batching path). Absent = legacy
+        per-ELF batching where ``binary_data`` carries a compiled ELF."""
+        if not kernel_files:
+            return None
+        for kf in kernel_files:
+            if kf.endswith(".c") and Path(kf).exists():
                 return Path(kf)
         return None
 

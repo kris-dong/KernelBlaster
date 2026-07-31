@@ -90,21 +90,57 @@ class ExecBatchClient:
         spike_args_str: str,
         kernel_id: str,
         n_runs: int = 1,
+        source_c_path: Optional[Path] = None,
+        base_stage_dir: Optional[Path] = None,
+        mid: Optional[str] = None,
+        target: str = "rvv",
+        board: Optional[str] = None,
     ) -> BatchExecJobResult:
         """RISC-V convenience wrapper: builds the :class:`BatchExecJob`
         with the ``kernel_files=[io.npz]`` + ``args=<spike-comma-list>``
-        shape the spike/firesim strategies expect."""
-        kernel_files = (
-            [str(io_npz_path.resolve())] if io_npz_path is not None else None
-        )
+        shape the spike/firesim strategies expect.
+
+        Same-problem batching kwargs (opt-in): ``source_c_path`` +
+        ``base_stage_dir`` + ``mid``. When set, the strategy's fusion
+        path (harness_shared_input via multi_link.sh) uses the source
+        .c directly (bypassing the per-candidate ELF that was only a
+        early-error-check) and stages against the shared model dir.
+        Batches of >1 same-problem candidates fuse into one Zephyr
+        boot per FireSim runworkload.
+        """
+        # kernel_files carries the io.npz for verify AND (opt-in) the
+        # source .c so the fusion path can read the LLM's kernel without
+        # re-parsing the compiled ELF's debug info. Strategy searches
+        # kernel_files for `.npz` and `.c` respectively.
+        kernel_files: list[str] = []
+        if io_npz_path is not None:
+            kernel_files.append(str(io_npz_path.resolve()))
+        if source_c_path is not None:
+            kernel_files.append(str(source_c_path.resolve()))
+
+        # env_vars propagates the shared-input harness config to the
+        # strategy's _link_batch_elf → multi_link.sh chain. All jobs
+        # in a same-problem batch share these values; the fuse script
+        # reads them from its subprocess env.
+        env_vars: Optional[dict] = None
+        if base_stage_dir is not None or mid is not None:
+            env_vars = {}
+            if base_stage_dir is not None:
+                env_vars["KB_MULTI_MODEL_DIR"] = str(base_stage_dir.resolve())
+            if mid is not None:
+                env_vars["KB_MULTI_MID"] = mid
+            env_vars["KB_MULTI_TARGET"] = target
+            if board is not None:
+                env_vars["KB_MULTI_BOARD"] = board
+
         job = BatchExecJob(
             binary_path=binary_path,
             args=spike_args_str,
-            env_vars=None,
+            env_vars=env_vars,
             prefix_command=None,
             n_runs=n_runs,
             timeout=timeout,
-            kernel_files=kernel_files,
+            kernel_files=kernel_files or None,
             profile=False,
             job_name=kernel_id,
         )
