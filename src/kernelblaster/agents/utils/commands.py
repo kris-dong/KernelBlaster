@@ -14,6 +14,7 @@
 # limitations under the License.
 import aiohttp
 import asyncio
+from dataclasses import dataclass
 from typing import Optional
 from pathlib import Path
 import os
@@ -31,6 +32,13 @@ __all__ = [
     "compile_opencl",
     "run_adreno_executable",
     "compile_and_run_opencl",
+    "BatchExecJob",
+    "BatchExecJobResult",
+    "run_gpu_batch",
+    # RISC-V + Zephyr + spike/FPGA
+    "compile_riscv",
+    "run_riscv_executable",
+    "compile_and_run_riscv",
 ]
 
 
@@ -196,6 +204,137 @@ async def run_gpu_executable(
         prefix_command=prefix_command,
         n_runs=n_runs,
     )
+
+
+# ---------------------------------------------------------------------------
+# Batched exec — POST /gpu/batch
+#
+# For strategies with ``supports_batching = True`` (e.g. FPGAExecStrategy)
+# this amortises the fixed per-batch cost (bitstream flash, board reset)
+# across ``len(jobs)`` binaries. Strategies without batching support just
+# execute the jobs serially inside the server — the endpoint still works,
+# so callers can opt into batching uniformly regardless of the active
+# target and let the server handle it.
+#
+# Companion to :class:`agents.utils.batch_coordinator.BatchCoordinator`:
+# most callers should never invoke ``run_gpu_batch`` directly and instead
+# route single-request calls through a coordinator that flushes to this
+# helper on size/time trigger. Direct callers are for cases where the
+# workload is naturally batch-shaped (e.g. re-running a suite of N kernels
+# against one bitstream).
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class BatchExecJob:
+    """One entry in a :func:`run_gpu_batch` call.
+
+    Field set mirrors the per-job kwargs the server's ``/gpu/batch``
+    endpoint parses (see :mod:`servers.exec_server`); the binary itself
+    is a filesystem path so the coordinator doesn't hold megabytes of
+    bytes in memory longer than necessary — we read + upload inside the
+    HTTP call.
+    """
+    binary_path: Path
+    args: str = ""
+    env_vars: Optional[dict] = None
+    prefix_command: Optional[str] = None
+    n_runs: int = 1
+    timeout: float = 3600
+    kernel_files: Optional[list[str]] = None
+    profile: bool = False
+    job_name: str = ""     # informational — appears in logs, not sent
+
+
+@dataclass
+class BatchExecJobResult:
+    """Result of one :class:`BatchExecJob`. ``success=False`` means the
+    strategy raised for THIS specific job — the batch as a whole
+    succeeded (otherwise :func:`run_gpu_batch` would raise instead of
+    returning). Callers that treat any per-job failure as fatal should
+    inspect ``success`` and raise :class:`FeedbackError` themselves —
+    same pattern as the single-request path already uses."""
+    stdout: str | list[str]
+    stderr: str | list[str]
+    success: bool
+    message: Optional[str] = None
+
+
+async def run_gpu_batch(
+    jobs: list[BatchExecJob],
+    gpu: GPUType,
+    *,
+    batch_name: str = "batch",
+) -> list[BatchExecJobResult]:
+    """POST ``jobs`` to the exec server's ``/gpu/batch`` endpoint.
+
+    Returns per-job results in the same order as ``jobs``. Individual
+    job failures are inline (``result.success = False``); this function
+    only raises when the whole batch is rejected (transport error, HTTP
+    non-200, response length mismatch, empty input).
+
+    ``batch_name`` is used only for logging.
+    """
+    if not jobs:
+        raise ValueError("run_gpu_batch: empty jobs list")
+
+    url = config.get_gpu_server_url(gpu)
+    max_timeout = max((j.timeout for j in jobs), default=3600)
+    client_timeout = aiohttp.ClientTimeout(total=max_timeout + 3600)
+
+    data = aiohttp.FormData()
+    manifest: list[dict] = []
+    for idx, job in enumerate(jobs):
+        with open(job.binary_path, "rb") as f:
+            binary_bytes = f.read()
+        data.add_field(
+            "binaries",
+            binary_bytes,
+            filename=os.path.basename(str(job.binary_path)),
+            content_type="application/octet-stream",
+        )
+        manifest.append({
+            "args": job.args,
+            "env_vars": job.env_vars,
+            "prefix_command": job.prefix_command,
+            "n_runs": job.n_runs,
+            "timeout": job.timeout,
+            "kernel_files": job.kernel_files,
+            "profile": job.profile,
+        })
+    data.add_field("manifest", json.dumps(manifest))
+
+    logger.info(
+        f"POST /gpu/batch [{batch_name}] - "
+        f"count={len(jobs)} url={url} max_timeout={max_timeout}"
+    )
+
+    async with TCPClient.get_session().post(
+        f"{url}/gpu/batch", data=data, timeout=client_timeout
+    ) as response:
+        if response.status != 200:
+            body = await response.text()
+            raise FeedbackError(
+                f"batch exec [{batch_name}] failed: HTTP {response.status}: {body}"
+            )
+        payload = await response.json()
+
+    raw_results = payload.get("results", [])
+    if len(raw_results) != len(jobs):
+        raise FeedbackError(
+            f"batch exec [{batch_name}] length mismatch: "
+            f"server returned {len(raw_results)} results for {len(jobs)} jobs"
+        )
+
+    return [
+        BatchExecJobResult(
+            stdout=r.get("stdout", ""),
+            stderr=r.get("stderr", ""),
+            success=bool(r.get("success", False)),
+            message=r.get("message"),
+        )
+        for r in raw_results
+    ]
 
 
 async def _compile_cu(
@@ -592,5 +731,226 @@ async def compile_and_run_opencl(
     logger.info(
         f"{len(stdout_list)} OpenCL kernel executions completed in {duration:0.2f} seconds. Success: {success}"
     )
+
+    return stdout_list, stderr_list, compiled_path, success
+
+
+# ---------------------------------------------------------------------------
+# RISC-V + Zephyr + spike/FPGA path
+# ---------------------------------------------------------------------------
+
+
+async def compile_riscv(
+    main_filepath: Path,
+    kernel_filepath: Path,
+    gpu: GPUType,
+    timeout: float = 600,
+    job_name: str = "",
+    *,
+    link_as_lib: bool = False,
+) -> str:
+    """Compile a RISC-V C kernel via the unified compile server.
+
+    Analogous to :func:`compile_opencl`. The compile server dispatches
+    to :class:`ZephyrCompileStrategy` via ``?backend=riscv``. Returns
+    the path to the produced Zephyr ELF (or static lib when
+    ``link_as_lib=True`` for batched-exec fusing).
+
+    ``gpu`` must be a RISC-V FPGA target (``GPUType.RISCV_FPGA_ZEPHYR``);
+    its ``zephyr_board`` selects the Zephyr board (spike_riscv64,
+    chipyard_riscv64/... for FireSim).
+    """
+    riscv_compile_url = os.getenv(
+        "KERNELBLASTER_RISCV_COMPILE_SERVER_URL", "http://localhost:2001"
+    )
+    try:
+        main_abs = main_filepath.resolve()
+        kernel_abs = kernel_filepath.resolve()
+
+        logger.info(f"RISC-V compile request - job_name: {job_name}")
+        logger.info(f"  main: {main_abs}")
+        logger.info(f"  kernel: {kernel_abs}")
+        logger.info(f"  board: {gpu.zephyr_board}")
+        logger.info(f"  link_as_lib: {link_as_lib}")
+
+        client_timeout = aiohttp.ClientTimeout(total=timeout + 3600)
+        async with TCPClient.get_session().get(
+            f"{riscv_compile_url}/compile",
+            params={
+                "backend": "riscv",
+                "job_name": job_name,
+                "main_file": str(main_abs),
+                "source_file": str(kernel_abs),
+                "backend_version": gpu.zephyr_board,
+                "backend_flag": int(link_as_lib),
+            },
+            timeout=client_timeout,
+        ) as response:
+            if response.status != 200:
+                text = await response.text()
+                raise FeedbackError(
+                    f"RISC-V compilation failed for {job_name}: HTTP "
+                    f"{response.status}: {text}"
+                )
+            result = await response.json()
+            if not result.get("success", False):
+                raise FeedbackError(
+                    f"RISC-V compilation failed for {job_name}: "
+                    f"{result.get('message', 'unknown')}"
+                )
+            return result["output_path"]
+    except aiohttp.ClientError as e:
+        raise FeedbackError(f"Error connecting to RISC-V compile server: {e}")
+    except asyncio.TimeoutError:
+        raise FeedbackError(
+            f"Timeout: RISC-V compilation for {job_name} exceeded {timeout}s"
+        )
+
+
+async def run_riscv_executable(
+    executable_path: Path,
+    gpu: GPUType,
+    timeout: float,
+    job_name: str,
+    io_npz_path: Optional[Path] = None,
+    n_runs: int = 1,
+    args_str: str = "",
+) -> tuple[list[str] | str, list[str] | str]:
+    """Execute a Zephyr ELF via the RISC-V exec server (spike strategy).
+
+    ``io_npz_path`` is the modelblaster golden — flows through
+    ``kernel_files`` on the exec endpoint so SpikeExecStrategy can pass
+    it as ``--io`` to spike_runner. Missing io = verify-only mode
+    (spike_runner relies on the in-binary MODELBLASTER_VERIFY marker).
+    ``args_str`` is a comma-list of spike args (e.g.
+    ``"isa=rv64gcv,pmpregions=0"``) forwarded via ``--spike-arg=...``.
+
+    Returns the raw spike output (with MODELBLASTER_WALL_CYCLES and
+    per-op [PROFILE] markers) so :meth:`RiscvZephyrBackend.parse_profile`
+    can pull cycles.
+    """
+    url = config.get_gpu_server_url(gpu)
+    kernel_files = [str(io_npz_path.resolve())] if io_npz_path else None
+    return await _run_gpu_binary(
+        executable_path,
+        url,
+        timeout,
+        job_name,
+        prefix_command=None,
+        n_runs=n_runs,
+    ) if kernel_files is None else await _run_gpu_binary_with_kernel_files(
+        executable_path=executable_path,
+        url=url,
+        timeout=timeout,
+        job_name=job_name,
+        kernel_files=kernel_files,
+        args_str=args_str,
+        n_runs=n_runs,
+    )
+
+
+async def _run_gpu_binary_with_kernel_files(
+    *,
+    executable_path: Path,
+    url: str,
+    timeout: float,
+    job_name: str,
+    kernel_files: list[str],
+    args_str: str,
+    n_runs: int,
+) -> tuple[list[str] | str, list[str] | str]:
+    """Variant of :func:`_run_gpu_binary` that carries ``kernel_files``
+    (used by the RISC-V spike strategy to pass io.npz) and ``args``
+    (comma-list of --spike-arg values). Split out because the CUDA/
+    OpenCL path never uses these fields."""
+    with open(executable_path, "rb") as f:
+        binary_data = f.read()
+    data = aiohttp.FormData()
+    data.add_field(
+        "binary",
+        binary_data,
+        filename=os.path.basename(str(executable_path)),
+        content_type="application/octet-stream",
+    )
+    data.add_field("n_runs", str(n_runs))
+    data.add_field("timeout", str(timeout))
+    if args_str:
+        data.add_field("args", args_str)
+    data.add_field("kernel_files", json.dumps(kernel_files))
+    client_timeout = aiohttp.ClientTimeout(total=timeout + 3600)
+    async with TCPClient.get_session().post(
+        f"{url}/gpu/binary", data=data, timeout=client_timeout,
+    ) as response:
+        if response.status != 200:
+            body = await response.text()
+            raise FeedbackError(
+                f"RISC-V exec {job_name} failed: HTTP {response.status}: {body}"
+            )
+        result = await response.json()
+        if not result.get("success", False):
+            raise FeedbackError(
+                f"RISC-V exec {job_name} failed: "
+                f"{result.get('message', 'unknown')}"
+            )
+        return result.get("stdout", ""), result.get("stderr", "")
+
+
+async def compile_and_run_riscv(
+    main_filepath: Path,
+    kernel_filepath: Path,
+    gpu: GPUType,
+    timer,
+    logger,
+    *,
+    timeout: int = 3600,
+    num_runs: int = 1,
+    io_npz_path: Optional[Path] = None,
+    spike_args_str: str = "",
+    passed_keyword: Optional[str] = None,
+) -> tuple[list[str], list[str], str, bool]:
+    """Compile + run a RISC-V C kernel through the unified servers.
+
+    Mirrors :func:`compile_and_run_opencl`: returns
+    ``(stdout_list, stderr_list, compiled_elf_path, success)``.
+
+    ``success`` follows the same convention as the OpenCL path — True
+    unless ``passed_keyword`` is supplied and missing from a run's
+    output.
+    """
+    job_name = str(kernel_filepath)
+    timer.start("compilation")
+    compiled_path = await compile_riscv(
+        main_filepath, kernel_filepath, gpu, timeout, job_name,
+    )
+    logger.info(
+        f"RISC-V compilation completed in {timer.stop('compilation'):.2f}s"
+    )
+
+    timer.start("kernel_executions")
+    stdout, stderr = await run_riscv_executable(
+        executable_path=Path(compiled_path),
+        gpu=gpu,
+        timeout=timeout,
+        job_name=job_name,
+        io_npz_path=io_npz_path,
+        n_runs=num_runs,
+        args_str=spike_args_str,
+    )
+    logger.info(
+        f"RISC-V execution completed in {timer.stop('kernel_executions'):.2f}s"
+    )
+
+    stdout_list = stdout if isinstance(stdout, list) else [stdout]
+    stderr_list = stderr if isinstance(stderr, list) else [stderr]
+
+    success = True
+    if passed_keyword is not None:
+        for i, s in enumerate(stdout_list):
+            if passed_keyword.lower() not in s.lower():
+                logger.info(
+                    f"Keyword '{passed_keyword}' missing in RISC-V run {i+1}"
+                )
+                success = False
+                break
 
     return stdout_list, stderr_list, compiled_path, success

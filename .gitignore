@@ -24,3 +24,8 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Runtime outputs / secrets / stateful DB mutations
+out/
+set_key.sh
+data/kernelblaster/database_llm_log.txt

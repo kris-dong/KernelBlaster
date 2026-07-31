@@ -37,19 +37,14 @@ Tier 4 (deterministic infra wins):
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import os
-import random
 import re
-import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-
-import math
 
 from .cost_tracker import CostTracker
 from .progress_writer import ProgressWriter
@@ -59,11 +54,12 @@ from .database_optimized import (
     extract_metrics_json,
 )
 from .database import OptimizationEntry, CompositeOptimization
-from .feedback import FeedbackAgent, FeedbackConfig
+from .feedback import FeedbackConfig
 from .opt_ncu_rl import RLNCUFeedback, parse_ncu_metrics
+from .opt_rl_optimized_base import RLOptimizedAgentBase
 from .reprofile_nsys import _parse_nsys_gpu_trace
 import base64
-from .rl_agents import ReplayBuffer, Trajectory, TrajectoryStep
+from .rl_agents import Trajectory, TrajectoryStep
 from .utils import (
     FeedbackError,
     NamedTimer,
@@ -74,298 +70,24 @@ from .utils import (
     run_gpu_executable,
 )
 from .utils.perf_log import perf_span, perf_record
-
-
-# ---------------------------------------------------------------------------
-# Technique → category dispatcher (drives model heterogeneity)
-# ---------------------------------------------------------------------------
-
-# Techniques whose codegen edit is mostly mechanical (vectorize loads, change
-# block size, swap a `__shared__` declaration). These get the cheap codegen
-# model.
-_SIMPLE_TECHNIQUE_PATTERNS = (
-    "coalesc",
-    "vector",
-    "occupancy",
-    "block_size",
-    "register",
-    "constant_cache",
-    "instruction_level_parallelism",
-    "fast_math",
-    "thread_data_mapping",
-    "thread_work_remapping",
-    "vectorized_processing",
-    "simd_operations",
-)
-
-# Techniques that genuinely require structural rewrites (tiling, fusion, tensor
-# cores, async copies). These get the premium codegen model.
-_HARD_TECHNIQUE_PATTERNS = (
-    "shared_memory_tiling",
-    "tensor_core",
-    "wmma",
-    "kernel_fusion",
-    "fused_operations",
-    "register_tiling",
-    "algorithmic",
-    "composite",
-    "hybrid",
-)
-
-
-def categorise_technique(name: str) -> str:
-    """Return ``'simple'``, ``'hard'``, or ``'simple'`` (default) for ``name``."""
-    low = name.lower()
-    for pat in _HARD_TECHNIQUE_PATTERNS:
-        if pat in low:
-            return "hard"
-    for pat in _SIMPLE_TECHNIQUE_PATTERNS:
-        if pat in low:
-            return "simple"
-    return "simple"
-
+from ..backends import CUDABackend, ProfileResult
+from .rl import ProfileCacheEntry
 
 # ---------------------------------------------------------------------------
-# Adaptive token budget — bumps BEDROCK_MAX_TOKENS / ANTHROPIC_MAX_TOKENS
-# at runtime when codegen responses look truncated. generate_code_*
-# (utils/query.py:485, 545) reads the env var fresh on every call, so the
-# bump takes effect on the next query without needing a restart.
+# CUDA backend singleton — passed to :class:`RLOptimizedAgentBase` so it
+# owns the tier-dispatch + deterministic-fix path via ``self.backend``.
 # ---------------------------------------------------------------------------
 
-
-_TOKEN_BUDGET_TIERS: List[int] = [16384, 32768, 65536]
-_TOKEN_BUDGET_LOCK = threading.Lock()
+_CUDA_BACKEND = CUDABackend()
 
 
-def _current_max_tokens() -> int:
-    raw = os.getenv("BEDROCK_MAX_TOKENS") or os.getenv("ANTHROPIC_MAX_TOKENS") or "16384"
-    try:
-        return int(raw)
-    except ValueError:
-        return 16384
-
-
-def _looks_truncated(text: str, usage: Optional[Dict[str, Any]], current_cap: int) -> Tuple[bool, str]:
-    """Two heuristics: (1) odd number of ``` fences in the text — model cut
-    mid-block; (2) output_tokens within 5% of the cap — almost certainly hit
-    the limit. Returns (truncated, reason)."""
-    if text:
-        fences = len(re.findall(r"```", text))
-        if fences > 0 and fences % 2 == 1:
-            return True, "odd number of ``` fences (unclosed code block)"
-    if usage:
-        out = usage.get("output_tokens") or 0
-        if out and current_cap and out >= int(current_cap * 0.95):
-            return True, f"output_tokens={out} ≥ 95% of cap={current_cap}"
-    return False, ""
-
-
-def maybe_bump_token_budget(
-    response_text: str, usage: Optional[Dict[str, Any]], logger=None
-) -> bool:
-    """If the response looks truncated, raise the cap one tier. Returns True if bumped.
-    Process-global; safe to call from any task."""
-    cur = _current_max_tokens()
-    truncated, reason = _looks_truncated(response_text or "", usage, cur)
-    if not truncated:
-        return False
-    with _TOKEN_BUDGET_LOCK:
-        cur = _current_max_tokens()  # re-read under lock
-        next_tier = next((t for t in _TOKEN_BUDGET_TIERS if t > cur), None)
-        if next_tier is None:
-            if logger:
-                logger.warning(
-                    f"Codegen response looks truncated ({reason}) but max_tokens "
-                    f"is already at top tier ({cur}); cannot bump further."
-                )
-            return False
-        os.environ["BEDROCK_MAX_TOKENS"] = str(next_tier)
-        os.environ["ANTHROPIC_MAX_TOKENS"] = str(next_tier)
-        if logger:
-            logger.warning(
-                f"Codegen looks truncated ({reason}); raised max_tokens "
-                f"{cur} → {next_tier} for all subsequent LLM calls."
-            )
-    return True
-
-
-# ---------------------------------------------------------------------------
-# Multi-arm bandit (UCB1) over (state, technique) pairs
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class _BanditArm:
-    pulls: int = 0
-    reward_sum: float = 0.0
-
-    def mean(self) -> float:
-        return self.reward_sum / self.pulls if self.pulls > 0 else 0.0
-
-    def update(self, reward: float) -> None:
-        self.pulls += 1
-        self.reward_sum += reward
-
-
-class UCB1Bandit:
-    """Per-state UCB1 over technique names.
-
-    Reward is the actual_improvement fraction (e.g. 0.12 for a 12% speedup),
-    clamped to [-1.0, 2.0] so a single catastrophic step doesn't poison the
-    arm forever.
-    """
-
-    def __init__(self, *, exploration_c: float = 1.4):
-        self.exploration_c = exploration_c
-        # arms[(state, technique)] -> _BanditArm
-        self._arms: Dict[Tuple[str, str], _BanditArm] = {}
-        self._total_pulls_per_state: Dict[str, int] = {}
-
-    def select(
-        self,
-        state: str,
-        candidates: List[str],
-        weights: Optional[List[float]] = None,
-        traj_idx: Optional[int] = None,
-    ) -> str:
-        """Select one candidate.
-
-        Cold-start (any arm with 0 pulls):
-        - If ``traj_idx`` is provided AND there are multiple unseen arms,
-          spread parallel/early trajectories across distinct unseen arms via
-          deterministic round-robin over the relevance-sorted list. This
-          guarantees that the first ``len(unseen)`` trajectories each try a
-          different action, instead of cubed-relevance sampling collapsing
-          them all to the dominant arm before the bandit has any data.
-        - Otherwise: cubed-relevance weighted sampling (legacy behavior).
-          Falls back to uniform random if no weights or all-zero.
-
-        Warm: standard UCB1 exploitation.
-        """
-        if not candidates:
-            raise ValueError("UCB1Bandit.select called with empty candidates")
-
-        # Find unseen arms.
-        unseen: List[Tuple[str, float]] = []
-        for i, c in enumerate(candidates):
-            arm = self._arms.get((state, c))
-            if arm is None or arm.pulls == 0:
-                w = float(weights[i]) if weights is not None and i < len(weights) else 1.0
-                unseen.append((c, max(0.0, w)))
-
-        if unseen:
-            if traj_idx is not None and len(unseen) > 1:
-                # Deterministic spread: traj_idx 0 → top relevance, traj 1 →
-                # 2nd, etc. With T trajectories and K unseen arms, each arm is
-                # tried by ⌈T/K⌉ trajectories. Stable sort with arm name as
-                # tiebreaker so identical-relevance arms still get distinct
-                # round-robin slots.
-                unseen_sorted = sorted(unseen, key=lambda t: (-t[1], t[0]))
-                return unseen_sorted[traj_idx % len(unseen_sorted)][0]
-            # Cubed-relevance weighted sampling among unseen arms.
-            cubed = [(c, w * w * w) for c, w in unseen]
-            total_w = sum(w for _, w in cubed)
-            if total_w <= 0.0:
-                return random.choice([c for c, _ in unseen])
-            r = random.random() * total_w
-            acc = 0.0
-            for c, w in cubed:
-                acc += w
-                if r <= acc:
-                    return c
-            return cubed[-1][0]  # numerical safety
-
-        # All arms pulled at least once → UCB1.
-        total = max(1, self._total_pulls_per_state.get(state, 0))
-        ln_total = math.log(total)
-        best = None
-        best_score = -float("inf")
-        for c in candidates:
-            arm = self._arms[(state, c)]
-            score = arm.mean() + self.exploration_c * math.sqrt(ln_total / arm.pulls)
-            if score > best_score:
-                best_score = score
-                best = c
-        return best  # type: ignore[return-value]
-
-    def update(self, state: str, technique: str, reward: float) -> None:
-        reward = max(-1.0, min(2.0, reward))
-        arm = self._arms.setdefault((state, technique), _BanditArm())
-        arm.update(reward)
-        self._total_pulls_per_state[state] = self._total_pulls_per_state.get(state, 0) + 1
-
-
-# ---------------------------------------------------------------------------
-# Deterministic syntax fix pre-pass — covers ~50–60% of nvcc fix-loops without
-# burning an LLM call.
-# ---------------------------------------------------------------------------
-
-
-_NVCC_FIXES: List[Tuple[re.Pattern, str, str]] = [
-    # Missing #include for cuda_fp16.h when half is used
-    (re.compile(r"\bidentifier\s+\"half\"\s+is\s+undefined", re.IGNORECASE),
-     "header_half", "#include <cuda_fp16.h>\n"),
-    # Missing #include for cuda_bf16.h when __nv_bfloat16 is used
-    (re.compile(r"\bidentifier\s+\"__nv_bfloat16\"\s+is\s+undefined", re.IGNORECASE),
-     "header_bf16", "#include <cuda_bf16.h>\n"),
-    # Missing #include for stdint when int64_t is used
-    (re.compile(r"\bidentifier\s+\"int64_t\"\s+is\s+undefined", re.IGNORECASE),
-     "header_stdint", "#include <cstdint>\n"),
-]
-
-
-def _deterministic_fix(code: str, error_msg: str) -> Optional[str]:
-    """Best-effort regex-based repair. Returns repaired code or None."""
-    if not error_msg:
-        return None
-    repaired = code
-    changed = False
-    for rx, _label, header in _NVCC_FIXES:
-        if rx.search(error_msg) and header.strip() not in repaired:
-            # Insert after the first existing #include if any, else at top.
-            inc_match = re.search(r"^\s*#include\s+[<\"][^>\"]+[>\"]", repaired, re.MULTILINE)
-            if inc_match:
-                idx = inc_match.end()
-                repaired = repaired[:idx] + "\n" + header + repaired[idx:]
-            else:
-                repaired = header + repaired
-            changed = True
-    # Common: "BLOCK_SIZE was not declared" — insert a default define.
-    m = re.search(r"\b\"(BLOCK_[A-Z_]+|TILE_[A-Z_]+)\"\s+is\s+undefined", error_msg)
-    if m and changed is False:
-        ident = m.group(1)
-        if f"#define {ident}" not in repaired:
-            repaired = f"#define {ident} 16\n" + repaired
-            changed = True
-    return repaired if changed else None
-
-
-# ---------------------------------------------------------------------------
-# NCU profile cache (process-local) keyed by SHA-1(code)
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class _ProfileCacheEntry:
-    cycles: int
-    metrics_json: Dict[str, Any]
-    annotated_ncu: str
-    raw_ncu: str
-
-
-class NCUProfileCache:
-    def __init__(self) -> None:
-        self._cache: Dict[str, _ProfileCacheEntry] = {}
-
-    @staticmethod
-    def _hash(code: str) -> str:
-        return hashlib.sha1(code.encode("utf-8")).hexdigest()
-
-    def get(self, code: str) -> Optional[_ProfileCacheEntry]:
-        return self._cache.get(self._hash(code))
-
-    def put(self, code: str, entry: _ProfileCacheEntry) -> None:
-        self._cache[self._hash(code)] = entry
+# The token-budget bumper, UCB1 bandit, deterministic fix rules, and
+# content-hash profile cache all moved to ``agents.rl`` (P5.1–P5.5). They're
+# imported at the top of the file — see ``from .rl import ...``. The
+# ``_deterministic_fix`` free function became ``backend.deterministic_fix``;
+# ``categorise_technique`` became ``backend.categorise_technique``. The old
+# ``_ProfileCacheEntry`` (NCU-specific fields) → ``ProfileCacheEntry``
+# (backend-agnostic: ``primary_metric``, ``profile: ProfileResult``, ``stderr``).
 
 
 # ---------------------------------------------------------------------------
@@ -373,8 +95,17 @@ class NCUProfileCache:
 # ---------------------------------------------------------------------------
 
 
-class OptimizedRLNCUAgent(FeedbackAgent):
-    """RL agent built around UCB selection + cache-stable prompts + NCU cache."""
+class OptimizedRLNCUAgent(RLOptimizedAgentBase):
+    """CUDA-specific optimized RL agent.
+
+    Inherits the tiered-model dispatch, UCB1 bandit, profile cache,
+    top-K seed buffer, and adaptive token budget from
+    :class:`RLOptimizedAgentBase`. Only the CUDA-specific bits live
+    here: NCU + nsys profile capture, ``elapsed_cycles`` parsing, and
+    the initialize/run outer wrappers with their perf spans.
+    """
+
+    agent_perf_label: str = "opt_ncu_rl_optimized"
 
     def __init__(
         self,
@@ -395,24 +126,27 @@ class OptimizedRLNCUAgent(FeedbackAgent):
         problem_id: Optional[str] = None,
         progress_writer: Optional[ProgressWriter] = None,
     ):
-        super().__init__(fb_config)
-        self.cost_tracker = cost_tracker
-        self.problem_id = problem_id
-        self.progress_writer = progress_writer
+        # Shared init (bandit, profile_cache, seed_buffer, tiered
+        # model config, prune knobs) lives on the base.
+        super().__init__(
+            fb_config,
+            code_to_optimize_fp,
+            backend=_CUDA_BACKEND,
+            max_rollout_steps=max_rollout_steps,
+            replay_buffer_size=replay_buffer_size,
+            num_rl_iterations=num_rl_iterations,
+            seed_from_init_count=seed_from_init_count,
+            bandit_exploration=bandit_exploration,
+            prune_patience=prune_patience,
+            prune_regression_pct=prune_regression_pct,
+            max_fix_attempts=max_fix_attempts,
+            cost_tracker=cost_tracker,
+            problem_id=problem_id,
+            progress_writer=progress_writer,
+        )
 
-        self.test_code_fp: Path = fb_config.test_code_fp
-        self.test_code: str = fb_config.test_code_fp.read_text()
-        self.code_to_optimize_fp: Path = code_to_optimize_fp
-        self.code_to_optimize: str = code_to_optimize_fp.read_text()
-
-        # Model dispatch (env-driven). All default to ``self.model`` so a clean
-        # run with no extra config still works.
-        self.model_plan: str = os.getenv("MODEL_PLAN") or self.model
-        self.model_codegen_simple: str = os.getenv("MODEL_CODEGEN_SIMPLE") or self.model
-        self.model_codegen_hard: str = os.getenv("MODEL_CODEGEN_HARD") or self.model
-        self.model_fix: str = os.getenv("MODEL_FIX") or self.model_codegen_simple
-
-        # Database (override if injected).
+        # CUDA-specific: database with cheap_llm plumbed through for
+        # tiered state-analysis dispatch.
         gpu_report_path = (
             Path(__file__).parent.parent.parent.parent.parent
             / "algo-sol-modeling/algo-space/gpu_optimization_report.md"
@@ -437,31 +171,8 @@ class OptimizedRLNCUAgent(FeedbackAgent):
             if cost_tracker is not None and getattr(self.database, "cost_tracker", None) is None:
                 self.database.cost_tracker = cost_tracker
 
-        # RL components.
-        self.replay_buffer = ReplayBuffer(max_size=replay_buffer_size)
-        self.bandit = UCB1Bandit(exploration_c=bandit_exploration)
-        self.profile_cache = NCUProfileCache()
-
-        # Run config.
-        self.max_rollout_steps = max_rollout_steps
-        self.num_rl_iterations = num_rl_iterations
-        self.seed_from_init_count = seed_from_init_count
-        self.prune_patience = prune_patience
-        self.prune_regression_pct = prune_regression_pct
-        self.max_fix_attempts = max_fix_attempts
-
-        # Tracking.
-        self.total_trajectories = 0
-        self.best_cycles: float = float("inf")
-        self.initial_cycles: Optional[int] = None
-        self.last_ncu_log: str = ""
-        # Top-K best (cycles, code) pairs for best-of-N seeding.
-        self._top_k_seeds: List[Tuple[int, str]] = []
-        self._top_k_size = 5
-
+        # CUDA-only knob (NCU profiling timeout).
         self.ncu_timeout_s = int(os.getenv("KERNELBLASTER_NCU_TIMEOUT_S", "600"))
-
-        self._trajectory_lock: asyncio.Lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Profiling — cached by code hash
@@ -482,8 +193,12 @@ class OptimizedRLNCUAgent(FeedbackAgent):
 
         cached = self.profile_cache.get(code) if code else None
         if cached is not None:
+            cycles = int(cached.primary_metric)
+            annotated_ncu = cached.profile.raw_metrics.get("annotated_ncu", "")
+            raw_ncu = cached.profile.raw_log
+            metrics_json = cached.profile.raw_metrics.get("metrics_json", {})
             self.agent_logger.info(
-                f"NCU cache hit for {filepath.name} (cycles={cached.cycles})"
+                f"NCU cache hit for {filepath.name} (cycles={cycles})"
             )
             # Cache hit is ~free; record it for cache-rate analysis.
             perf_record(
@@ -491,9 +206,9 @@ class OptimizedRLNCUAgent(FeedbackAgent):
                 duration_s=0.0,
                 problem_id=self.problem_id,
                 agent="opt_ncu_rl_optimized",
-                extra={"cycles": cached.cycles},
+                extra={"cycles": cycles},
             )
-            return cached.annotated_ncu, cached.raw_ncu, "", cached.cycles, cached.metrics_json
+            return annotated_ncu, raw_ncu, cached.stderr, cycles, metrics_json
 
         with perf_span(
             phase="profile_total",
@@ -507,13 +222,25 @@ class OptimizedRLNCUAgent(FeedbackAgent):
         # in metrics_json["elapsed_cycles"] separately for LLM context.
         metrics_json = extract_metrics_json(raw_ncu, gpu_time_ns=cycles)
         if code:
+            # Wrap the CUDA-specific fields into a generic ProfileResult so
+            # the cache stays backend-agnostic (P5.2). CUDA readers still
+            # find annotated_ncu / metrics_json under ``raw_metrics``.
+            profile = ProfileResult(
+                total_time_ms=float(cycles),
+                per_kernel_ms={},
+                raw_metrics={
+                    "annotated_ncu": annotated_ncu,
+                    "metrics_json": metrics_json,
+                    "elapsed_cycles": int(cycles),
+                },
+                raw_log=raw_ncu,
+            )
             self.profile_cache.put(
                 code,
-                _ProfileCacheEntry(
-                    cycles=cycles,
-                    metrics_json=metrics_json,
-                    annotated_ncu=annotated_ncu,
-                    raw_ncu=raw_ncu,
+                ProfileCacheEntry(
+                    primary_metric=float(cycles),
+                    profile=profile,
+                    stderr=stderr or "",
                 ),
             )
         return annotated_ncu, raw_ncu, stderr, cycles, metrics_json
@@ -720,78 +447,11 @@ class OptimizedRLNCUAgent(FeedbackAgent):
         return details_stdout, details_stdout, details_stderr, gpu_time_ns
 
     # ------------------------------------------------------------------
-    # LLM dispatchers
+    # LLM dispatchers — inherited from RLOptimizedAgentBase (P5.7).
+    # ``_llm_codegen`` routes via ``self.backend.categorise_technique``;
+    # ``_llm_fix`` uses ``self.model_fix``. Both apply cost tracking +
+    # adaptive token-budget bump.
     # ------------------------------------------------------------------
-
-    async def _llm_codegen(
-        self, messages: List[Dict[str, str]], *, technique_name: str
-    ) -> str:
-        category = categorise_technique(technique_name)
-        model = self.model_codegen_hard if category == "hard" else self.model_codegen_simple
-        self.agent_logger.info(
-            f"Codegen dispatch: technique={technique_name} category={category} model={model}"
-        )
-        with perf_span(
-            phase="llm_codegen",
-            problem_id=self.problem_id,
-            agent="opt_ncu_rl_optimized",
-            model=model,
-        ) as span:
-            span.set_extra(technique=technique_name, category=category)
-            response = await generate_code_retry(
-                messages=messages,
-                model=model,
-                logger=self.agent_logger,
-                max_retries=2,
-            )
-            text = response.generations[0] if response.generations else ""
-            usage = getattr(response, "usage", None)
-            if usage:
-                span.set_extra(
-                    input_tokens=usage.get("input_tokens"),
-                    output_tokens=usage.get("output_tokens"),
-                )
-        if self.cost_tracker is not None:
-            self.cost_tracker.record(
-                model=model,
-                usage=usage,
-                role=f"codegen_{category}",
-                problem_id=self.problem_id,
-                logger=self.agent_logger,
-            )
-        maybe_bump_token_budget(text, usage, logger=self.agent_logger)
-        return text
-
-    async def _llm_fix(self, messages: List[Dict[str, str]]) -> str:
-        with perf_span(
-            phase="llm_fix",
-            problem_id=self.problem_id,
-            agent="opt_ncu_rl_optimized",
-            model=self.model_fix,
-        ) as span:
-            response = await generate_code_retry(
-                messages=messages,
-                model=self.model_fix,
-                logger=self.agent_logger,
-                max_retries=2,
-            )
-            text = response.generations[0] if response.generations else ""
-            usage = getattr(response, "usage", None)
-            if usage:
-                span.set_extra(
-                    input_tokens=usage.get("input_tokens"),
-                    output_tokens=usage.get("output_tokens"),
-                )
-        if self.cost_tracker is not None:
-            self.cost_tracker.record(
-                model=self.model_fix,
-                usage=usage,
-                role="fix",
-                problem_id=self.problem_id,
-                logger=self.agent_logger,
-            )
-        maybe_bump_token_budget(text, usage, logger=self.agent_logger)
-        return text
 
     # ------------------------------------------------------------------
     # Run — main entry point
@@ -837,7 +497,7 @@ class OptimizedRLNCUAgent(FeedbackAgent):
                 err = str(e)
                 last_error = err
 
-                patched = _deterministic_fix(current_code, err)
+                patched = self.backend.deterministic_fix(current_code, err)
                 if patched is not None and patched != current_code:
                     self.agent_logger.info(
                         f"Deterministic syntax-fix repaired init (attempt {attempt})"
@@ -916,7 +576,10 @@ class OptimizedRLNCUAgent(FeedbackAgent):
                 )
             except Exception as e:
                 self.agent_logger.debug(f"Could not write baseline marker: {e}")
-            self._top_k_seeds.append((cycles, self.code_to_optimize))
+            # Late-bind the (possibly deterministic-fix-repaired) init code
+            # to the seed buffer so subsequent rollouts see the working version.
+            self.seed_buffer.set_init_code(self.code_to_optimize)
+            self.seed_buffer.update(float(cycles), self.code_to_optimize)
             self.agent_logger.info(f"Initial cycles={cycles}, metrics={metrics}")
             return
 
@@ -968,7 +631,11 @@ class OptimizedRLNCUAgent(FeedbackAgent):
 
         async def _one_rollout(idx: int) -> Optional[Trajectory]:
             try:
-                seed_code = self._pick_seed_code(idx)
+                seed_code, seed_metric = self.seed_buffer.pick(idx)
+                if seed_metric is not None:
+                    self.agent_logger.info(
+                        f"Rollout {idx} seeded from prior best ({seed_metric} cycles)"
+                    )
                 return await self._run_rollout(idx, seed_code, initial_state)
             except Exception as e:
                 self.agent_logger.error(f"Rollout {idx} failed: {e}")
@@ -992,7 +659,7 @@ class OptimizedRLNCUAgent(FeedbackAgent):
                     best_step.code + f"\n\n// Elapsed Cycles: {best_step.cycles}\n"
                 )
                 self.agent_logger.info(f"New best: {best_cycles} cycles (action={best_step.action})")
-            self._update_top_k(best_step.cycles, best_step.code)
+            self.seed_buffer.update(float(best_step.cycles), best_step.code)
 
         # Persist database snapshot.
         try:
@@ -1028,29 +695,9 @@ class OptimizedRLNCUAgent(FeedbackAgent):
         self.agent_logger.warning("RL produced no improvement.")
         return failure
 
-    # ------------------------------------------------------------------
-    # Best-of-N seeding
-    # ------------------------------------------------------------------
-
-    def _pick_seed_code(self, idx: int) -> str:
-        """Choose the starting code for rollout ``idx``.
-
-        First ``seed_from_init_count`` rollouts always start from init.cu.
-        Later rollouts pick from the running top-K best seeds (sorted by cycles).
-        """
-        if idx < self.seed_from_init_count or not self._top_k_seeds:
-            return self.code_to_optimize
-        # Round-robin over the top-K best seeds we've seen so far.
-        seeds = sorted(self._top_k_seeds, key=lambda t: t[0])[: self._top_k_size]
-        cycles, code = seeds[idx % len(seeds)]
-        self.agent_logger.info(f"Rollout {idx} seeded from prior best ({cycles} cycles)")
-        return code
-
-    def _update_top_k(self, cycles: int, code: str) -> None:
-        if not code:
-            return
-        self._top_k_seeds.append((cycles, code))
-        self._top_k_seeds = sorted(self._top_k_seeds, key=lambda t: t[0])[: self._top_k_size]
+    # P5.4 extraction: ``_pick_seed_code`` and ``_update_top_k`` moved to
+    # ``rl.TopKSeedBuffer``. Callers use ``self.seed_buffer.pick(idx)`` and
+    # ``self.seed_buffer.update(metric, code)`` directly.
 
     # ------------------------------------------------------------------
     # Rollout
@@ -1275,8 +922,14 @@ class OptimizedRLNCUAgent(FeedbackAgent):
     ) -> Tuple[str, int, str, Dict[str, Any]]:
         # 1. Build messages with cache-stable system prompt.
         # Use last cached profile metrics if available; else minimal dict.
+        # ProfileCacheEntry stashes metrics_json under ProfileResult.raw_metrics
+        # per the P5.2 backend-agnostic shape.
         try:
-            current_metrics_json = self.profile_cache.get(code).metrics_json if self.profile_cache.get(code) else {}
+            cached_entry = self.profile_cache.get(code)
+            current_metrics_json = (
+                cached_entry.profile.raw_metrics.get("metrics_json", {})
+                if cached_entry is not None else {}
+            )
         except Exception:
             current_metrics_json = {}
         if current_cycles and "elapsed_cycles" not in current_metrics_json:
@@ -1284,8 +937,9 @@ class OptimizedRLNCUAgent(FeedbackAgent):
             current_metrics_json["elapsed_cycles"] = int(current_cycles)
 
         # Best-so-far hint to keep the LLM grounded.
-        if self._top_k_seeds and current_cycles is not None:
-            best = min(t[0] for t in self._top_k_seeds)
+        snapshot = self.seed_buffer.snapshot()
+        if snapshot and current_cycles is not None:
+            best = int(min(m for m, _ in snapshot))
             best_so_far_summary = (
                 f"Running best across all rollouts: {best} cycles "
                 f"(this trajectory's current: {current_cycles} cycles)."
@@ -1329,7 +983,7 @@ class OptimizedRLNCUAgent(FeedbackAgent):
             except FeedbackError as e:
                 err = str(e)
                 # 3a. Deterministic syntax fix first.
-                patched = _deterministic_fix(optimized_code, err)
+                patched = self.backend.deterministic_fix(optimized_code, err)
                 if patched is not None and patched != optimized_code:
                     self.agent_logger.info(
                         f"Deterministic syntax-fix repaired step {step} attempt {attempt}"

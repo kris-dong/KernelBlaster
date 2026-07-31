@@ -140,9 +140,22 @@ class Backend(ABC):
     """
 
     # ---- identity (class attributes, set by subclasses) ----
-    name: str = ""               # "cuda" | "opencl"
-    kernel_ext: str = ""         # ".cu" | ".cl"
-    driver_filename: str = ""    # "driver.cpp" | "driver.c"
+    name: str = ""               # "cuda" | "opencl" | "riscv"
+    kernel_ext: str = ""         # ".cu" | ".cl" | ".c"
+    driver_filename: str = ""    # "driver.cpp" | "driver.c" | "main.c"
+
+    # ---- Heterogeneous-model dispatch patterns (P5.5) ----
+    # Consumed by :meth:`categorise_technique`. Subclasses list the substrings
+    # that identify "mechanically simple" techniques (small deltas — swap a
+    # keyword, change a block size) vs "structurally hard" techniques (require
+    # rewriting the algorithm — tiling, fusion, tensor cores). The optimized
+    # RL agent routes them to different-tier codegen models.
+    #
+    # Default: empty tuples → every technique classifies as "simple" (no
+    # tier split). Backends that want the split populate these class attrs
+    # or override :meth:`categorise_technique` for richer logic.
+    simple_technique_patterns: tuple[str, ...] = ()
+    hard_technique_patterns: tuple[str, ...] = ()
 
     # ---- prompts / database assets ----
     @property
@@ -344,3 +357,49 @@ class Backend(ABC):
     # each backend's native metric (CUDA cycles, OpenCL ms). No shape
     # conversion is needed on read or write — callers just read
     # ``step.cycles`` directly.
+
+    # ---- Heterogeneous-model + deterministic-fix hooks (P5.5) ----
+    # These two hooks let the optimized RL loop stay backend-agnostic
+    # while backends preserve their language-specific behaviour.
+
+    def categorise_technique(self, technique_name: str) -> str:
+        """Classify a technique as ``"simple"`` or ``"hard"``.
+
+        Drives the optimized RL agent's model-tier dispatch: "simple"
+        techniques run on a cheaper codegen model, "hard" ones get the
+        premium model. Substring-matched against
+        :attr:`hard_technique_patterns` first (so a technique whose
+        name contains BOTH a simple and a hard pattern wins "hard"),
+        then :attr:`simple_technique_patterns`. Fallback: ``"simple"``
+        — the same conservative default the CUDA-optimized agent used
+        before the extraction.
+
+        Override for richer logic (e.g. dispatch by op family rather
+        than name substring).
+        """
+        low = technique_name.lower()
+        for pat in self.hard_technique_patterns:
+            if pat in low:
+                return "hard"
+        for pat in self.simple_technique_patterns:
+            if pat in low:
+                return "simple"
+        return "simple"
+
+    def deterministic_fix(
+        self, code: str, error_msg: str
+    ) -> "str | None":
+        """Best-effort regex-based repair of a broken kernel.
+
+        Runs BEFORE the LLM fix path in the optimized RL agent's
+        initialize + rollout fix loops. Returns the repaired code, or
+        ``None`` when no rule matches (caller falls through to an LLM
+        fix request).
+
+        Default: ``None`` (no deterministic rules — every failure goes
+        straight to the LLM). CUDA/NCU implements a set of nvcc-error
+        → include-header rules; other backends can add their own
+        (e.g. RISC-V gcc's ``implicit-function-declaration`` warnings
+        → add a header stub) or leave the default in place.
+        """
+        return None

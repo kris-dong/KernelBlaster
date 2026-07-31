@@ -268,6 +268,64 @@ def initialize_adreno_gpu_server(
     )
 
 
+def initialize_riscv_fpga_server(
+    log_file: TextIOWrapper,
+    *,
+    board_host: str | None = None,
+    bitstream_path: Path | str | None = None,
+    batch_runner_template: Path | str | None = None,
+    port: int | None = None,
+):
+    """Initialize the RISC-V FPGA execution server (batched via
+    :class:`FPGAExecStrategy`) and return ``(process, url)``.
+
+    Spawns the unified exec_server with ``--strategy=fpga``. The
+    strategy amortises the multi-minute bitstream flash across every
+    batch of kernel binaries — clients should prefer
+    ``POST /gpu/batch`` (or a :class:`BatchCoordinator`) over
+    ``POST /gpu/binary`` when talking to this server; the single path
+    still works but pays the batch-runner link cost per request.
+
+    Args:
+        board_host: SSH target for the openOCD/JTAG-bridge host. ``None``
+            means the FPGA is on the same host as the exec server.
+        bitstream_path: Path to the ``.bit`` file to flash. Read from
+            ``KERNELBLASTER_FPGA_BITSTREAM`` env var when unset.
+        batch_runner_template: Directory holding the Zephyr batch-
+            runner app template. Read from
+            ``KERNELBLASTER_ZEPHYR_BATCH_RUNNER`` env var when unset.
+    """
+    gpu_server_url = os.getenv("KERNELBLASTER_RISCV_FPGA_GPU_SERVER_URL")
+    if gpu_server_url:
+        logger.info(f"Using existing RISC-V FPGA server at {gpu_server_url}")
+        return None, gpu_server_url
+
+    if bitstream_path is None:
+        bitstream_path = os.getenv("KERNELBLASTER_FPGA_BITSTREAM")
+    if batch_runner_template is None:
+        batch_runner_template = os.getenv("KERNELBLASTER_ZEPHYR_BATCH_RUNNER")
+
+    extra_args: list[str] = ["--strategy", "fpga"]
+    if board_host:
+        extra_args.extend(["--board-host", board_host])
+    if bitstream_path:
+        extra_args.extend(["--bitstream-path", str(bitstream_path)])
+    if batch_runner_template:
+        extra_args.extend(["--batch-runner-template", str(batch_runner_template)])
+
+    return _spawn_server(
+        label="RISC-V FPGA server",
+        module="src.kernelblaster.servers.exec_server",
+        log_file=log_file,
+        port=port,
+        default_port=2005,
+        extra_args=extra_args,
+        startup_extra_log=(
+            f"(board={board_host}, bitstream={bitstream_path or '<unset>'})"
+        ),
+    )
+
+
 def find_free_port(start_port: int = 2001) -> int:
     """Find an available port starting from start_port."""
     for port in range(start_port, start_port + 100):

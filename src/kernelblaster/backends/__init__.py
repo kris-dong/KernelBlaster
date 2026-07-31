@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any
 from .base import Backend, ProfileResult
 from .cuda import CUDABackend
 from .opencl import OpenCLBackend
+from .riscv import RiscvZephyrBackend
 
 if TYPE_CHECKING:
     from ..config import GPUType
@@ -33,14 +34,17 @@ if TYPE_CHECKING:
 _REGISTRY: dict[str, type[Backend]] = {
     "cuda": CUDABackend,
     "opencl": OpenCLBackend,
+    "riscv": RiscvZephyrBackend,
 }
 
 
 def get_backend(name: str, **kwargs: Any) -> Backend:
-    """Return a Backend instance for ``name`` (``"cuda"`` or ``"opencl"``).
+    """Return a Backend instance for ``name``.
 
-    Extra kwargs are forwarded to the backend constructor (e.g. ``gpu=``,
-    or ``board_host=`` for OpenCL).
+    Recognised names: ``"cuda"``, ``"opencl"``, ``"riscv"``. Extra
+    kwargs are forwarded to the backend constructor (e.g. ``gpu=``,
+    ``board_host=`` for OpenCL / RISC-V, ``batch_runner_template=`` for
+    RISC-V).
     """
     name = name.lower()
     if name not in _REGISTRY:
@@ -56,6 +60,8 @@ def backend_for_gpu(gpu: "GPUType") -> Backend:
         return CUDABackend(gpu=gpu)
     if gpu.is_adreno:
         return OpenCLBackend(gpu=gpu)
+    if gpu.is_riscv_fpga:
+        return RiscvZephyrBackend(gpu=gpu)
     raise ValueError(f"No backend registered for GPU {gpu!r}")
 
 
@@ -63,6 +69,7 @@ __all__ = [
     "Backend",
     "CUDABackend",
     "OpenCLBackend",
+    "RiscvZephyrBackend",
     "ProfileResult",
     "backend_for_gpu",
     "get_backend",

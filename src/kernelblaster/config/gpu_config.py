@@ -47,6 +47,21 @@ _ADRENO_MAP = {
     "adreno750": "opencl_3.0",
 }
 
+# RISC-V + Zephyr targets, mapped to the ``west build -b <board>`` value
+# used by modelblaster's build pipeline (matches _run_lib.sh's
+# BOARD_TARGET selection). Two shapes:
+#
+#   riscv_spike       → spike_riscv64            (functional simulator)
+#   riscv_fpga_zephyr → chipyard_riscv64/rocketchip_virt_riscv64  (FireSim)
+#
+# Batching is intrinsic to both (one Zephyr ELF can hold N problems;
+# for FireSim this also amortises the multi-minute bitstream flash),
+# so :attr:`is_batched_target` is True for either.
+_RISCV_FPGA_MAP = {
+    "riscv_spike": "spike_riscv64",
+    "riscv_fpga_zephyr": "chipyard_riscv64/rocketchip_virt_riscv64",
+}
+
 
 class GPUType(StrEnum):
     A100 = "a100"
@@ -66,6 +81,13 @@ class GPUType(StrEnum):
     ADRENO_730 = "adreno730"
     ADRENO_740 = "adreno740"
     ADRENO_750 = "adreno750"
+    # RISC-V + Zephyr targets. Two shapes covered today:
+    #   RISCV_SPIKE       — functional simulator (spike_riscv64 board).
+    #   RISCV_FPGA_ZEPHYR — FireSim / real chipyard_riscv64 SoC.
+    # Add more entries when specific SoC bitstreams need distinct
+    # identities in the RL database.
+    RISCV_SPIKE = "riscv_spike"
+    RISCV_FPGA_ZEPHYR = "riscv_fpga_zephyr"
 
     @property
     def is_nvidia(self) -> bool:
@@ -76,6 +98,20 @@ class GPUType(StrEnum):
         return self.value in _ADRENO_MAP
 
     @property
+    def is_riscv_fpga(self) -> bool:
+        return self.value in _RISCV_FPGA_MAP
+
+    @property
+    def is_batched_target(self) -> bool:
+        """True when the target's exec path amortises fixed setup cost
+        across multiple binaries and clients should prefer
+        ``/gpu/batch`` (via :class:`BatchCoordinator`) over
+        ``/gpu/binary``. NVIDIA + Adreno = False (each request is
+        independent); RISC-V FPGA = True (one bitstream flash serves
+        many kernel ELFs)."""
+        return self.is_riscv_fpga
+
+    @property
     def sm(self):
         assert self.value in _SM_MAP, f"Not an NVIDIA GPU: {self.value}"
         return _SM_MAP[self.value]
@@ -84,6 +120,16 @@ class GPUType(StrEnum):
     def opencl_version(self) -> str:
         assert self.value in _ADRENO_MAP, f"Not an Adreno GPU: {self.value}"
         return _ADRENO_MAP[self.value]
+
+    @property
+    def zephyr_board(self) -> str:
+        """Zephyr ``--board`` identifier for this target. Used by
+        :class:`servers.strategies.ZephyrCompileStrategy` to invoke
+        ``west build``. Placeholder value (``qemu_riscv32``) until a
+        real bitstream/target lands — override via env var
+        ``KERNELBLASTER_ZEPHYR_BOARD`` at server startup."""
+        assert self.value in _RISCV_FPGA_MAP, f"Not a RISC-V FPGA target: {self.value}"
+        return _RISCV_FPGA_MAP[self.value]
 
     @property
     def target_lang(self) -> str:

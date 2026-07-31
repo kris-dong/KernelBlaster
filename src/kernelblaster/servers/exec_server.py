@@ -53,7 +53,14 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from .server_logging import get_log_config
-from .strategies import ExecStrategy, LocalExecStrategy, RemoteExecStrategy
+from .strategies import (
+    ExecJob,
+    ExecJobResult,
+    ExecStrategy,
+    LocalExecStrategy,
+    RemoteExecStrategy,
+    get_exec_strategy_cls,
+)
 from .utils.queue_server import worker_pool
 
 
@@ -172,26 +179,56 @@ async def _remote_preflight():
 # Worker handler
 # ---------------------------------------------------------------------------
 
-async def _exec_job(worker_id: int, job_args: tuple) -> ExecResult:
+async def _exec_job(worker_id: int, job_args: tuple):
     """Handler for :func:`worker_pool` — routes to the active strategy.
 
-    ``job_args`` shape: single-element tuple carrying a dict with the
-    per-request kwargs the strategies accept.
+    ``job_args`` shape is a discriminated tuple flattened for
+    :func:`queue_worker_loop`'s ``*job_args`` unpacking:
+
+      * ``("single", payload_dict)`` — strategy.exec(**payload) →
+        :class:`ExecResult`.
+      * ``("batch", list[ExecJob])`` — strategy.batch_exec(jobs=...) →
+        ``list[ExecJobResult]`` wrapped as ``list[ExecResult]``.
+
+    Both paths convert underlying strategy exceptions into
+    ``ExecResult(success=False, ...)`` — clients see 200-OK JSON with
+    the failure flag, matching the pre-refactor contract.
     """
-    (payload,) = job_args
+    kind, payload = job_args[0], job_args[1]
     assert _STRATEGY is not None, "exec strategy not initialised"
 
-    try:
-        stdout, stderr = await _STRATEGY.exec(worker_id=worker_id, **payload)
-        return ExecResult(success=True, stdout=stdout, stderr=stderr)
-    except Exception as e:
-        # Both GpuCommandError (local) and AdrenoExecutionError
-        # (remote) carry ``error_message``; other exceptions get their
-        # str repr. Convert to inline success=False so the HTTP client
-        # sees a 200-OK JSON body (matches pre-refactor contract).
-        message = getattr(e, "error_message", None) or str(e)
-        logger.error(f"[Worker {worker_id}]: exec failed: {message}")
-        return ExecResult(success=False, message=message)
+    if kind == "single":
+        try:
+            stdout, stderr = await _STRATEGY.exec(worker_id=worker_id, **payload)
+            return ExecResult(success=True, stdout=stdout, stderr=stderr)
+        except Exception as e:
+            message = getattr(e, "error_message", None) or str(e)
+            logger.error(f"[Worker {worker_id}]: exec failed: {message}")
+            return ExecResult(success=False, message=message)
+
+    if kind == "batch":
+        jobs: list[ExecJob] = payload
+        try:
+            results = await _STRATEGY.batch_exec(worker_id=worker_id, jobs=jobs)
+            return [_job_result_to_exec_result(r) for r in results]
+        except Exception as e:
+            # Whole-batch failure (e.g. bitstream flash refused). All
+            # jobs get the same error — clients that want per-job
+            # granularity should catch inside batch_exec instead.
+            message = getattr(e, "error_message", None) or str(e)
+            logger.error(f"[Worker {worker_id}]: batch_exec failed: {message}")
+            return [ExecResult(success=False, message=message) for _ in jobs]
+
+    raise ValueError(f"Unknown exec job kind: {kind!r}")
+
+
+def _job_result_to_exec_result(r: ExecJobResult) -> "ExecResult":
+    return ExecResult(
+        stdout=r.stdout,
+        stderr=r.stderr,
+        success=r.success,
+        message=r.message,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -202,7 +239,9 @@ async def _exec_job(worker_id: int, job_args: tuple) -> ExecResult:
 async def lifespan(app):
     global _STRATEGY
 
-    if _BOARD_HOST:
+    strategy_name = _resolve_strategy_name()
+
+    if strategy_name == "remote":
         _STRATEGY = RemoteExecStrategy(board_host=_BOARD_HOST)
         logger.info(
             f"Started unified exec server on {args.host}:{args.port} "
@@ -210,7 +249,7 @@ async def lifespan(app):
         )
         await _remote_preflight()
         num_workers = args.num_workers
-    else:
+    elif strategy_name == "local":
         assert _GPU_IDS is not None, "GPU_IDS not initialised for local strategy"
         _STRATEGY = LocalExecStrategy(gpu_ids=_GPU_IDS)
         logger.info(
@@ -235,6 +274,22 @@ async def lifespan(app):
         await _print_nvidia_smi(logger)
         await _check_gpu_processes()
         num_workers = len(_GPU_IDS)
+    else:
+        # Registry-dispatched strategies (currently: fpga). Instantiation
+        # kwargs come from CLI flags translated into a kwargs dict below.
+        strategy_cls = get_exec_strategy_cls(strategy_name)
+        init_kwargs = _strategy_init_kwargs(strategy_name)
+        _STRATEGY = strategy_cls(**init_kwargs)
+        logger.info(
+            f"Started unified exec server on {args.host}:{args.port} "
+            f"strategy={strategy_name} init_kwargs={list(init_kwargs)}"
+        )
+        # Optional per-strategy pre-flight hook (real FPGAExecStrategy
+        # uses this to check board connectivity + bitstream freshness).
+        preflight = getattr(_STRATEGY, "preflight", None)
+        if preflight is not None:
+            await preflight()
+        num_workers = args.num_workers
 
     async with worker_pool(
         num_workers=num_workers,
@@ -244,6 +299,44 @@ async def lifespan(app):
         logger=logger,
     ):
         yield
+
+
+def _resolve_strategy_name() -> str:
+    """Pick the strategy name from CLI flags, preserving pre-flag
+    behaviour: ``--strategy`` explicit > ``--board-host`` implies
+    ``remote`` > default ``local``. Central so tests can reason about
+    resolution without a full server boot."""
+    explicit = getattr(args, "strategy", None)
+    if explicit:
+        return explicit
+    if _BOARD_HOST:
+        return "remote"
+    return "local"
+
+
+def _strategy_init_kwargs(strategy_name: str) -> dict:
+    """Translate CLI namespace → strategy __init__ kwargs. Kept here
+    (not on the strategies themselves) so ``exec_server`` owns the CLI
+    surface end-to-end and strategy classes remain plain data holders.
+    Extend when a new strategy needs new flags."""
+    if strategy_name == "fpga":
+        return dict(
+            board_host=_BOARD_HOST,
+            bitstream_path=getattr(args, "bitstream_path", None),
+            batch_runner_template=getattr(args, "batch_runner_template", None),
+        )
+    if strategy_name == "spike":
+        spike_args_raw = getattr(args, "spike_extra_args", None) or ""
+        default_spike_args = tuple(
+            a for a in spike_args_raw.split(",") if a.strip()
+        )
+        return dict(
+            spike_binary=getattr(args, "spike_binary", None),
+            modelblaster_root=getattr(args, "modelblaster_root", None),
+            multi_link_script=getattr(args, "multi_link_script", None),
+            default_spike_args=default_spike_args,
+        )
+    return {}
 
 
 def _pin_libtorch_ld_path():
@@ -284,8 +377,37 @@ async def health_check():
         "status": "healthy",
         "service": "exec-server",
         "strategy": _STRATEGY.name if _STRATEGY else "<not-started>",
+        "supports_batching": bool(_STRATEGY and _STRATEGY.supports_batching),
         "board_host": _BOARD_HOST,
     }
+
+
+# ---------------------------------------------------------------------------
+# Request-parsing helpers (shared by /gpu/binary and /gpu/batch)
+# ---------------------------------------------------------------------------
+
+def _parse_env_vars(env_vars: Optional[str]) -> Optional[dict]:
+    if not env_vars:
+        return None
+    try:
+        parsed = json.loads(env_vars)
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid env_vars JSON: {e}")
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=400, detail="env_vars must be a JSON object")
+    return parsed
+
+
+def _parse_kernel_files(kernel_files: Optional[str]) -> Optional[list[str]]:
+    if not kernel_files:
+        return None
+    try:
+        parsed = json.loads(kernel_files)
+    except json.JSONDecodeError:
+        return [kernel_files]
+    if not isinstance(parsed, list):
+        return [kernel_files]
+    return parsed
 
 
 @APP.post("/gpu/binary", response_model=ExecResult)
@@ -310,42 +432,139 @@ async def execute_gpu_binary(
         if not binary_data:
             raise HTTPException(status_code=400, detail="Empty binary file provided")
 
-        parsed_env_vars: Optional[dict] = None
-        if env_vars:
-            try:
-                parsed_env_vars = json.loads(env_vars)
-                if not isinstance(parsed_env_vars, dict):
-                    raise ValueError("env_vars must be a JSON object")
-            except (json.JSONDecodeError, ValueError) as e:
-                raise HTTPException(
-                    status_code=400, detail=f"Invalid env_vars JSON: {e}"
-                )
-
-        parsed_kernel_files: Optional[list[str]] = None
-        if kernel_files:
-            try:
-                parsed_kernel_files = json.loads(kernel_files)
-                if not isinstance(parsed_kernel_files, list):
-                    parsed_kernel_files = [kernel_files]
-            except json.JSONDecodeError:
-                parsed_kernel_files = [kernel_files]
-
         payload = dict(
             binary_data=binary_data,
             filename=binary.filename or "gpu_executable",
             args=args or "",
-            env_vars=parsed_env_vars,
+            env_vars=_parse_env_vars(env_vars),
             prefix_command=prefix_command,
             n_runs=n_runs,
             timeout=timeout,
-            kernel_files=parsed_kernel_files,
+            kernel_files=_parse_kernel_files(kernel_files),
             profile=profile or False,
         )
 
         completion_future: asyncio.Future = asyncio.Future()
-        await QUEUE.put((payload, completion_future, time.time()))
+        # Flat shape: ("single", payload, fut, ts). queue_worker_loop's
+        # ``*job_args, fut, ts = item`` unpacks to job_args=("single", payload).
+        await QUEUE.put(("single", payload, completion_future, time.time()))
         await completion_future
         return completion_future.result()
+    except asyncio.CancelledError:
+        raise HTTPException(status_code=500, detail="Request was cancelled")
+
+
+class BatchExecResponse(BaseModel):
+    """Wrapper for :meth:`ExecStrategy.batch_exec` — per-job results in
+    the same order as the incoming binaries. Individual failures are
+    inline (``results[i].success = False``); the enclosing HTTP call
+    only fails if the whole batch is rejected (invalid input, no
+    strategy, ...).
+    """
+    results: list[ExecResult] = []
+
+
+@APP.post("/gpu/batch", response_model=BatchExecResponse)
+async def execute_gpu_batch(
+    binaries: list[UploadFile] = File(..., description="Binaries in the batch"),
+    manifest: str = Form(
+        ...,
+        description=(
+            "JSON list of per-job kwargs, aligned with `binaries` by index. "
+            "Each entry may set: args, env_vars, prefix_command, n_runs, "
+            "timeout, kernel_files, profile. Missing keys default to the "
+            "same defaults /gpu/binary uses."
+        ),
+    ),
+):
+    """Execute a batch of binaries in one queue slot.
+
+    Dispatches to :meth:`ExecStrategy.batch_exec`. For strategies with
+    ``supports_batching = False`` (Local, Remote SSH) this just runs
+    them serially; the endpoint still works and returns the same shape,
+    which lets client code opt into batching uniformly. For batching-
+    aware strategies (FPGA) this amortises the fixed per-batch cost
+    (bitstream flash, board reset) across ``len(binaries)`` jobs.
+    """
+    if len(binaries) == 0:
+        raise HTTPException(status_code=400, detail="Empty batch")
+
+    try:
+        manifest_parsed = json.loads(manifest)
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid manifest JSON: {e}")
+    if not isinstance(manifest_parsed, list):
+        raise HTTPException(status_code=400, detail="manifest must be a JSON list")
+    if len(manifest_parsed) != len(binaries):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"manifest length ({len(manifest_parsed)}) does not match "
+                f"binaries length ({len(binaries)})"
+            ),
+        )
+
+    jobs: list[ExecJob] = []
+    for idx, (upload, entry) in enumerate(zip(binaries, manifest_parsed)):
+        if not isinstance(entry, dict):
+            raise HTTPException(
+                status_code=400, detail=f"manifest[{idx}] must be a JSON object"
+            )
+        data = await upload.read()
+        if not data:
+            raise HTTPException(status_code=400, detail=f"binaries[{idx}] is empty")
+
+        # env_vars / kernel_files may arrive as JSON strings (form-encoded
+        # style) OR native dicts/lists (JSON manifest style) — accept both.
+        env_vars_raw = entry.get("env_vars")
+        if isinstance(env_vars_raw, str):
+            env_vars_val = _parse_env_vars(env_vars_raw)
+        elif env_vars_raw is None or isinstance(env_vars_raw, dict):
+            env_vars_val = env_vars_raw
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"manifest[{idx}].env_vars must be a dict or JSON string",
+            )
+
+        kernel_files_raw = entry.get("kernel_files")
+        if isinstance(kernel_files_raw, str):
+            kernel_files_val = _parse_kernel_files(kernel_files_raw)
+        elif kernel_files_raw is None or isinstance(kernel_files_raw, list):
+            kernel_files_val = kernel_files_raw
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"manifest[{idx}].kernel_files must be a list or JSON string",
+            )
+
+        jobs.append(ExecJob(
+            binary_data=data,
+            filename=upload.filename or f"gpu_executable_{idx}",
+            args=entry.get("args", "") or "",
+            env_vars=env_vars_val,
+            prefix_command=entry.get("prefix_command"),
+            n_runs=int(entry.get("n_runs", 1)),
+            timeout=float(entry.get("timeout", 3600)),
+            kernel_files=kernel_files_val,
+            profile=bool(entry.get("profile", False)),
+        ))
+
+    logger.info(
+        f"/gpu/batch [{_STRATEGY.name if _STRATEGY else '?'}] - "
+        f"count={len(jobs)} supports_batching="
+        f"{_STRATEGY.supports_batching if _STRATEGY else '?'} "
+        f"backlog={QUEUE.qsize()}"
+    )
+
+    try:
+        completion_future: asyncio.Future = asyncio.Future()
+        # Flat shape (same convention as /gpu/binary above).
+        await QUEUE.put(("batch", jobs, completion_future, time.time()))
+        await completion_future
+        results = completion_future.result()
+        # The handler returns list[ExecResult] for the batch shape.
+        return BatchExecResponse(results=results)
     except asyncio.CancelledError:
         raise HTTPException(status_code=500, detail="Request was cancelled")
 
@@ -373,8 +592,34 @@ def main():
                              "sizes workers from KERNELBLASTER_GPU_SERVER_GPU_IDS / "
                              "KERNELBLASTER_GPU_SERVER_NUM_WORKERS.")
     parser.add_argument("--board-host", type=str, default=None,
-                        help="SSH target for Adreno board. When set, the "
-                             "server picks the RemoteExecStrategy.")
+                        help="SSH target for Adreno board (or FPGA host). "
+                             "Absent + no --strategy = LocalExecStrategy; "
+                             "set + no --strategy = RemoteExecStrategy.")
+    parser.add_argument("--strategy", type=str, default=None,
+                        help="Explicit exec strategy name (e.g. 'local', "
+                             "'remote', 'fpga'). If unset, resolved from "
+                             "--board-host (present = 'remote', absent = "
+                             "'local').")
+    parser.add_argument("--bitstream-path", type=Path, default=None,
+                        help="Path to the FPGA bitstream (fpga strategy).")
+    parser.add_argument("--batch-runner-template", type=Path, default=None,
+                        help="Path to the batch-runner Zephyr app template "
+                             "used by FPGAExecStrategy to build one boot ELF "
+                             "from N kernel binaries.")
+    parser.add_argument("--spike-binary", type=str, default=None,
+                        help="Path to the spike executable (spike strategy). "
+                             "Absent = look up on PATH.")
+    parser.add_argument("--modelblaster-root", type=Path, default=None,
+                        help="Root dir of modelblaster (contains "
+                             "modelblaster/validation/). Required by the "
+                             "spike strategy to find spike_runner.")
+    parser.add_argument("--multi-link-script", type=Path, default=None,
+                        help="Path to a script that fuses N kernel ELFs into "
+                             "one multi-model ELF for batched spike runs. "
+                             "Absent = spike batches devolve to per-item.")
+    parser.add_argument("--spike-extra-args", type=str, default=None,
+                        help="Comma-separated list of --spike-arg values "
+                             "injected into every spike run (e.g. 'isa=rv64gcv').")
     parser.add_argument(
         "--log_path", type=Path,
         default=Path("/tmp/kernelblaster/exec_server.log"),

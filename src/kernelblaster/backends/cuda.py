@@ -20,6 +20,7 @@ migrate consumers off the free functions onto this surface.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Mapping
 
@@ -90,6 +91,37 @@ class CUDABackend(Backend):
     name = "cuda"
     kernel_ext = ".cu"
     driver_filename = "driver.cpp"
+
+    # Heterogeneous-model tier dispatch (P5.5 extraction from
+    # opt_ncu_rl_optimized._SIMPLE_TECHNIQUE_PATTERNS / _HARD_TECHNIQUE_PATTERNS).
+    # SIMPLE = mostly-mechanical edits (change a block size, vectorize
+    # a load, swap a keyword). HARD = structural rewrites (tiling,
+    # tensor cores, fusion, algorithmic).
+    simple_technique_patterns = (
+        "coalesc",
+        "vector",
+        "occupancy",
+        "block_size",
+        "register",
+        "constant_cache",
+        "instruction_level_parallelism",
+        "fast_math",
+        "thread_data_mapping",
+        "thread_work_remapping",
+        "vectorized_processing",
+        "simd_operations",
+    )
+    hard_technique_patterns = (
+        "shared_memory_tiling",
+        "tensor_core",
+        "wmma",
+        "kernel_fusion",
+        "fused_operations",
+        "register_tiling",
+        "algorithmic",
+        "composite",
+        "hybrid",
+    )
 
     def __init__(self, *, gpu: "GPUType | None" = None):
         # GPU type is preserved for callers that still need SM version etc.
@@ -290,6 +322,52 @@ class CUDABackend(Backend):
             final_filename="final_rl_cuda_perf.cu",
             use_global_best_preference=False,
         )
+
+    # ---- Deterministic-fix pre-pass (P5.5) ----
+    # Regex-based nvcc-error → include-header repair. Runs before the LLM
+    # fix path in the optimized RL agent's initialize + rollout loops.
+    # Covers ~50-60% of nvcc fix cycles without burning an LLM call. Extracted
+    # from opt_ncu_rl_optimized._NVCC_FIXES.
+    _NVCC_FIX_RULES: tuple[tuple[re.Pattern, str, str], ...] = (
+        (re.compile(r"\bidentifier\s+\"half\"\s+is\s+undefined", re.IGNORECASE),
+         "header_half", "#include <cuda_fp16.h>\n"),
+        (re.compile(r"\bidentifier\s+\"__nv_bfloat16\"\s+is\s+undefined", re.IGNORECASE),
+         "header_bf16", "#include <cuda_bf16.h>\n"),
+        (re.compile(r"\bidentifier\s+\"int64_t\"\s+is\s+undefined", re.IGNORECASE),
+         "header_stdint", "#include <cstdint>\n"),
+    )
+
+    def deterministic_fix(self, code: str, error_msg: str) -> str | None:
+        """Best-effort regex repair of common nvcc failures.
+
+        Handles the ~three most common missing-include patterns (half,
+        bfloat16, int64_t) plus the "BLOCK_SIZE undefined" boilerplate.
+        Returns the repaired code, or None if no rule matched.
+        """
+        if not error_msg:
+            return None
+        repaired = code
+        changed = False
+        for rx, _label, header in self._NVCC_FIX_RULES:
+            if rx.search(error_msg) and header.strip() not in repaired:
+                # Insert after the first existing #include if any, else at top.
+                inc_match = re.search(
+                    r"^\s*#include\s+[<\"][^>\"]+[>\"]", repaired, re.MULTILINE,
+                )
+                if inc_match:
+                    idx = inc_match.end()
+                    repaired = repaired[:idx] + "\n" + header + repaired[idx:]
+                else:
+                    repaired = header + repaired
+                changed = True
+        # Common: "BLOCK_SIZE was not declared" → insert default define.
+        m = re.search(r"\b\"(BLOCK_[A-Z_]+|TILE_[A-Z_]+)\"\s+is\s+undefined", error_msg)
+        if m and not changed:
+            ident = m.group(1)
+            if f"#define {ident}" not in repaired:
+                repaired = f"#define {ident} 16\n" + repaired
+                changed = True
+        return repaired if changed else None
 
     # ---- LLM response handling ----
     def extract_code_from_response(self, response_text: str) -> str | None:
