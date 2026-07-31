@@ -63,6 +63,24 @@ if os.getenv("PERFLAB_KEY"):
         timeout=None,
     )
 
+# Bedrock client configured via AWS_BEARER_TOKEN_BEDROCK (or standard AWS
+# creds). Uses the Converse API — one code path handles both Anthropic
+# ``anthropic.claude-*`` and Meta ``meta.llama*`` model IDs (as well as
+# their region-prefixed inference-profile variants ``us.meta.llama*``,
+# ``us.anthropic.claude-*``). ``asyncio.to_thread`` is used to bridge
+# boto3's sync API into the async pipeline — a native async Bedrock SDK
+# doesn't exist yet.
+bedrock_client = None
+if os.getenv("AWS_BEARER_TOKEN_BEDROCK") or os.getenv("AWS_ACCESS_KEY_ID"):
+    try:
+        import boto3  # type: ignore
+        bedrock_client = boto3.client(
+            "bedrock-runtime",
+            region_name=os.getenv("AWS_REGION", "us-west-2"),
+        )
+    except Exception:
+        bedrock_client = None
+
 
 class TrimError(Exception):
     pass
@@ -170,6 +188,130 @@ def process_messages(messages: List[dict], model: str) -> List[dict]:
         return formatted_messages
 
     return messages
+
+
+def _is_bedrock_model(model: str) -> bool:
+    """Detect Bedrock model IDs / inference-profile IDs.
+
+    Matches ``anthropic.claude-*``, ``meta.llama*``, ``us.meta.llama*``,
+    ``us.anthropic.claude-*``, and other Bedrock-native prefixes.
+    Cross-region inference profiles use a ``<region>.<vendor>.<model>``
+    shape; the ``.`` separator + vendor prefix is the reliable signal.
+    """
+    low = model.lower()
+    for prefix in (
+        "anthropic.claude", "us.anthropic.claude",
+        "eu.anthropic.claude", "apac.anthropic.claude",
+        "meta.llama", "us.meta.llama",
+        "eu.meta.llama", "apac.meta.llama",
+        "mistral.", "us.mistral.",
+        "amazon.nova", "us.amazon.nova",
+        "cohere.command", "ai21.jamba",
+        "moonshotai.", "moonshot.", "us.moonshotai.", "us.moonshot.",
+    ):
+        if low.startswith(prefix):
+            return True
+    return False
+
+
+async def generate_code_bedrock(
+    messages, n_tasks: int, model: str
+) -> LLMResponse:
+    """Generate via Bedrock's Converse API.
+
+    One code path for Anthropic Claude, Meta Llama, Mistral, Nova, etc.
+    Converse accepts a normalised ``[{role, content:[{text}]}]`` message
+    shape; we translate from the OpenAI ``[{role, content: str}]`` shape
+    here.
+
+    ``n_tasks`` > 1 issues that many independent Converse calls (Converse
+    has no ``n`` parameter). Sequential for simplicity — the RL loop
+    already parallelises at the trajectory level, and only NUM_PARALLEL_
+    GENERATIONS_PER_ATTEMPT-tier callers ever pass ``n_tasks > 1``.
+    """
+    if bedrock_client is None:
+        raise RuntimeError(
+            "Bedrock model requested but no bedrock-runtime client is "
+            "configured — set AWS_BEARER_TOKEN_BEDROCK (or standard AWS "
+            "credentials) + AWS_REGION."
+        )
+
+    # OpenAI messages → Converse messages. Converse takes the system
+    # prompt separately; user/assistant messages are lists of content
+    # blocks. Empty content blocks are illegal — drop them.
+    system_blocks: list[dict] = []
+    conv_messages: list[dict] = []
+    for m in messages:
+        role = m.get("role")
+        content = m.get("content") or ""
+        if role == "system":
+            if content:
+                system_blocks.append({"text": content})
+            continue
+        if not content:
+            continue
+        conv_messages.append({"role": role, "content": [{"text": content}]})
+
+    # Bedrock rejects an assistant-terminated message list — drop a
+    # trailing assistant turn if the caller left one on the tail.
+    while conv_messages and conv_messages[-1]["role"] == "assistant":
+        conv_messages.pop()
+    if not conv_messages:
+        raise RuntimeError("generate_code_bedrock: no user messages after conversion")
+
+    max_tokens_env = os.getenv("BEDROCK_MAX_TOKENS") or os.getenv("ANTHROPIC_MAX_TOKENS")
+    try:
+        max_tokens = int(max_tokens_env) if max_tokens_env else 8192
+    except ValueError:
+        max_tokens = 8192
+
+    inference_config: dict = {"maxTokens": max_tokens}
+    temperature_env = os.getenv("BEDROCK_TEMPERATURE")
+    if temperature_env:
+        try:
+            inference_config["temperature"] = float(temperature_env)
+        except ValueError:
+            pass
+
+    kwargs: dict = {
+        "modelId": model,
+        "messages": conv_messages,
+        "inferenceConfig": inference_config,
+    }
+    if system_blocks:
+        kwargs["system"] = system_blocks
+
+    outputs: list[str] = []
+    total_input = 0
+    total_output = 0
+    start = time.time()
+    for _ in range(n_tasks):
+        # boto3 client is sync; hop off the event loop.
+        resp = await asyncio.to_thread(bedrock_client.converse, **kwargs)
+        content = resp["output"]["message"].get("content") or []
+        text = "".join(
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and "text" in block
+        )
+        outputs.append(text)
+        usage = resp.get("usage") or {}
+        total_input += int(usage.get("inputTokens") or 0)
+        total_output += int(usage.get("outputTokens") or 0)
+    end = time.time()
+
+    return LLMResponse(
+        deepcopy(messages),
+        outputs,
+        {
+            "input_tokens": total_input,
+            "output_tokens": total_output,
+            "total_tokens": total_input + total_output,
+        },
+        model,
+        n_tasks,
+        end - start,
+    )
 
 
 async def generate_code_openai(client, messages, n_tasks, model: str) -> LLMResponse:
@@ -323,6 +465,15 @@ async def generate_code(messages, n_tasks=1, model=None) -> LLMResponse:
                 use_4bit=True,
             )
     
+    # Bedrock: matches Anthropic + Meta + Mistral + Nova etc. (including
+    # ``us.<vendor>...`` cross-region inference profiles) whenever the
+    # bedrock-runtime client is configured. Preferred over OpenAI when
+    # the model ID is clearly Bedrock-flavored — this is what lets the
+    # heterogeneous flow use e.g. Llama 4 Scout for MODEL_CODEGEN_SIMPLE
+    # and Llama 4 Maverick for MODEL_CODEGEN_HARD.
+    if bedrock_client is not None and _is_bedrock_model(model):
+        return await generate_code_bedrock(messages, n_tasks, model)
+
     # Fall back to OpenAI-compatible client
     # Prefer OpenAI if configured (this is the most common local dev path).
     client = oai_client
@@ -333,7 +484,9 @@ async def generate_code(messages, n_tasks=1, model=None) -> LLMResponse:
 
     if client is None:
         raise RuntimeError(
-            "No LLM client configured. Set OPENAI_API_KEY or PERFLAB_KEY, or use a local model."
+            "No LLM client configured. Set OPENAI_API_KEY or PERFLAB_KEY, "
+            "AWS_BEARER_TOKEN_BEDROCK / AWS credentials for Bedrock models, "
+            "or use a local model."
         )
 
     return await generate_code_openai(client, messages, n_tasks, model)
