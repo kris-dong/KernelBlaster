@@ -41,6 +41,62 @@ them as coarse priors, not calibrated values — the RL loop updates
 
 ---
 
+## RVV Canonical Idioms (single-instruction forms — prefer these)
+
+The RVV V extension has direct scalar-argument intrinsics for the common
+elementwise patterns. Emitting `vmfgt` + `vmerge` when a single-op form
+exists is a common LLM mistake — it triples the vector-unit work for no
+functional gain.
+
+| Op | ONE-OP form | Wrong (3-op) form to avoid |
+|---|---|---|
+| `y = max(x, 0)` (ReLU) | `vfmax_vf_f32m8(x, 0.0f, vl)` | `vmfgt_vf_*` + `vmerge_vvm_*` |
+| `y = min(x, cap)` (clamp-max) | `vfmin_vf_f32m8(x, cap, vl)` | `vmflt_vf_*` + `vmerge_vvm_*` |
+| `y = max(x, y)` (elementwise max) | `vfmax_vv_f32m8(x, y, vl)` | mask + merge |
+| `y = |x|` | `vfabs_v_f32m8(x, vl)` | shift + mask hack |
+| `y = a * b + c` (FMA) | `vfmacc_vv_f32m8(c, a, b, vl)` | `vfmul` + `vfadd` (2 ops, but breaks fma fusion) |
+| `s = sum(x[:])` | `vfredosum_vs_f32m8_f32m1(...)` | scalar reduction loop |
+| `m = max(x[:])` | `vfredmax_vs_f32m8_f32m1(...)` | scalar max loop |
+| `y = sign(a) * |b|` | `vfsgnj_vv_f32m8(b, a, vl)` | bit manipulation |
+| `y = x * scale` (widen memory op) | LMUL=m8 stripmine | LMUL=m2 (misses free bandwidth) |
+
+For any comparison-with-constant that reduces to max/min/clamp/abs/sign,
+there is a direct `vf*_vf_*` intrinsic. Reach for it FIRST.
+
+---
+
+## Memory-vs-Compute Bottleneck Triage (READ BEFORE PICKING A TECHNIQUE)
+
+Before applying any technique, estimate the op's arithmetic intensity:
+
+    intensity = FLOPs / (bytes_read + bytes_written)
+
+For a Rocket + Saturn (DLEN=128, VLEN=256) config with ~1-2 GB/s
+effective DDR bandwidth to the target frequency, the compute peak is
+~4-8 fp32 GFLOP/s. Break-even intensity is ~2-4 FLOP/byte. Below that
+line, the vector unit will sit idle waiting for DDR — compute
+optimisations (RVV, unroll, pipeline) CANNOT help; the profile just
+shows fewer instructions retired but the same wall time.
+
+Common workload placement:
+
+| Op class | Intensity (FLOP/B) | Regime | Best-shot techniques |
+|---|---:|---|---|
+| ReLU, clamp, add, mul (pure elementwise fp32) | ~0.25 | **memory-bound** | prefetch, streaming stores, fusion into neighbour |
+| Sigmoid, tanh (transcendental elementwise) | ~5 (limb-bound) | compute-bound | polynomial approx, RVV vectorise |
+| Reduce sum / max (single-pass) | ~0.5 | memory-bound | tree reduction, `vfredosum_vs` |
+| GEMM (large, weight-reused) | 2 * K per output element | compute-bound (K >~ 32) | RVV + register tiling + pipelining |
+| Conv2D (weight-reused, small output) | 2 * KH*KW*IC per output | compute-bound | RVV + register tiling + im2col |
+| BatchNorm forward | ~2 | borderline | fuse into producer/consumer |
+| Attention softmax | mixed (see hybrid_bound_attention) | hybrid | flash-attention style fusion |
+
+**If you're stuck below break-even intensity**, the only levers are
+memory-side: prefetch, streaming stores, blocking to fit in L1D, or
+fusing to eliminate the intermediate tensor entirely. Adding more
+vector lanes just idles them harder.
+
+---
+
 ## RISC-V Architecture Quick Reference (Rocket / Saturn defaults)
 
 - **Core**: Single-issue in-order scalar (Rocket) or dual-issue in-order with
@@ -83,20 +139,34 @@ exceeds L1D, low arithmetic intensity per byte loaded.
 **Signature**: A dominant op is an elementwise / small-window stencil
 (relu, sigmoid, elementwise_add, conv1d, depthwise conv, batchnorm) with input
 size >> L1D capacity. Per-op cycles are dominated by load latency; when IPC
-data is available, IPC < 0.5.
+data is available, IPC < 0.5. Intensity < 1 FLOP/byte.
+
+**Do-not-bother heuristics for pure-elementwise fp32 stencils (relu, add,
+mul, negate, clamp)**: intensity ~0.25 FLOP/byte. Compute optimisations
+(unroll, RVV, pipeline) will plateau at 1.1-1.3x because the vector unit
+already outruns DDR. Focus on prefetch / streaming stores / fusing into the
+neighbour producer or consumer. If those aren't available, expect the RL
+loop to top out at ~15% improvement over the reference and move on.
 
 **Recommended Optimizations** (predicted_improvement %):
-- `1.1_loop_tiling_icache` (20%): Tile inner loops so a chunk fits in L1D.
+- `3.3_prefetch_hints` (25%): Software prefetch 64-128 elements ahead
+  (`__builtin_prefetch(&a[i + 64], 0, 0)`). Locality hint 0 = no reuse,
+  correct for streaming stencils. Rocket's L1 hardware prefetcher is weak.
+- `5.1_streaming_stores` (12%): For output-only writes with no reuse, avoid
+  the read-for-ownership by writing full cache lines. Modest but stackable.
+- `5.2_producer_consumer_fusion` (35%): The largest lever for memory-bound
+  elementwise — often not applicable inside a single kernel, but flags the
+  isolated-optimisation ceiling to the caller.
+- `1.1_loop_tiling_icache` (18%): Tile inner loops so a chunk fits in L1D.
   For a 16 KB L1D holding fp32 data, tile size ≈ 4096 elements — one warm
   cache-line fill lasts many arithmetic ops.
-- `3.3_prefetch_hints` (18%): Emit a load 2 cache lines ahead of the consumer
-  (`__builtin_prefetch(&a[i + 32], 0, 3)`). Rocket's L1 hardware prefetcher is
-  simple; software prefetch helps.
 - `1.2_data_layout_soa` (15%): For batch / channel-major inputs, reorder to
   keep stride-1 access on the innermost loop.
-- `2.3_rvv_vectorization` (35%): If target is `rvv`, use `vsetvl` + vector
-  loads to widen the memory transaction — a single `vle32.v` moves 32 fp32
-  elements per instruction, amortising the front-end.
+- `2.3_rvv_vectorization` (15%): Only widens the memory transaction here —
+  won't move the needle if already at DDR peak. Use LMUL=m8 with `vle32_v`
+  to amortise the vsetvli overhead over the largest possible batch. USE
+  `vfmax_vf` / `vfmin_vf` / `vfabs_v` for elementwise-with-scalar patterns —
+  see "RVV Canonical Idioms" above.
 
 ---
 
@@ -244,9 +314,12 @@ mispredicts.
 **Recommended Optimizations**:
 - `predicated_arithmetic` (30%): Replace `if (x > t) y = a else y = b` with
   `y = a * (x > t) + b * (x <= t)` — branch-free.
-- `min_max_via_intrinsics` (20%): Use `__builtin_fmax` / `__builtin_fmin`
-  (or `fmaxf`/`fminf` when Zfh present); the compiler emits a single
-  `fmax.s`/`fmin.s` instead of a branch.
+- `min_max_via_intrinsics` (20%): Scalar path — use `__builtin_fmax` /
+  `__builtin_fmin` (or `fmaxf`/`fminf` when Zfh present); the compiler
+  emits a single `fmax.s`/`fmin.s` instead of a branch. Vector path —
+  `vfmax_vf_f32m8(v, thresh, vl)` / `vfmin_vf_f32m8(v, thresh, vl)` for
+  the direct single-op form; DO NOT expand into vmfgt+vmerge (three ops
+  instead of one).
 - `sort_or_bucket_data` (25%): If the workload permits reordering, group
   elements by branch outcome so subsequent passes are branch-free.
 - `2.3_rvv_vectorization` (40%): RVV masked ops (`vfmax.vv` under mask)

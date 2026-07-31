@@ -53,11 +53,15 @@ _RISCV_DEFAULT_OPTIMIZATIONS: Mapping[str, list[tuple[str, float]]] = {
         ("1.1_loop_tiling_icache", 25.0),
         ("1.2_data_layout_soa", 20.0),
         ("1.3_reduce_indirect_loads", 15.0),
+        ("3.3_prefetch_hints", 22.0),
+        ("5.1_streaming_stores", 12.0),
+        ("5.2_producer_consumer_fusion", 30.0),
     ],
     "compute_bound": [
         ("2.1_loop_unrolling", 30.0),
         ("2.2_strength_reduction", 20.0),
         ("2.3_rvv_vectorization", 40.0),
+        ("4.1_register_tiling", 25.0),
     ],
     "latency_bound": [
         ("3.1_branch_prediction_hints", 25.0),
@@ -67,6 +71,7 @@ _RISCV_DEFAULT_OPTIMIZATIONS: Mapping[str, list[tuple[str, float]]] = {
     "hybrid_bound": [
         ("4.1_register_tiling", 30.0),
         ("4.2_software_pipelining", 30.0),
+        ("2.3_rvv_vectorization", 25.0),
     ],
 }
 
@@ -96,9 +101,18 @@ _RISCV_TECHNIQUE_MAP: Mapping[str, str] = {
         "shifts. In-order RISC-V cores make branch/mul latency painful."
     ),
     "2.3_rvv_vectorization": (
-        "If the target SoC exposes the RISC-V V extension, use vsetvl-driven "
-        "vector intrinsics for the inner loop. Falls back to scalar cleanly "
-        "when V is absent."
+        "Vectorize the inner loop with V-extension intrinsics: "
+        "`vsetvl_e32m8(n - i)` to stripmine, `vle32_v_f32m8` / "
+        "`vse32_v_f32m8` for stride-1 load/store. CRITICAL: for common "
+        "elementwise idioms, use the direct single-instruction form, NOT "
+        "compare-then-merge — one vector op vs three: "
+        "`vfmax_vf_f32m8(v, 0.0f, vl)` for ReLU / max-with-scalar, "
+        "`vfmin_vf_f32m8` for clamp, `vfabs_v_f32m8` for absolute value, "
+        "`vfsgnj_vv` for sign copy, `vfmacc_vv` for fused-multiply-add, "
+        "`vfredosum_vs` / `vfredmax_vs` for in-vector reductions. "
+        "Prefer LMUL=m8 for pure-elementwise (widens the memory "
+        "transaction); drop to m4/m2 under register pressure. Skip when "
+        "the target lacks `V` — falls back to scalar cleanly."
     ),
     "3.1_branch_prediction_hints": (
         "Restructure conditionals so the predicted-taken path is the common "
@@ -109,8 +123,34 @@ _RISCV_TECHNIQUE_MAP: Mapping[str, str] = {
         "in-order pipeline doesn't stall on load-use hazards."
     ),
     "3.3_prefetch_hints": (
-        "Emit software prefetches (target-specific intrinsic or the RVA22 "
-        "hint instruction) two iterations ahead of the consumer."
+        "Emit software prefetches (`__builtin_prefetch(&x[i + K], 0, 0)`) "
+        "K = 32-128 elements ahead of the consumer. Rocket's L1 hardware "
+        "prefetcher is weak; software prefetch is the primary lever for "
+        "hiding DDR latency on memory-bound elementwise. Locality-hint "
+        "0 tells the cache 'no reuse' — appropriate for streaming."
+    ),
+    "5.1_streaming_stores": (
+        "For output-only writes with no reuse (elementwise ops, "
+        "materialising staged tensors), skip the read-for-ownership by "
+        "writing through cache-bypass paths. On RISC-V + Zephyr this is "
+        "typically `__builtin_prefetch(&out[i], 1, 0)` (locality-hint 0 "
+        "= no temporal reuse) or aligning to full cache-line writes so "
+        "the coherency protocol can drop the pre-read. Helps when the "
+        "op is memory-bandwidth bound and output has no downstream "
+        "reuse in the same kernel."
+    ),
+    "5.2_producer_consumer_fusion": (
+        "When the profile shows a memory-bound elementwise op "
+        "sandwiched between two other ops (e.g. relu after conv), the "
+        "single-op-in-isolation view is misleading — the whole "
+        "producer -> op -> consumer chain traffics the intermediate "
+        "tensor through DDR. Fusing the elementwise into the producer "
+        "or consumer eliminates that traffic entirely. For "
+        "modelblaster's generated dispatcher, fusion means rewriting "
+        "the surrounding kernel to inline the elementwise pass; the "
+        "isolated kernel here can't fuse alone, but the profile hint "
+        "(low arithmetic intensity, DDR-bound) is a signal that the "
+        "isolated form is fundamentally limited."
     ),
     "4.1_register_tiling": (
         "Increase work per innermost iteration so intermediate results stay "
