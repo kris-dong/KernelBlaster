@@ -187,11 +187,25 @@ def split_files_for_compilation(
             )
         main_file_text = main_file_text.replace(header_decl, "")
 
-        # Add cstdint in case fixed-width integer types are used like int64_t
-        # Add torch/torch.h in case parameters are of type torch::Tensor or c10::ScalarType
-        header_file_text = (
-            "#include <cstdint>\n#include <torch/torch.h>\n" + header_decl + "\n"
+        # Add cstdint in case fixed-width integer types are used like int64_t.
+        # torch/torch.h is only needed when the launch signature or the kernel
+        # itself uses torch::/c10::/at:: types. Pulling it into the CUDA
+        # translation unit costs ~40s per compile (nvcc parses all of LibTorch),
+        # and the hot RL loop recompiles the kernel ~120x per problem, so the
+        # include is guarded to the host TU unless it is genuinely required.
+        needs_torch = bool(
+            re.search(r"\b(torch|c10|at)::", cuda_file_text)
+            or re.search(r"\b(torch|c10|at)::", header_decl)
         )
+        if needs_torch:
+            torch_include = "#include <torch/torch.h>\n"
+        else:
+            # __CUDACC__ is defined for the nvcc-compiled kernel TU and not for
+            # the host-compiled driver TU, so the driver still sees LibTorch.
+            torch_include = (
+                "#ifndef __CUDACC__\n#include <torch/torch.h>\n#endif\n"
+            )
+        header_file_text = "#include <cstdint>\n" + torch_include + header_decl + "\n"
 
         # Add the header include to both main file and CUDA file
         main_file_text = f'#include "cuda_model.cuh"\n{main_file_text}'
