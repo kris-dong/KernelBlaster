@@ -51,7 +51,8 @@ from .progress_writer import ProgressWriter
 from .rl import ProfileCacheEntry
 from .rl_agents import Trajectory, TrajectoryStep
 from .utils import FeedbackError, NamedTimer
-from .utils.commands import compile_and_run_riscv
+from .utils.commands import compile_and_run_riscv, compile_and_run_riscv_batched
+from .utils.exec_batch_client import ExecBatchClient, get_exec_batch_client
 
 
 class OptimizedRLRiscvAgent(RLOptimizedAgentBase):
@@ -100,6 +101,7 @@ class OptimizedRLRiscvAgent(RLOptimizedAgentBase):
         progress_writer: Optional[ProgressWriter] = None,
         io_npz_path: Optional[Path] = None,
         spike_args_str: str = "",
+        use_exec_batching: bool = True,
     ):
         backend = RiscvZephyrBackend(gpu=gpu)
 
@@ -154,6 +156,14 @@ class OptimizedRLRiscvAgent(RLOptimizedAgentBase):
         # minutes on stock-dim KernelBench problems).
         self.spike_timeout_s = int(os.getenv("KERNELBLASTER_SPIKE_TIMEOUT_S", "1800"))
 
+        # Batching: when enabled (default) the RL exec calls route
+        # through a client-side :class:`ExecBatchClient` that coalesces
+        # concurrent rollout submits into ``/gpu/batch`` calls. Lazily
+        # created on first use (needs an event loop). Users can disable
+        # per-run to A/B against single-item exec.
+        self._use_exec_batching = use_exec_batching
+        self._batch_client: Optional[ExecBatchClient] = None
+
         # Legacy field the RL loop still references; RISC-V uses cycles
         # directly. ``last_ncu_log`` is repurposed to store the raw
         # spike stdout so the state analyzer has full context.
@@ -178,18 +188,40 @@ class OptimizedRLRiscvAgent(RLOptimizedAgentBase):
         # Driver = fb_config.test_code_fp (the KernelBench driver.c).
         driver_fp = self.test_code_fp
 
-        stdout_list, stderr_list, _elf_path, _success = await compile_and_run_riscv(
-            driver_fp,
-            filepath,
-            self.gpu,
-            timer,
-            self.agent_logger,
-            timeout=self.spike_timeout_s,
-            num_runs=1,
-            io_npz_path=self.io_npz_path,
-            spike_args_str=self.spike_args_str,
-            passed_keyword=None,
-        )
+        # Route through the batch client when enabled — concurrent
+        # rollouts naturally arrive here nearly-simultaneously, and the
+        # coordinator coalesces them into one ``/gpu/batch`` HTTP call.
+        # When batching is off (or the client can't be created), fall
+        # back to the single-item path with identical semantics.
+        if self._use_exec_batching:
+            if self._batch_client is None:
+                self._batch_client = await get_exec_batch_client(self.gpu)
+            stdout_list, stderr_list, _elf_path, _success = await compile_and_run_riscv_batched(
+                driver_fp,
+                filepath,
+                self.gpu,
+                timer,
+                self.agent_logger,
+                self._batch_client,
+                timeout=self.spike_timeout_s,
+                num_runs=1,
+                io_npz_path=self.io_npz_path,
+                spike_args_str=self.spike_args_str,
+                passed_keyword=None,
+            )
+        else:
+            stdout_list, stderr_list, _elf_path, _success = await compile_and_run_riscv(
+                driver_fp,
+                filepath,
+                self.gpu,
+                timer,
+                self.agent_logger,
+                timeout=self.spike_timeout_s,
+                num_runs=1,
+                io_npz_path=self.io_npz_path,
+                spike_args_str=self.spike_args_str,
+                passed_keyword=None,
+            )
         stdout = "\n".join(stdout_list) if isinstance(stdout_list, list) else str(stdout_list)
         stderr = "\n".join(stderr_list) if isinstance(stderr_list, list) else str(stderr_list)
 

@@ -954,3 +954,102 @@ async def compile_and_run_riscv(
                 break
 
     return stdout_list, stderr_list, compiled_path, success
+
+
+async def compile_and_run_riscv_batched(
+    main_filepath: Path,
+    kernel_filepath: Path,
+    gpu: GPUType,
+    timer,
+    logger,
+    batch_client,
+    *,
+    timeout: int = 3600,
+    num_runs: int = 1,
+    io_npz_path: Optional[Path] = None,
+    spike_args_str: str = "",
+    passed_keyword: Optional[str] = None,
+) -> tuple[list[str], list[str], str, bool]:
+    """Batched variant of :func:`compile_and_run_riscv`.
+
+    Compilation stays per-item (there's nothing to amortise on the
+    compile side — the compile server already runs N-way parallel via
+    ``--num-workers``). Only the exec phase routes through
+    ``batch_client``: N concurrent callers coalesce into one
+    ``/gpu/batch`` HTTP call whose per-job cost is one boot / one flash
+    amortised across ``N`` kernels.
+
+    ``batch_client`` is an :class:`ExecBatchClient` (see
+    :mod:`agents.utils.exec_batch_client`); pass ``None`` to disable
+    batching (functionally identical to :func:`compile_and_run_riscv`).
+
+    Returns the same ``(stdout_list, stderr_list, compiled_elf_path,
+    success)`` 4-tuple as the single-item path so callers can swap
+    seamlessly. Failure semantics also match: any per-job
+    ``success=False`` re-raises as :class:`FeedbackError`, letting the
+    RL fix-loop catch it unchanged.
+    """
+    if batch_client is None:
+        return await compile_and_run_riscv(
+            main_filepath, kernel_filepath, gpu, timer, logger,
+            timeout=timeout,
+            num_runs=num_runs,
+            io_npz_path=io_npz_path,
+            spike_args_str=spike_args_str,
+            passed_keyword=passed_keyword,
+        )
+
+    job_name = str(kernel_filepath)
+    timer.start("compilation")
+    compiled_path = await compile_riscv(
+        main_filepath, kernel_filepath, gpu, timeout, job_name,
+    )
+    logger.info(
+        f"RISC-V compilation completed in {timer.stop('compilation'):.2f}s"
+    )
+
+    # ``kernel_id`` = the ELF stem. spike/firesim strategies key
+    # per-kernel WALL_CYCLES markers off ``Path(job.filename).stem``,
+    # and the compile server already generates UUID-based ELF paths
+    # (compile_server.py:222), so this is unique across concurrent
+    # rollouts by construction.
+    kernel_id = Path(compiled_path).stem
+
+    timer.start("kernel_executions")
+    result = await batch_client.submit_riscv(
+        binary_path=Path(compiled_path),
+        io_npz_path=io_npz_path,
+        timeout=timeout,
+        spike_args_str=spike_args_str,
+        kernel_id=kernel_id,
+        n_runs=num_runs,
+    )
+    logger.info(
+        f"RISC-V batched execution completed in "
+        f"{timer.stop('kernel_executions'):.2f}s (job={kernel_id})"
+    )
+
+    if not result.success:
+        raise FeedbackError(
+            f"RISC-V batched exec {job_name} failed: "
+            f"{result.message or 'unknown'}"
+        )
+
+    stdout_list = (
+        result.stdout if isinstance(result.stdout, list) else [result.stdout]
+    )
+    stderr_list = (
+        result.stderr if isinstance(result.stderr, list) else [result.stderr]
+    )
+
+    success = True
+    if passed_keyword is not None:
+        for i, s in enumerate(stdout_list):
+            if passed_keyword.lower() not in s.lower():
+                logger.info(
+                    f"Keyword '{passed_keyword}' missing in RISC-V run {i+1}"
+                )
+                success = False
+                break
+
+    return stdout_list, stderr_list, compiled_path, success

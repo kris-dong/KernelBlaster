@@ -395,6 +395,7 @@ async def async_main(args: argparse.Namespace) -> int:
         max_fix_attempts=args.max_fix_attempts,
         io_npz_path=io_npz,
         spike_args_str=args.spike_extra_args or "",
+        use_exec_batching=not args.no_exec_batching,
     )
 
     logger.info("=" * 72)
@@ -456,6 +457,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--bandit-c", type=float, default=1.4)
     p.add_argument("--prune-patience", type=int, default=2)
     p.add_argument("--max-fix-attempts", type=int, default=2)
+    p.add_argument(
+        "--no-exec-batching",
+        action="store_true",
+        help="Disable client-side /gpu/batch coalescing. Default is "
+             "enabled — coalesces concurrent-rollout exec calls into "
+             "one batched HTTP round-trip. Tune size/wait via env "
+             "KERNELBLASTER_EXEC_BATCH_SIZE / _MAX_WAIT_MS.",
+    )
     p.add_argument("--timeout-min", type=int, default=60,
                    help="Overall RL-loop timeout (minutes).")
 
