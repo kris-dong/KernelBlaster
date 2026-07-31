@@ -43,25 +43,36 @@ them as coarse priors, not calibrated values — the RL loop updates
 
 ## RVV Canonical Idioms (single-instruction forms — prefer these)
 
+**RVV 1.0 intrinsic naming** — this toolchain requires ALL vector
+intrinsics to be prefixed with `__riscv_`. The pre-1.0 unprefixed names
+(`vfmax_vf_f32m8` etc.) fail with `implicit declaration of function` at
+compile time; only `__riscv_vfmax_vf_f32m8` and its kin are recognised.
+
 The RVV V extension has direct scalar-argument intrinsics for the common
-elementwise patterns. Emitting `vmfgt` + `vmerge` when a single-op form
-exists is a common LLM mistake — it triples the vector-unit work for no
-functional gain.
+elementwise patterns. Emitting `__riscv_vmfgt` + `__riscv_vmerge` when a
+single-op form exists is a common LLM mistake — it triples the vector-
+unit work for no functional gain.
 
 | Op | ONE-OP form | Wrong (3-op) form to avoid |
 |---|---|---|
-| `y = max(x, 0)` (ReLU) | `vfmax_vf_f32m8(x, 0.0f, vl)` | `vmfgt_vf_*` + `vmerge_vvm_*` |
-| `y = min(x, cap)` (clamp-max) | `vfmin_vf_f32m8(x, cap, vl)` | `vmflt_vf_*` + `vmerge_vvm_*` |
-| `y = max(x, y)` (elementwise max) | `vfmax_vv_f32m8(x, y, vl)` | mask + merge |
-| `y = |x|` | `vfabs_v_f32m8(x, vl)` | shift + mask hack |
-| `y = a * b + c` (FMA) | `vfmacc_vv_f32m8(c, a, b, vl)` | `vfmul` + `vfadd` (2 ops, but breaks fma fusion) |
-| `s = sum(x[:])` | `vfredosum_vs_f32m8_f32m1(...)` | scalar reduction loop |
-| `m = max(x[:])` | `vfredmax_vs_f32m8_f32m1(...)` | scalar max loop |
-| `y = sign(a) * |b|` | `vfsgnj_vv_f32m8(b, a, vl)` | bit manipulation |
+| `y = max(x, 0)` (ReLU) | `__riscv_vfmax_vf_f32m8(x, 0.0f, vl)` | `__riscv_vmfgt_vf_*` + `__riscv_vmerge_vvm_*` |
+| `y = min(x, cap)` (clamp-max) | `__riscv_vfmin_vf_f32m8(x, cap, vl)` | `__riscv_vmflt_vf_*` + `__riscv_vmerge_vvm_*` |
+| `y = max(x, y)` (elementwise max) | `__riscv_vfmax_vv_f32m8(x, y, vl)` | mask + merge |
+| `y = |x|` | `__riscv_vfabs_v_f32m8(x, vl)` | shift + mask hack |
+| `y = a * b + c` (FMA) | `__riscv_vfmacc_vv_f32m8(c, a, b, vl)` | `__riscv_vfmul` + `__riscv_vfadd` (2 ops, but breaks fma fusion) |
+| `s = sum(x[:])` | `__riscv_vfredosum_vs_f32m8_f32m1(...)` | scalar reduction loop |
+| `m = max(x[:])` | `__riscv_vfredmax_vs_f32m8_f32m1(...)` | scalar max loop |
+| `y = sign(a) * |b|` | `__riscv_vfsgnj_vv_f32m8(b, a, vl)` | bit manipulation |
 | `y = x * scale` (widen memory op) | LMUL=m8 stripmine | LMUL=m2 (misses free bandwidth) |
 
 For any comparison-with-constant that reduces to max/min/clamp/abs/sign,
-there is a direct `vf*_vf_*` intrinsic. Reach for it FIRST.
+there is a direct `__riscv_vf*_vf_*` intrinsic. Reach for it FIRST.
+
+Load/store patterns:
+- `__riscv_vsetvl_e32m8(n - i)` — request VL for remaining elements
+- `__riscv_vle32_v_f32m8(&input[i], vl)` — stride-1 load
+- `__riscv_vse32_v_f32m8(&output[i], v, vl)` — stride-1 store
+- `__riscv_vle32_v_f32m8_m(mask, &input[i], vl)` — masked load
 
 ---
 
