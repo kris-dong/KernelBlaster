@@ -247,15 +247,12 @@ class SpikeExecStrategy(ExecStrategy):
         """
         if self._modelblaster_root is None:
             return _all_failed(jobs, "SpikeExecStrategy: modelblaster_root not configured")
-        if self._multi_link_script is None:
-            # No multi-link plumbing → force per-item fallback.
-            raise BatchTooLargeError(
-                "SpikeExecStrategy: multi_link_script not configured "
-                "(cannot fuse batch)",
-                suggested_split=1,
-            )
         if len(jobs) == 1:
-            # Degenerate batch — no reason to fuse.
+            # Degenerate batch — no reason to fuse. Handled BEFORE the
+            # multi_link_script check because a batch of 1 needs no
+            # fusion; the T1 coordinator can flush a lone job through
+            # /gpu/batch and we should serve it as a single-item run
+            # rather than rejecting for missing fusion plumbing.
             [j] = jobs
             try:
                 stdout, stderr = await self.exec(
@@ -274,6 +271,14 @@ class SpikeExecStrategy(ExecStrategy):
             except Exception as e:
                 msg = getattr(e, "error_message", None) or str(e)
                 return [ExecJobResult(success=False, message=msg)]
+        if self._multi_link_script is None:
+            # No multi-link plumbing for a batch of N>1 → force per-item
+            # fallback via base ExecStrategy._split_and_retry.
+            raise BatchTooLargeError(
+                "SpikeExecStrategy: multi_link_script not configured "
+                "(cannot fuse batch)",
+                suggested_split=1,
+            )
 
         # 1) Link N ELFs into one — hands off to the user-configured
         #    fuse script. Names the output ``fused.elf`` in a per-worker

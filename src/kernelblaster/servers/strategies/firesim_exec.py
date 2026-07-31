@@ -328,17 +328,13 @@ class FireSimExecStrategy(ExecStrategy):
         so callers see per-job success/failure inline instead of an
         all-or-nothing batch failure.
         """
-        if self._multi_link_script is None:
-            # No multi-link plumbing → force per-item fallback via
-            # base ExecStrategy._split_and_retry.
-            raise BatchTooLargeError(
-                "FireSimExecStrategy: multi_link_script not configured "
-                "(cannot fuse batch)",
-                suggested_split=1,
-            )
         if len(jobs) == 1:
             # Degenerate batch — one boot per candidate anyway, so
-            # skip fusion entirely.
+            # skip fusion entirely. Handled BEFORE the multi_link_script
+            # check because a batch of 1 needs no fusion — the coordinator
+            # from T1 flushes even a lone job through /gpu/batch, and it
+            # would be wrong to reject those when the whole point of the
+            # single-item path is that no fusion is needed.
             [j] = jobs
             try:
                 stdout, stderr = await self.exec(
@@ -357,6 +353,14 @@ class FireSimExecStrategy(ExecStrategy):
             except Exception as e:
                 msg = getattr(e, "error_message", None) or str(e)
                 return [ExecJobResult(success=False, message=msg)]
+        if self._multi_link_script is None:
+            # No multi-link plumbing for a batch of N>1 → force per-item
+            # fallback via base ExecStrategy._split_and_retry.
+            raise BatchTooLargeError(
+                "FireSimExecStrategy: multi_link_script not configured "
+                "(cannot fuse batch)",
+                suggested_split=1,
+            )
 
         with tempfile.TemporaryDirectory(
             prefix=f"kb_firesim_fuse_w{worker_id}_",

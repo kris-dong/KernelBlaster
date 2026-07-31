@@ -95,6 +95,25 @@ if [[ -n "${KERNEL_CFLAGS}" ]]; then
     WEST_CMAKE_ARGS+=("-DMODELBLASTER_KERNEL_CFLAGS=${KERNEL_CFLAGS}")
 fi
 
+# modelblaster's utilization-aware sizing (BENCH_TARGET_MB=256 default) can
+# overflow the stock 256MB ram0 region. _run_lib.sh's auto-ram0 logic writes
+# a ``ram0.overlay`` alongside the generated skeleton that resizes the RAM
+# region for BOTH runners. The RL loop's bridge bypasses _run_lib.sh (goes
+# straight to west build), so pick up the overlay here explicitly.
+RAM0_OVERLAY="${STAGE}/generated/ram0.overlay"
+if [[ -f "${RAM0_OVERLAY}" ]]; then
+    WEST_CMAKE_ARGS+=("-DDTC_OVERLAY_FILE=${RAM0_OVERLAY}")
+fi
+
+# Baked io > 2GB (or the .mb_bigio section above the stock .bss layout)
+# needs the RISC-V large code model. Honor CMODEL_LARGE=1 the same way
+# _run_lib.sh does. Default off so small problems stay in the ±2GiB
+# medany span; setting it once per RL run enables the same fitness the
+# baseline build was configured with.
+if [[ "${CMODEL_LARGE:-0}" == "1" ]]; then
+    WEST_CMAKE_ARGS+=("-DCONFIG_RISCV_CMODEL_LARGE=y")
+fi
+
 west build -p "${PRISTINE}" -b "${BOARD}" modelblaster/harness \
     --build-dir "${BUILD_DIR}" \
     -- "${WEST_CMAKE_ARGS[@]}"
