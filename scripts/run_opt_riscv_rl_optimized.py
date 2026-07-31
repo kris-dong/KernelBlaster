@@ -260,6 +260,11 @@ def start_firesim_exec_server(
         cmd += ["--firesim-default-timeout", str(args.firesim_default_timeout)]
     if args.firesim_python_bin:
         cmd += ["--firesim-python-bin", args.firesim_python_bin]
+    # Optional: enable batched-boot fusion when a script path is set.
+    # Same flag the spike strategy reads — the fuse script's
+    # $FUSE_TARGET env var tells it which board to link for.
+    if args.multi_link_script:
+        cmd += ["--multi-link-script", str(args.multi_link_script)]
 
     logger.info(f"Starting firesim exec server: {shlex.join(cmd)}")
     p = subprocess.Popen(cmd, cwd=str(REPO_ROOT))
@@ -567,6 +572,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--firesim-python-bin", default=None,
                    help="Python interpreter for firesim_runner (defaults "
                         "to sys.executable).")
+    p.add_argument("--multi-link-script", default=None,
+                   help="Path to the multi-kernel fusion script (same "
+                        "protocol for spike + firesim: stdin manifest, "
+                        "$FUSED_OUT env). Enables batched-boot fusion — "
+                        "N candidates per firesim runworkload. Absent = "
+                        "batches of >1 fall back to per-item.")
 
     p.add_argument("--experiment-name", default=None)
     p.add_argument("--out-root", default=None,

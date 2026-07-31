@@ -345,6 +345,11 @@ def _strategy_init_kwargs(strategy_name: str) -> dict:
             firesim_root=getattr(args, "firesim_root", None),
             firesim_env=getattr(args, "firesim_env", None),
             modelblaster_root=getattr(args, "modelblaster_root", None),
+            # Shares the ``--multi-link-script`` flag with spike since
+            # the fusion protocol (stdin manifest, $FUSED_OUT env,
+            # BATCH_RELOC_ERROR_RE) is identical. Absent = batches of
+            # >1 fall back to per-item via BatchTooLargeError.
+            multi_link_script=getattr(args, "multi_link_script", None),
             queue_enabled=not getattr(args, "no_firesim_queue", False),
             queue_root=getattr(args, "firesim_queue_root", None),
             queue_bin=getattr(args, "firesim_queue_bin", None),

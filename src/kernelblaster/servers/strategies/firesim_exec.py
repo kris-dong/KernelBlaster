@@ -56,7 +56,19 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-from ..utils.exec_strategy import ExecJob, ExecJobResult, ExecStrategy
+from ..utils.exec_strategy import (
+    BatchTooLargeError,
+    ExecJob,
+    ExecJobResult,
+    ExecStrategy,
+)
+# The multi-link fusion protocol + WALL_CYCLES parse regex are shared
+# with SpikeExecStrategy — same modelblaster harness convention, same
+# per-model marker shape. Rather than duplicate 100 lines of tricky
+# regex + subprocess plumbing, import the pieces we can reuse. If we
+# ever grow a third RISC-V exec target, promote these to a shared
+# ``strategies/utils/riscv_batching.py``.
+from .spike_exec import _WALL_CYCLES_RE, _kernel_id_for
 
 
 class FireSimError(Exception):
@@ -98,9 +110,15 @@ class FireSimExecStrategy(ExecStrategy):
     """
 
     name = "firesim"
-    # T2 lands single-item only. T3 flips this to True + adds a
-    # ``_batch_exec_impl`` that fuses N kernel ELFs into one boot.
-    supports_batching = False
+    # T3: fuse N kernel drop-ins into one Zephyr boot per firesim
+    # runworkload. Amortises the multi-minute infrasetup + boot cost
+    # across the whole batch — the actual FPGA-overhead payoff.
+    # ``_multi_link_script`` must be configured for a batch of >1 to
+    # go through the fused path; absent = every batch fires
+    # BatchTooLargeError and the base ExecStrategy falls back to
+    # per-item, so this defaults to safe-but-slow when the fusion
+    # plumbing isn't wired.
+    supports_batching = True
 
     def __init__(
         self,
@@ -108,6 +126,7 @@ class FireSimExecStrategy(ExecStrategy):
         firesim_root: Optional[str] = None,
         firesim_env: Optional[str] = None,
         modelblaster_root: Optional[Path] = None,
+        multi_link_script: Optional[Path] = None,
         queue_enabled: bool = True,
         queue_root: Optional[str] = None,
         queue_bin: Optional[str] = None,
@@ -159,6 +178,9 @@ class FireSimExecStrategy(ExecStrategy):
             Path(modelblaster_root)
             if modelblaster_root
             else _resolve_modelblaster_root()
+        )
+        self._multi_link_script = (
+            Path(multi_link_script) if multi_link_script is not None else None
         )
         self._queue_enabled = queue_enabled
         self._queue_root = queue_root
@@ -271,6 +293,262 @@ class FireSimExecStrategy(ExecStrategy):
                     f"not executable. Runs will fail — did the miniforge "
                     f"env path change?"
                 )
+        if self._multi_link_script is not None and not self._multi_link_script.exists():
+            self._logger.warning(
+                f"FireSimExecStrategy: multi_link_script "
+                f"{self._multi_link_script} does not exist. Batches of >1 "
+                f"will fall back to per-item runs (BatchTooLargeError → "
+                f"split_and_retry)."
+            )
+
+    # ------------------------------------------------------------------
+    # Batched exec — fuse N kernel ELFs into one Zephyr boot, submit ONE
+    # firesim runworkload, parse per-model markers.
+    # ------------------------------------------------------------------
+
+    async def _batch_exec_impl(
+        self,
+        *,
+        worker_id: int,
+        jobs: list[ExecJob],
+    ) -> list[ExecJobResult]:
+        """Fuse N Zephyr ELFs into one multi-model boot ELF, run it
+        through ``firesim_runner --models n1,n2,...``, parse per-model
+        output.
+
+        Contract identical to :meth:`SpikeExecStrategy._batch_exec_impl`
+        — same manifest into ``_multi_link_script``, same WALL_CYCLES
+        marker convention on the way back out. Only the transport
+        differs (firesim_runner vs. spike_runner).
+
+        Raises :class:`BatchTooLargeError` when
+        ``_multi_link_script`` is unset OR the link step overflows
+        RISC-V PC-relative relocations — the base
+        :meth:`ExecStrategy.batch_exec` catches that and subdivides,
+        so callers see per-job success/failure inline instead of an
+        all-or-nothing batch failure.
+        """
+        if self._multi_link_script is None:
+            # No multi-link plumbing → force per-item fallback via
+            # base ExecStrategy._split_and_retry.
+            raise BatchTooLargeError(
+                "FireSimExecStrategy: multi_link_script not configured "
+                "(cannot fuse batch)",
+                suggested_split=1,
+            )
+        if len(jobs) == 1:
+            # Degenerate batch — one boot per candidate anyway, so
+            # skip fusion entirely.
+            [j] = jobs
+            try:
+                stdout, stderr = await self.exec(
+                    worker_id=worker_id,
+                    binary_data=j.binary_data,
+                    filename=j.filename,
+                    args=j.args,
+                    env_vars=j.env_vars,
+                    prefix_command=j.prefix_command,
+                    n_runs=j.n_runs,
+                    timeout=j.timeout,
+                    kernel_files=j.kernel_files,
+                    profile=j.profile,
+                )
+                return [ExecJobResult(stdout=stdout, stderr=stderr, success=True)]
+            except Exception as e:
+                msg = getattr(e, "error_message", None) or str(e)
+                return [ExecJobResult(success=False, message=msg)]
+
+        with tempfile.TemporaryDirectory(
+            prefix=f"kb_firesim_fuse_w{worker_id}_",
+        ) as td:
+            fused_elf = await self._link_batch_elf(
+                worker_id=worker_id, td=Path(td), jobs=jobs,
+            )
+            model_names = [_kernel_id_for(j) for j in jobs]
+            io_paths = self._collect_io_paths(jobs, model_names)
+
+            # Longest per-job timeout dominates the fused run.
+            timeout = max(
+                (j.timeout for j in jobs), default=self._default_timeout,
+            )
+
+            cmd = self._build_multi_cmd(
+                elf_path=fused_elf,
+                model_names=model_names,
+                io_paths=io_paths,
+                extra_args=self._parse_firesim_args(""),
+                timeout=timeout,
+            )
+            env = self._build_env(per_job_env=None)
+            self._logger.info(
+                f"[Worker {worker_id}]: firesim batch of {len(jobs)}: "
+                f"models={','.join(model_names)}"
+            )
+            stdout, stderr = await self._run_cmd(
+                cmd, env=env, timeout=timeout,
+            )
+
+        return self._parse_batch_output(jobs, model_names, stdout, stderr)
+
+    async def _link_batch_elf(
+        self,
+        *,
+        worker_id: int,
+        td: Path,
+        jobs: list[ExecJob],
+    ) -> Path:
+        """Invoke ``_multi_link_script`` to fuse N kernel ELFs into
+        one ``fused.elf``. Same protocol as spike's fuser:
+
+        * Reads a manifest of ``<model_name> <staged_dir>`` lines
+          from stdin.
+        * Writes fused ELF to ``$FUSED_OUT``.
+        * Non-zero rc + reloc marker in stderr →
+          :class:`BatchTooLargeError`.
+        """
+        assert self._multi_link_script is not None
+        model_names = [_kernel_id_for(j) for j in jobs]
+
+        manifest_lines: list[str] = []
+        for j, name in zip(jobs, model_names):
+            staged = td / name
+            staged.mkdir()
+            (staged / "prebuilt.elf").write_bytes(j.binary_data)
+            manifest_lines.append(f"{name} {staged}")
+
+        fused_out = td / "fused.elf"
+        env = os.environ.copy()
+        env["FUSED_OUT"] = str(fused_out)
+        env["FUSE_WORKER_ID"] = str(worker_id)
+        # firesim wants a chipyard_riscv64 board; spike wants
+        # spike_riscv64. Advertise which so the shared script can
+        # branch.
+        env["FUSE_TARGET"] = "firesim"
+
+        proc = await asyncio.create_subprocess_exec(
+            str(self._multi_link_script),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        stdout_b, stderr_b = await proc.communicate(
+            input="\n".join(manifest_lines).encode(),
+        )
+        stderr = stderr_b.decode(errors="replace")
+
+        if proc.returncode != 0:
+            from .fpga_exec import BATCH_RELOC_ERROR_RE
+            if BATCH_RELOC_ERROR_RE.search(stderr):
+                raise BatchTooLargeError(
+                    f"multi_link_script hit reloc limit at N={len(jobs)}. "
+                    f"stderr tail: {stderr[-500:]}",
+                    suggested_split=max(1, len(jobs) // 2),
+                )
+            raise FireSimError(
+                f"multi_link_script failed rc={proc.returncode}. "
+                f"stderr tail: {stderr[-500:]}"
+            )
+
+        if not fused_out.exists():
+            raise FireSimError(
+                f"multi_link_script exited 0 but did not produce {fused_out}"
+            )
+        return fused_out
+
+    def _build_multi_cmd(
+        self,
+        *,
+        elf_path: Path,
+        model_names: list[str],
+        io_paths: Optional[dict[str, str]],
+        extra_args: tuple[str, ...],
+        timeout: float,
+    ) -> list[str]:
+        """Multi-model firesim_runner invocation.
+
+        ``firesim_runner`` accepts ``--models n1,n2,...`` and the
+        parallel ``--io-paths n1=<npz1>,n2=<npz2>`` shape (see
+        firesim_runner.py:807-816); the response format is the same
+        WALL_CYCLES-per-model that spike_runner emits, so the parser
+        below is shared.
+        """
+        cmd = [
+            self._python_bin, "-m", "modelblaster.validation.firesim_runner",
+            "--elf", str(elf_path),
+            "--models", ",".join(model_names),
+            "--timeout", str(int(timeout)),
+        ]
+        if io_paths:
+            cmd += [
+                "--io-paths",
+                ",".join(f"{k}={v}" for k, v in io_paths.items()),
+            ]
+        cmd.extend(extra_args)
+        return cmd
+
+    def _collect_io_paths(
+        self,
+        jobs: list[ExecJob],
+        model_names: list[str],
+    ) -> Optional[dict[str, str]]:
+        """Per-model io.npz mapping for ``--io-paths``. Absent io.npz
+        means verify-only for that model (relies on the in-binary
+        MODELBLASTER_VERIFY marker)."""
+        out: dict[str, str] = {}
+        for j, name in zip(jobs, model_names):
+            io = self._pick_io_npz(j.kernel_files)
+            if io is not None:
+                out[name] = str(io)
+        return out or None
+
+    def _parse_batch_output(
+        self,
+        jobs: list[ExecJob],
+        model_names: list[str],
+        stdout: str,
+        stderr: str,
+    ) -> list[ExecJobResult]:
+        """Distribute firesim_runner stdout back to per-job results.
+
+        The runner emits ``=== MODELBLASTER_WALL_CYCLES [<name>@<quant>] === N``
+        once per model (wrapped in the
+        ``=== MODELBLASTER_RAW_FIRESIM_{BEGIN,END} ===`` markers the
+        runner adds around the uartlog). Same shape as spike, so we
+        share the regex and slice by WALL-to-WALL boundaries.
+
+        Missing markers → per-job failure with a clear message.
+        """
+        matches: list[tuple[int, int, str]] = []
+        for m in _WALL_CYCLES_RE.finditer(stdout):
+            tag = m.group("name") or ""
+            base = tag.split("@", 1)[0]
+            matches.append((m.start(), m.end(), base))
+
+        per_name: dict[str, str] = {}
+        prev_wall_end = 0
+        for start, end, base in matches:
+            window = stdout[prev_wall_end:end]
+            per_name[base] = window
+            prev_wall_end = end
+
+        results: list[ExecJobResult] = []
+        for j, name in zip(jobs, model_names):
+            block = per_name.get(name)
+            if block is None:
+                results.append(ExecJobResult(
+                    stdout="", stderr=stderr,
+                    success=False,
+                    message=(
+                        f"firesim output for model {name} missing "
+                        f"MODELBLASTER_WALL_CYCLES marker"
+                    ),
+                ))
+                continue
+            results.append(ExecJobResult(
+                stdout=block.strip(), stderr="", success=True,
+            ))
+        return results
 
     # ------------------------------------------------------------------
     # Internal helpers — decomposed so tests can substitute individual
