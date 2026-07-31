@@ -42,6 +42,7 @@ from .local_exec import LocalExecStrategy
 from .remote_exec import RemoteExecStrategy
 from .fpga_exec import FPGAExecStrategy
 from .spike_exec import SpikeExecStrategy
+from .firesim_exec import FireSimExecStrategy
 
 # Self-registration on import — the unified compile server just
 # imports this package and can dispatch per-request.
@@ -56,6 +57,7 @@ register_exec_strategy(LocalExecStrategy)
 register_exec_strategy(RemoteExecStrategy)
 register_exec_strategy(FPGAExecStrategy)
 register_exec_strategy(SpikeExecStrategy)
+register_exec_strategy(FireSimExecStrategy)
 
 __all__ = [
     # Compile strategies
@@ -74,6 +76,7 @@ __all__ = [
     "RemoteExecStrategy",
     "FPGAExecStrategy",
     "SpikeExecStrategy",
+    "FireSimExecStrategy",
     "get_exec_strategy_cls",
     "register_exec_strategy",
 ]

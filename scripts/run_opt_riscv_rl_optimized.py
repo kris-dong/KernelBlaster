@@ -222,6 +222,55 @@ def start_spike_exec_server(
     return url
 
 
+def start_firesim_exec_server(
+    port: int,
+    modelblaster_root: Path,
+    args: argparse.Namespace,
+) -> str:
+    """Start the framework's exec server with the firesim strategy.
+
+    Mirrors :func:`start_spike_exec_server` but wires through the
+    firesim-runner-specific flags: chipyard root, env.sh, queue on/off,
+    priority, timeout. Values default to env-var fallback inside the
+    strategy, so a minimal CLI still works when FIRESIM_ROOT etc. are
+    already exported.
+    """
+    cmd = [
+        sys.executable, "-m", "src.kernelblaster.servers.exec_server",
+        "--host", "127.0.0.1", "--port", str(port),
+        "--strategy", "firesim",
+        "--modelblaster-root", str(modelblaster_root),
+        "--num-workers", "1",
+    ]
+    if args.firesim_root:
+        cmd += ["--firesim-root", args.firesim_root]
+    if args.firesim_env:
+        cmd += ["--firesim-env", args.firesim_env]
+    if args.no_firesim_queue:
+        cmd += ["--no-firesim-queue"]
+    if args.firesim_queue_root:
+        cmd += ["--firesim-queue-root", args.firesim_queue_root]
+    if args.firesim_queue_bin:
+        cmd += ["--firesim-queue-bin", args.firesim_queue_bin]
+    if args.firesim_queue_priority is not None:
+        cmd += ["--firesim-queue-priority", str(args.firesim_queue_priority)]
+    if args.firesim_queue_timeout is not None:
+        cmd += ["--firesim-queue-timeout", str(args.firesim_queue_timeout)]
+    if args.firesim_default_timeout is not None:
+        cmd += ["--firesim-default-timeout", str(args.firesim_default_timeout)]
+    if args.firesim_python_bin:
+        cmd += ["--firesim-python-bin", args.firesim_python_bin]
+
+    logger.info(f"Starting firesim exec server: {shlex.join(cmd)}")
+    p = subprocess.Popen(cmd, cwd=str(REPO_ROOT))
+    _SPAWNED_PROCS.append(p)
+    url = f"http://127.0.0.1:{port}"
+    if not _wait_healthy(url):
+        raise RuntimeError(f"firesim exec server at {url} did not become healthy in 30s")
+    logger.info(f"FireSim exec server healthy at {url}")
+    return url
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -270,15 +319,29 @@ async def async_main(args: argparse.Namespace) -> int:
     artifacts_dir = Path(args.artifacts_dir).resolve()
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     compile_url = start_compile_server(args.compile_port, artifacts_dir)
-    spike_binary = args.spike_binary or shutil.which("spike")
-    if not spike_binary:
-        raise SystemExit("spike binary not on PATH; pass --spike-binary")
-    exec_url = start_spike_exec_server(
-        args.exec_port, modelblaster_root, spike_binary=spike_binary,
-    )
+    if args.strategy == "firesim":
+        exec_url = start_firesim_exec_server(
+            args.exec_port, modelblaster_root, args,
+        )
+    else:
+        spike_binary = args.spike_binary or shutil.which("spike")
+        if not spike_binary:
+            raise SystemExit("spike binary not on PATH; pass --spike-binary")
+        exec_url = start_spike_exec_server(
+            args.exec_port, modelblaster_root, spike_binary=spike_binary,
+        )
 
     # 4. Wire the framework's URL config to these servers.
     os.environ["COMPILE_SERVER_URL"] = compile_url
+    # When --strategy=firesim, override --gpu to match unless the user
+    # explicitly picked a RISC-V FPGA target — the agent's compile
+    # server dispatches on GPUType.zephyr_board, and spike vs. firesim
+    # need different boards (spike_riscv64 vs. chipyard_riscv64/...).
+    if args.strategy == "firesim" and args.gpu == "riscv_spike":
+        args.gpu = "riscv_fpga_zephyr"
+        logger.info(
+            "Overriding --gpu to riscv_fpga_zephyr for --strategy=firesim"
+        )
     os.environ[f"GPU_SERVER_URL_{args.gpu.upper()}"] = exec_url
     os.environ["KERNELBLASTER_RISCV_COMPILE_SERVER_URL"] = compile_url
     config.COMPILE_SERVER_URL = compile_url
@@ -468,7 +531,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout-min", type=int, default=60,
                    help="Overall RL-loop timeout (minutes).")
 
-    # Server + spike knobs.
+    # Server + exec-strategy knobs.
+    p.add_argument("--strategy", choices=["spike", "firesim"], default="spike",
+                   help="Exec strategy: 'spike' (functional simulator, "
+                        "default) or 'firesim' (FPGA via "
+                        "modelblaster.validation.firesim_runner). Selects "
+                        "the exec server strategy and the RL agent's "
+                        "GPUType inference.")
     p.add_argument("--compile-port", type=int, default=22401)
     p.add_argument("--exec-port", type=int, default=22402)
     p.add_argument("--artifacts-dir", default="/tmp/kb_riscv_artifacts")
@@ -476,6 +545,28 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Path to spike; falls back to PATH lookup.")
     p.add_argument("--spike-extra-args", default=None,
                    help="Comma-list of extra --spike-arg values (e.g. 'isa=rv64gc').")
+
+    # FireSim strategy knobs — only consulted when --strategy=firesim.
+    p.add_argument("--firesim-root", default=None,
+                   help="<chipyard>/sims/firesim. Overrides FIRESIM_ROOT.")
+    p.add_argument("--firesim-env", default=None,
+                   help="chipyard env.sh. Overrides FIRESIM_ENV.")
+    p.add_argument("--no-firesim-queue", action="store_true",
+                   help="Skip on-host firesim queue; drive firesim direct.")
+    p.add_argument("--firesim-queue-root", default=None,
+                   help="FIRESIM_QUEUE_ROOT (e.g. /scratch/dima/firesim_queue).")
+    p.add_argument("--firesim-queue-bin", default=None,
+                   help="firesim-queue CLI path.")
+    p.add_argument("--firesim-queue-priority", type=int, default=5,
+                   help="FIRESIM_QUEUE_PRIORITY.")
+    p.add_argument("--firesim-queue-timeout", type=int, default=None,
+                   help="FIRESIM_QUEUE_TIMEOUT — daemon-side wall cap. "
+                        "Absent = let workload run to natural completion.")
+    p.add_argument("--firesim-default-timeout", type=int, default=900,
+                   help="Fallback subprocess timeout (seconds).")
+    p.add_argument("--firesim-python-bin", default=None,
+                   help="Python interpreter for firesim_runner (defaults "
+                        "to sys.executable).")
 
     p.add_argument("--experiment-name", default=None)
     p.add_argument("--out-root", default=None,

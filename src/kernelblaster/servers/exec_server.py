@@ -336,6 +336,23 @@ def _strategy_init_kwargs(strategy_name: str) -> dict:
             multi_link_script=getattr(args, "multi_link_script", None),
             default_spike_args=default_spike_args,
         )
+    if strategy_name == "firesim":
+        # queue_timeout=None means "let the workload run to natural
+        # completion" — the runner + queue both interpret that as
+        # "no daemon SIGTERM watchdog"; add a per-job override at
+        # submit time when a cap is needed.
+        return dict(
+            firesim_root=getattr(args, "firesim_root", None),
+            firesim_env=getattr(args, "firesim_env", None),
+            modelblaster_root=getattr(args, "modelblaster_root", None),
+            queue_enabled=not getattr(args, "no_firesim_queue", False),
+            queue_root=getattr(args, "firesim_queue_root", None),
+            queue_bin=getattr(args, "firesim_queue_bin", None),
+            queue_priority=getattr(args, "firesim_queue_priority", 5),
+            queue_timeout_s=getattr(args, "firesim_queue_timeout", None),
+            default_timeout=float(getattr(args, "firesim_default_timeout", 900)),
+            python_bin=getattr(args, "firesim_python_bin", None),
+        )
     return {}
 
 
@@ -620,6 +637,39 @@ def main():
     parser.add_argument("--spike-extra-args", type=str, default=None,
                         help="Comma-separated list of --spike-arg values "
                              "injected into every spike run (e.g. 'isa=rv64gcv').")
+
+    # FireSim strategy (--strategy firesim). Reuses --modelblaster-root
+    # from the spike group above (modelblaster.validation.firesim_runner
+    # needs the same PYTHONPATH root).
+    parser.add_argument("--firesim-root", type=str, default=None,
+                        help="firesim install root "
+                             "(<chipyard>/sims/firesim). Overrides FIRESIM_ROOT.")
+    parser.add_argument("--firesim-env", type=str, default=None,
+                        help="chipyard env.sh path. Overrides FIRESIM_ENV.")
+    parser.add_argument("--no-firesim-queue", action="store_true",
+                        help="Skip the on-host firesim queue and drive "
+                             "firesim directly. Single-user dev only.")
+    parser.add_argument("--firesim-queue-root", type=str, default=None,
+                        help="FIRESIM_QUEUE_ROOT (e.g. "
+                             "/scratch/dima/firesim_queue).")
+    parser.add_argument("--firesim-queue-bin", type=str, default=None,
+                        help="firesim-queue CLI path.")
+    parser.add_argument("--firesim-queue-priority", type=int, default=5,
+                        help="FIRESIM_QUEUE_PRIORITY (default 5 = middle).")
+    parser.add_argument("--firesim-queue-timeout", type=int, default=None,
+                        help="FIRESIM_QUEUE_TIMEOUT — hard daemon-side cap "
+                             "in seconds. Absent = let the workload run "
+                             "to natural completion.")
+    parser.add_argument("--firesim-default-timeout", type=int, default=900,
+                        help="Default runner timeout when the ExecJob "
+                             "doesn't specify. Should exceed one firesim "
+                             "runworkload (few minutes).")
+    parser.add_argument("--firesim-python-bin", type=str, default=None,
+                        help="Python interpreter to invoke "
+                             "modelblaster.validation.firesim_runner with "
+                             "(defaults to sys.executable; on garden use "
+                             "the miniforge zephyr env).")
+
     parser.add_argument(
         "--log_path", type=Path,
         default=Path("/tmp/kernelblaster/exec_server.log"),
