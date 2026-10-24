@@ -24,6 +24,7 @@ from pathlib import Path
 import shutil
 import re
 import json
+import math
 import itertools  # Added to support fallback logic using itertools.chain
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass, asdict, field
@@ -465,6 +466,10 @@ class GPUOptimizationDatabase:
         # retrieve them directly without having to run additional selection logic.
         # self._llm_recommended_optimizations: Dict[str, OptimizationEntry | CompositeOptimization] = {}
         self._llm_recommended_optimizations: Dict[str, OptimizationEntry] = {}
+        # Finer numerical stats keyed by (state, technique, op_class, arch), plus
+        # a coarse per-step (state, technique) aggregate; see get_speedup_estimate.
+        # Persisted under the additive top-level JSON key "fine_stats".
+        self.fine_stats: Dict[str, Dict[str, Any]] = {}
         
         # Load comprehensive optimization knowledge
         self.gpu_optimization_knowledge = ""
@@ -578,6 +583,7 @@ class GPUOptimizationDatabase:
                     k: [_asdict(o) for o in v] for k, v in self.composite_optimizations.items()
                 },
                 "discovered_states": self.discovered_states,
+                "fine_stats": getattr(self, "fine_stats", {}),
             }
 
             # Guard snapshot writes as well
@@ -760,6 +766,9 @@ class GPUOptimizationDatabase:
 
             # Discovered states metadata
             self.discovered_states = data.get("discovered_states", {})
+            # Finer stats (absent in pre-semantic-KB snapshots)
+            fs = data.get("fine_stats", {})
+            self.fine_stats = fs if isinstance(fs, dict) else {}
 
             # 3) Compose full markdown from current in-memory data and write it
             final_markdown = self.get_database_md_text(include_header_footer=True)
@@ -1521,6 +1530,9 @@ AVAILABLE OPTIMISATIONS:
         state_analysis_response: str,
         code_implementation: str,
         top_n: int = 5, #generated top 5 optimisations options
+        *,
+        knowledge_notes: Optional[str] = None,
+        stats_context: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """Ask the LLM to pick the *top_n* most relevant optimisation techniques.
 
@@ -1540,6 +1552,13 @@ AVAILABLE OPTIMISATIONS:
             preserved for the LLM.
         top_n:
             Number of optimisation candidates to request from the LLM (default 3).
+        knowledge_notes:
+            Optional pre-rendered semantic-knowledge block (claims + "already
+            tried", see ``knowledge.semantic``). ``None``/empty leaves the
+            prompt byte-identical to the legacy one.
+        stats_context:
+            Optional ``{"op_class", "arch"}``; adds measured fine-key stats
+            (>= ``FINE_STATS_MIN_SAMPLES`` samples) to the prompt.
 
         Returns
         -------
@@ -1553,7 +1572,8 @@ AVAILABLE OPTIMISATIONS:
         if self.cheap_llm is not None and self.cheap_llm.is_available():
             try:
                 tiered_plan = await self._generate_optimization_plan_tiered(
-                    state_analysis_response, code_implementation, top_n
+                    state_analysis_response, code_implementation, top_n,
+                    knowledge_notes=knowledge_notes, stats_context=stats_context,
                 )
                 if tiered_plan:
                     return tiered_plan
@@ -1605,6 +1625,12 @@ CODE IMPLEMENTATION:
 ----------------------- AVAILABLE OPTIMISATIONS ----------------------
 {self._build_available_optimisations_summary()}
 """
+        _kb_block = self._knowledge_block(knowledge_notes, stats_context)
+        if _kb_block:
+            prompt += (
+                "\n----------------------- LEARNED KNOWLEDGE ----------------------------\n"
+                + _kb_block + "\n"
+            )
 
         # -------------------- Attempt LLM inference --------------------
         if self.llm_interface and self.llm_interface.is_available():
@@ -1768,6 +1794,9 @@ CODE IMPLEMENTATION:
         state_analysis_response: str,
         code_implementation: str,
         top_n: int = 5,
+        *,
+        knowledge_notes: Optional[str] = None,
+        stats_context: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """Cheap-LLM dispatch for plan generation. Caller is responsible for
         deciding whether this path is appropriate; on failure it raises so the
@@ -1778,6 +1807,13 @@ CODE IMPLEMENTATION:
             f"{state_analysis_response}\n\n"
             "KERNEL SOURCE:\n```cpp\n"
             f"{code_implementation}\n```\n\n"
+        )
+        # Knowledge goes in the per-call user message so the cached system
+        # prompt stays byte-stable.
+        _kb_block = self._knowledge_block(knowledge_notes, stats_context)
+        if _kb_block:
+            user_msg += "LEARNED KNOWLEDGE (from past outcomes):\n" + _kb_block + "\n\n"
+        user_msg += (
             f"Return a JSON array of {top_n} objects with keys "
             "`technique`, `relevance_score`, `description`. No prose."
         )
@@ -1798,8 +1834,13 @@ CODE IMPLEMENTATION:
         ncu_metrics_json: Dict[str, Any],
         strategy_description: str = "",
         best_so_far_summary: Optional[str] = None,
+        knowledge_notes: Optional[str] = None,
     ) -> List[Dict[str, str]]:
         """Build a system+user message pair for codegen with cache-stable system text.
+
+        ``knowledge_notes`` (optional, pre-rendered claims / "already tried"
+        for this technique) is added to the user message only; the system
+        prompt is unchanged so prefix caching still applies.
 
         Replaces the legacy ~6 KB ``generate_strategy_guided_prompt`` system block —
         identical across all codegen calls in a run, so prefix caches will charge
@@ -1833,6 +1874,11 @@ CODE IMPLEMENTATION:
             user_blocks.append(f"STRATEGY NOTE FROM PLAN:\n{strategy_description}")
         if best_so_far_summary:
             user_blocks.append(f"PRIOR-STEP CONTEXT:\n{best_so_far_summary}")
+        if knowledge_notes and knowledge_notes.strip():
+            user_blocks.append(
+                "LEARNED NOTES FOR THIS TECHNIQUE (from past outcomes; heed pitfalls, "
+                "do not repeat dead ends):\n" + knowledge_notes.strip()
+            )
         user_blocks.append(
             "NCU METRICS (Speed-Of-Light, JSON):\n"
             f"{json.dumps(ncu_metrics_json, sort_keys=True)}"
@@ -1855,8 +1901,13 @@ CODE IMPLEMENTATION:
         *,
         broken_kernel: str,
         compiler_error: str,
+        knowledge_notes: Optional[str] = None,
     ) -> List[Dict[str, str]]:
-        """Build a small fix-attempt prompt — bounded payload, no DB injection."""
+        """Build a small fix-attempt prompt — bounded payload, no DB injection.
+
+        ``knowledge_notes`` (optional): known pitfalls + fixes for the
+        technique, appended to the user message when non-empty.
+        """
         err = compiler_error[:1500]
         kernel = broken_kernel
         if len(kernel) > 12000:
@@ -1872,8 +1923,13 @@ CODE IMPLEMENTATION:
             f"{err}\n```\n\n"
             "BROKEN KERNEL:\n```cpp\n"
             f"{kernel}\n```\n\n"
-            "Return the fixed kernel in one ```cpp``` block."
         )
+        if knowledge_notes and knowledge_notes.strip():
+            user_msg += (
+                "KNOWN PITFALLS FOR THIS TECHNIQUE (from past outcomes):\n"
+                + knowledge_notes.strip()[:2000] + "\n\n"
+            )
+        user_msg += "Return the fixed kernel in one ```cpp``` block."
         return [
             {"role": "system", "content": "<!-- cache_control: ephemeral -->\n" + system_prompt},
             {"role": "user", "content": user_msg},
@@ -2276,8 +2332,20 @@ CODE IMPLEMENTATION:
         current_metric: Optional[float] = None,
         baseline_metric: Optional[float] = None,
         current_file_path: Optional[Path] = None,
+        op_class: Optional[str] = None,
+        arch: Optional[str] = None,
+        step_speedup: Optional[float] = None,
     ):
             """Record actuals + rolling speedup for an optimisation entry.
+
+            Besides the legacy coarse fields on the ``OptimizationEntry`` this
+            also records a *per-step* speedup sample in ``fine_stats`` under
+            the (state, technique) key and, when ``op_class`` / ``arch`` are
+            given, under the finer (state, technique, op_class, arch) key
+            (``step_speedup`` if passed, else inferred from the percent
+            ``actual_improvement``). Fine stats are recorded even when the
+            technique is not listed under *state* (the plan can pick it from
+            another state's list).
 
             Speedup calc has three ranked paths (Phase 3c full):
 
@@ -2303,6 +2371,12 @@ CODE IMPLEMENTATION:
                     f"Attempting to update optimization result for {technique} "
                     f"in state {state} with actual improvement {actual_improvement}"
                 )
+            try:
+                self._record_fine_stats(state, technique, actual_improvement,
+                                        op_class=op_class, arch=arch, step_speedup=step_speedup)
+            except Exception as e:  # stats must never break the update
+                if logger:
+                    logger.warning(f"fine_stats update failed: {e}")
             if state not in self.optimization_strategies:
                 return  # nothing to update
             for opt in self.optimization_strategies[state].get("optimizations", []):
@@ -2465,6 +2539,94 @@ CODE IMPLEMENTATION:
                         )
                         # For first-use entries we leave confidence as is.
                         break
+
+    # ------------------------------------------------------------------
+    # Finer numerical stats: (state, technique, op_class, arch)
+    # ------------------------------------------------------------------
+    FINE_STATS_MIN_SAMPLES = 3
+
+    @staticmethod
+    def fine_stats_key(state: str, technique: str, op_class: Optional[str] = None,
+                       arch: Optional[str] = None) -> str:
+        return f"{state}|{technique}|{op_class or '*'}|{arch or '*'}"
+
+    def _record_fine_stats(self, state: str, technique: str, actual_improvement: float, *,
+                           op_class: Optional[str] = None, arch: Optional[str] = None,
+                           step_speedup: Optional[float] = None) -> None:
+        sp = step_speedup
+        if sp is None:
+            denom = 1.0 - float(actual_improvement) / 100.0
+            sp = 1.0 / denom if denom > 1e-6 else None
+        if sp is None or not (sp > 0) or math.isinf(sp):
+            return
+        keys = [self.fine_stats_key(state, technique)]
+        if op_class or arch:
+            keys.append(self.fine_stats_key(state, technique, op_class, arch))
+        now = datetime.now().isoformat()
+        with self._io_lock:
+            for key in keys:
+                st = self.fine_stats.setdefault(key, {"n": 0, "sum_log_speedup": 0.0,
+                                                      "mean_improvement": 0.0, "n_improved": 0,
+                                                      "best_speedup": None, "worst_speedup": None})
+                n = st["n"] + 1
+                st["sum_log_speedup"] += math.log(sp)
+                st["mean_improvement"] = (st["mean_improvement"] * st["n"] + float(actual_improvement)) / n
+                st["n"] = n
+                st["n_improved"] += 1 if sp > 1.02 else 0
+                st["best_speedup"] = sp if st["best_speedup"] is None else max(st["best_speedup"], sp)
+                st["worst_speedup"] = sp if st["worst_speedup"] is None else min(st["worst_speedup"], sp)
+                st["geomean_speedup"] = math.exp(st["sum_log_speedup"] / n)
+                st["last_updated"] = now
+
+    def get_speedup_estimate(self, state: str, technique: str, op_class: Optional[str] = None,
+                             arch: Optional[str] = None,
+                             min_samples: Optional[int] = None) -> Tuple[float, int, str]:
+        """Best available speedup estimate: (speedup, n_samples, source).
+
+        source is ``"fine"`` (state, technique, op_class, arch) when that key has
+        >= ``min_samples`` samples, else ``"coarse"`` (per-step (state, technique)
+        aggregate), else ``"legacy"`` (``OptimizationEntry.predicted_speedup``),
+        else ``"prior"`` (1.0).
+        """
+        ms = self.FINE_STATS_MIN_SAMPLES if min_samples is None else min_samples
+        if op_class or arch:
+            st = self.fine_stats.get(self.fine_stats_key(state, technique, op_class, arch))
+            if st and st.get("n", 0) >= ms:
+                return float(st["geomean_speedup"]), int(st["n"]), "fine"
+        st = self.fine_stats.get(self.fine_stats_key(state, technique))
+        if st and st.get("n", 0) > 0:
+            return float(st["geomean_speedup"]), int(st["n"]), "coarse"
+        for opt in self.optimization_strategies.get(state, {}).get("optimizations", []):
+            if opt.technique == technique and opt.usage_count:
+                return float(opt.predicted_speedup or 1.0), int(opt.usage_count), "legacy"
+        return 1.0, 0, "prior"
+
+    def _knowledge_block(self, knowledge_notes: Optional[str],
+                         stats_context: Optional[Dict[str, Any]]) -> str:
+        parts = [p for p in ((knowledge_notes or "").strip(),
+                             self._build_fine_stats_block(stats_context)) if p]
+        return "\n\n".join(parts)
+
+    def _build_fine_stats_block(self, stats_context: Optional[Dict[str, Any]]) -> str:
+        """Measured per-(op_class, arch) stats with >= N samples, for the plan prompt."""
+        if not stats_context:
+            return ""
+        op_class, arch = stats_context.get("op_class"), stats_context.get("arch")
+        if not (op_class or arch):
+            return ""
+        suffix = f"|{op_class or '*'}|{arch or '*'}"
+        rows = []
+        for key, st in self.fine_stats.items():
+            if key.endswith(suffix) and st.get("n", 0) >= self.FINE_STATS_MIN_SAMPLES:
+                state, technique = key.split("|")[:2]
+                rows.append((st["geomean_speedup"], f"  - {technique} in {state}: "
+                             f"{st['geomean_speedup']:.2f}x geomean per step over {st['n']} tries "
+                             f"({st['n_improved']} improved)"))
+        if not rows:
+            return ""
+        rows.sort(key=lambda r: -r[0])
+        return (f"MEASURED ON THIS OP CLASS / ARCH ({op_class or '*'}, {arch or '*'}):\n"
+                + "\n".join(r[1] for r in rows[:15]))
 
     def update_composite_optimization_result(self, state: str, composite_id: str, actual_improvement: float):
         """Update composite optimization result for tracking and learning."""
