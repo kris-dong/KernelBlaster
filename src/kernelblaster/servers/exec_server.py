@@ -434,7 +434,12 @@ def _parse_kernel_files(kernel_files: Optional[str]) -> Optional[list[str]]:
 
 @APP.post("/gpu/binary", response_model=ExecResult)
 async def execute_gpu_binary(
-    binary: UploadFile = File(..., description="Binary executable to run"),
+    binary: Optional[UploadFile] = File(None, description="Binary executable to run"),
+    binary_path: Optional[str] = Form(
+        None,
+        description="Instead of uploading: path of the binary on this host "
+        "(clients on the same machine skip the upload + temp copy)",
+    ),
     args: Optional[str] = Form("", description="Command line arguments"),
     env_vars: Optional[str] = Form(None, description="JSON dict (local only)"),
     prefix_command: Optional[str] = Form(None, description="Prefix e.g. 'ncu' (local only)"),
@@ -446,17 +451,31 @@ async def execute_gpu_binary(
     """Execute an uploaded binary. Strategy picked at server startup."""
     logger.info(
         f"/gpu/binary [{_STRATEGY.name if _STRATEGY else '?'}] - "
-        f"file={binary.filename} args={args!r} n_runs={n_runs} "
+        f"file={binary.filename if binary else binary_path} args={args!r} n_runs={n_runs} "
         f"profile={profile} backlog={QUEUE.qsize()}"
     )
     try:
-        binary_data = await binary.read()
-        if not binary_data:
+        extra = {}
+        if binary is not None:
+            binary_data = await binary.read()
+            filename = binary.filename or "gpu_executable"
+        elif binary_path:
+            if not (os.path.isfile(binary_path) and os.access(binary_path, os.X_OK)):
+                raise HTTPException(status_code=400, detail=f"binary_path not executable here: {binary_path}")
+            filename = os.path.basename(binary_path)
+            if isinstance(_STRATEGY, LocalExecStrategy):
+                binary_data, extra = b"", {"binary_path": binary_path}
+            else:
+                binary_data = Path(binary_path).read_bytes()
+        else:
+            raise HTTPException(status_code=400, detail="Provide binary or binary_path")
+        if not binary_data and not extra:
             raise HTTPException(status_code=400, detail="Empty binary file provided")
 
         payload = dict(
+            **extra,
             binary_data=binary_data,
-            filename=binary.filename or "gpu_executable",
+            filename=filename,
             args=args or "",
             env_vars=_parse_env_vars(env_vars),
             prefix_command=prefix_command,

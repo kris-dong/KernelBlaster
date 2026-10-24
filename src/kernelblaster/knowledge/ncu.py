@@ -39,9 +39,17 @@ _SMEM = ("Launch Statistics", "Static Shared Memory Per Block")
 _WAVES = ("Launch Statistics", "Waves Per SM")
 
 
-def ncu_command(*, prefix: str = "mbslot_", slot: Optional[str] = None, launch_count: int = 256) -> str:
-    """ncu prefix for ``MB_MODE=profile <exe>``: every slot, or just ``slot``."""
-    rx = f"{prefix}{slot}::" if slot else prefix
+def ncu_command(*, prefix: str = "mbslot_", slot: Optional[str] = None, slots=None,
+                launch_count: int = 256) -> str:
+    """ncu prefix for ``MB_MODE=profile <exe>``: every slot, just ``slot``, or
+    the kernels of ``slots`` (fewer kernels -> fewer replays)."""
+    if slot:
+        slots = [slot]
+    if slots:
+        rx = (f"{prefix}{slots[0]}::" if len(slots) == 1 else
+              f"{prefix}(" + "|".join(sorted(slots)) + ")::")
+    else:
+        rx = prefix
     secs = " ".join(f"--section={s}" for s in SECTIONS)
     return (f"ncu --kernel-name-base demangled --print-kernel-base demangled -k regex:'{rx}' "
             f"--launch-count {launch_count} --page details {secs} --csv")

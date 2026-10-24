@@ -27,6 +27,7 @@ import sysconfig
 import time
 from torch.utils import cmake_prefix_path
 
+from . import cuda_fast
 from .utils.queue_server import queue_worker_loop
 from .utils.subprocess import run_subprocess_shell
 from ..agents.utils import find_kernel_launch_header
@@ -163,10 +164,13 @@ def get_all_includes(main_file_text: str) -> list[str]:
 
 
 def split_files_for_compilation(
-    main_file_path: str, cuda_file_path: str | None
+    main_file_path: str, cuda_file_path: str | None, driver_torch: bool = True
 ) -> tuple[str, str, str]:
     """
     This method parses the driver file and cuda file and separates it into two compilable units.
+
+    ``driver_torch=False`` (fast path, torch-free drivers only) leaves
+    torch/torch.h out of the host TU as well.
     """
     main_file_text = Path(main_file_path).read_text()
     header_file_text = ""
@@ -199,6 +203,8 @@ def split_files_for_compilation(
         )
         if needs_torch:
             torch_include = "#include <torch/torch.h>\n"
+        elif not driver_torch:
+            torch_include = ""
         else:
             # __CUDACC__ is defined for the nvcc-compiled kernel TU and not for
             # the host-compiled driver TU, so the driver still sees LibTorch.
@@ -276,21 +282,48 @@ async def exec_compilation(
         # Use the standard worker environment
         work_dir = get_cuda_env_root(worker_id)
 
-    main_fp_out, header_fp_out, cuda_fp_out = write_compilation_files(
-        work_dir, main_file, cuda_file
-    )
-
-    arch_version = extract_arch_version(sm_version)
-
     if timeout is None:
         # Phase E: ``args`` global went away with the legacy ``__main__``
         # block; read the CLI-tunable through the env var it was
         # originally sourced from.
         timeout = int(os.getenv("KERNELBLASTER_COMPILE_TIMEOUT_S", "360"))
 
+    if cuda_fast.enabled():
+        builder = cuda_fast.get_builder(ENV_DIR, ENV_VARS)
+        try:
+            return await builder.build_driver_kernel(
+                work_dir, main_file, cuda_file, sm_version, timeout, CompilationError
+            )
+        except cuda_fast.ToolchainError as e:
+            logger.warning(f"fast compile unavailable ({e}); using CMake")
+        # the legacy build below must not write through a cached hard link
+        stale = work_dir / f"build_{sm_version}" / "main"
+        if stale.exists():
+            stale.unlink()
+    return await _exec_compilation_cmake(
+        main_file, cuda_file, sm_version, work_dir, timeout
+    )
+
+
+async def _exec_compilation_cmake(
+    main_file: str,
+    cuda_file: str,
+    sm_version: str,
+    work_dir: Path,
+    timeout: int,
+):
+    """The legacy build: split files into ``work_dir``, CMake configure (once
+    per directory and SM version), ``make``."""
+    main_fp_out, header_fp_out, cuda_fp_out = write_compilation_files(
+        work_dir, main_file, cuda_file
+    )
+
+    arch_version = extract_arch_version(sm_version)
+
     # this call is expensive, so only regenerate if the sm version is different
+    # (a build dir the fast path made has no Makefile yet)
     sm_build_dir = work_dir / f"build_{sm_version}"
-    if not sm_build_dir.exists():
+    if not (sm_build_dir / "Makefile").exists():
         build_type = "Release"
         cmd = build_cmake_command(
             sm_build_dir,

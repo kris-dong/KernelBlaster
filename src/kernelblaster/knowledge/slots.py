@@ -108,6 +108,26 @@ class SlotProblem:
         parts.append((self.root / asm["tail"]).read_text())
         return "\n".join(parts)
 
+    def units(self, sources: Mapping[str, str]) -> list[tuple[str, str]]:
+        """The same program as :meth:`assemble`, one TU per slot.
+
+        ``(name, text)`` per TU: ``slot_<id>.cu`` = head + the wrapped slot,
+        and ``walker_tail.cu`` = head + a declaration of every slot entry (from
+        the manifest signature) + tail. Slot kernels keep their
+        ``<prefix><id>::`` names, so NCU attribution is unchanged. A slot
+        whose entry no longer matches its manifest signature, that relies on
+        another slot's includes, or defines a host global twice fails to
+        build this way; evaluators then fall back to the assembled TU.
+        """
+        asm = self.manifest["assembly"]
+        prefix = asm.get("namespace_prefix", "mbslot_")
+        head = (self.root / asm["head"]).read_text()
+        out = [(f"slot_{sid}.cu", "\n".join([head, wrap_slot(sid, sources[sid], prefix)]))
+               for sid in self.order]
+        decls = "".join(f"namespace {prefix}{sid} {{ {self.slots[sid].signature}; }}\n" for sid in self.order)
+        out.append(("walker_tail.cu", "\n".join([head, decls, (self.root / asm["tail"]).read_text()])))
+        return out
+
     def neighbours(self, sid: str) -> list[str]:
         """Slots that feed or consume this slot's ops (for read-only context)."""
         ops = self.manifest["ops"]
@@ -218,8 +238,9 @@ class Evaluator:
     async def evaluate(self, problem: SlotProblem, sources: Mapping[str, str], tag: str) -> EvalResult:
         raise NotImplementedError
 
-    async def profile(self, problem: SlotProblem, sources: Mapping[str, str], tag: str):
-        """NCU per slot: -> ({slot: summary}, None) or ({}, why not)."""
+    async def profile(self, problem: SlotProblem, sources: Mapping[str, str], tag: str, slots=None):
+        """NCU per slot (every slot, or only ``slots``): -> ({slot: summary},
+        None) or ({}, why not)."""
         return {}, f"{type(self).__name__} does not profile"
 
 
@@ -237,11 +258,18 @@ class LocalEvaluator(Evaluator):
     """nvcc + run on this host (dev/tests; no KernelBlaster servers needed)."""
 
     def __init__(self, arch: str = "75", work_root: Optional[Path] = None, nvcc: str = "nvcc",
-                 max_parallel: int = 2, timeout_s: int = 900, keep: bool = False):
+                 max_parallel: int = 2, timeout_s: int = 900, keep: bool = False,
+                 incremental: Optional[bool] = None, cache_dir: Optional[Path] = None,
+                 build_jobs: int = 4):
         self.arch, self.nvcc, self.timeout_s, self.keep = arch, nvcc, timeout_s, keep
         self.work_root = Path(work_root) if work_root else None
         self._sem = asyncio.Semaphore(max_parallel)
         self._gpu = asyncio.Lock()             # one timed run at a time
+        # one TU per slot, objects + binaries cached by content (see _build_units)
+        self.incremental = _incremental_default() if incremental is None else incremental
+        self._cache_dir = Path(cache_dir) if cache_dir else None
+        self._cache = None
+        self._unit_sem = asyncio.Semaphore(build_jobs)   # nvcc processes for unit objects
 
     def _workdir(self, problem, tag) -> Path:
         root = self.work_root or problem.root / "kb_work"
@@ -249,8 +277,78 @@ class LocalEvaluator(Evaluator):
         work.mkdir(parents=True, exist_ok=True)
         return work
 
+    def _flags(self) -> list[str]:
+        return ["-O3", f"-arch=sm_{self.arch}", "-std=c++17", "-lineinfo"]
+
+    def _build_cache(self, problem):
+        from ..servers.utils.build_cache import BuildCache
+
+        if self._cache is None:
+            root = self._cache_dir or (self.work_root or problem.root / "kb_work") / ".build_cache"
+            self._cache = BuildCache(root)
+        return self._cache
+
+    async def _nvcc(self, args: list[str]) -> tuple[int, str]:
+        proc = await asyncio.create_subprocess_exec(self.nvcc, *args, stdout=asyncio.subprocess.PIPE,
+                                                    stderr=asyncio.subprocess.STDOUT)
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), self.timeout_s)
+        except asyncio.TimeoutError:
+            proc.kill()
+            return -1, f"nvcc timed out after {self.timeout_s}s"
+        return proc.returncode, out.decode(errors="replace")
+
+    async def _build_units(self, problem, sources, work: Path) -> bool:
+        """The incremental build: every slot / the tail / the driver as its
+        own object, each cached by (flags, text, absolute inputs), then one
+        cached link. The same nvcc invocation as the one-shot build, split
+        into its compile and link steps. False if any step fails."""
+        from ..servers.utils.build_cache import cache_key, external_inputs, link_or_copy
+
+        cache = self._build_cache(problem)
+        flags = self._flags()
+
+        class _Failed(Exception):
+            pass
+
+        async def obj(src: Path, text: str):
+            key = cache_key("nvcc-c", self.nvcc, *flags, text, *external_inputs(text))
+
+            async def build(tmp: Path):
+                async with self._unit_sem:
+                    rc, _ = await self._nvcc([*flags, "-c", str(src), "-o", str(tmp)])
+                if rc != 0:
+                    raise _Failed(src.name)
+            return key, (await cache.get_or_build(key, ".o", build))[0]
+
+        jobs = []
+        for name, text in problem.units(sources):
+            (work / name).write_text(text)
+            jobs.append(obj(work / name, text))
+        drv = problem.driver_path
+        jobs.append(obj(drv, drv.read_text()))
+        objs = await asyncio.gather(*jobs, return_exceptions=True)
+        if any(isinstance(o, BaseException) for o in objs):
+            return False
+        link_key = cache_key("nvcc-link", self.nvcc, f"-arch=sm_{self.arch}", *[k for k, _ in objs])
+
+        async def link(tmp: Path):
+            rc, _ = await self._nvcc([f"-arch=sm_{self.arch}", *[str(p) for _, p in objs], "-o", str(tmp)])
+            if rc != 0:
+                raise _Failed("link")
+        try:
+            exe, _ = await cache.get_or_build(link_key, ".exe", link)
+        except _Failed:
+            return False
+        link_or_copy(exe, work / "problem")
+        return True
+
     async def _build(self, problem, sources, work: Path) -> Optional[EvalResult]:
         """nvcc the assembled TU + driver into work/problem; an EvalResult on failure."""
+        if self.incremental and await self._build_units(problem, sources, work):
+            return None
+        # the one-shot build of the assembled TU is authoritative (errors,
+        # and anything the per-slot split cannot express)
         (work / "kernels.cu").write_text(problem.assemble(sources))
         async with self._sem:
             proc = await asyncio.create_subprocess_exec(
@@ -291,7 +389,7 @@ class LocalEvaluator(Evaluator):
             if not self.keep:
                 shutil.rmtree(work, ignore_errors=True)
 
-    async def profile(self, problem, sources, tag):
+    async def profile(self, problem, sources, tag, slots=None):
         from .ncu import ncu_command
 
         work = self._workdir(problem, tag + "_ncu")
@@ -300,7 +398,7 @@ class LocalEvaluator(Evaluator):
             if bad is not None:
                 return {}, "build failed: " + bad.error_text(300)
             async with self._gpu:
-                text = await self._run(work / "problem", {"MB_MODE": "profile"}, ncu_command())
+                text = await self._run(work / "problem", {"MB_MODE": "profile"}, ncu_command(slots=slots))
             return _ncu_result(text) if text is not None else ({}, "ncu timed out")
         finally:
             if not self.keep:
@@ -353,8 +451,35 @@ class SSHEvaluator(LocalEvaluator):
 class ServerEvaluator(Evaluator):
     """KernelBlaster's compile + GPU exec servers (``compile_cu`` / ``run_gpu_executable``)."""
 
-    def __init__(self, gpu, work_root: Path, timeout_s: int = 900):
+    def __init__(self, gpu, work_root: Path, timeout_s: int = 900, incremental: Optional[bool] = None):
         self.gpu, self.work_root, self.timeout_s = gpu, Path(work_root), timeout_s
+        # one TU per slot via the compile server's /compile_units (objects
+        # cached there by content); off when the server lacks the endpoint
+        self.incremental = _incremental_default() if incremental is None else incremental
+
+    async def _compile_units(self, problem, sources, work: Path, cu: Path) -> Optional[Path]:
+        from ..agents.utils.commands import UnitsUnsupported, compile_cu_units
+        from ..agents.utils import FeedbackError
+
+        paths = []
+        for name, text in problem.units(sources):
+            # content-addressed name: the server keys objects by text anyway,
+            # this keeps lineinfo paths stable across candidates
+            d = self.work_root / "units" / hashlib.sha1(text.encode()).hexdigest()[:16]
+            d.mkdir(parents=True, exist_ok=True)
+            if not (d / name).exists():
+                tmp = d / f".{name}.{uuid.uuid4().hex[:6]}"
+                tmp.write_text(text)
+                os.replace(tmp, d / name)
+            paths.append(d / name)
+        try:
+            return Path(await compile_cu_units(problem.driver_path, paths, self.gpu, timeout=self.timeout_s,
+                                               job_name=f"{cu} (units)"))
+        except UnitsUnsupported:
+            self.incremental = False
+        except FeedbackError:
+            pass                    # the assembled build reports the error
+        return None
 
     async def _compile(self, problem, sources, tag):
         from ..agents.utils.commands import compile_cu
@@ -364,6 +489,10 @@ class ServerEvaluator(Evaluator):
         work.mkdir(parents=True, exist_ok=True)
         cu = work / "kernels.cu"
         cu.write_text(problem.assemble(sources))
+        if self.incremental:
+            exe = await self._compile_units(problem, sources, work, cu)
+            if exe is not None:
+                return cu, exe, None
         try:
             return cu, Path(await compile_cu(problem.driver_path, cu, self.gpu, timeout=self.timeout_s,
                                              job_name=str(cu))), None
@@ -384,7 +513,7 @@ class ServerEvaluator(Evaluator):
             return EvalResult(ok=False, stage="run", errors=[str(e)[-2000:]], log=str(e)[-4000:])
         return parse_driver_output(stdout + "\n" + stderr)
 
-    async def profile(self, problem, sources, tag):
+    async def profile(self, problem, sources, tag, slots=None):
         from ..agents.utils.commands import run_gpu_executable
         from ..agents.utils import FeedbackError
         from .ncu import ncu_command
@@ -394,10 +523,14 @@ class ServerEvaluator(Evaluator):
             return {}, "build failed: " + bad.error_text(300)
         try:
             stdout, stderr = await run_gpu_executable(exe, self.gpu, self.timeout_s, job_name=f"{cu} (ncu)",
-                                                      prefix_command=f"MB_MODE=profile {ncu_command()} ")
+                                                      prefix_command=f"MB_MODE=profile {ncu_command(slots=slots)} ")
         except FeedbackError as e:
             return {}, str(e)[-300:]
         return _ncu_result(stdout + "\n" + stderr)
+
+
+def _incremental_default() -> bool:
+    return os.getenv("KERNELBLASTER_SLOT_UNITS", "1").lower() not in ("0", "false", "no", "off")
 
 
 def _compile_errors(log: str, limit: int = 3000) -> str:
