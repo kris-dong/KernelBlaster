@@ -1,0 +1,34 @@
+{
+ "_doc": "Families and targets (knowledge_architecture.md section 2). Levels are fixed in code; this file is data. Peaks are fp32 GFLOP/s and DRAM GB/s; width = parallel lanes the machine needs to be full (SMs x max resident threads, subgroups, VLEN/32 lanes); launch_us = per-kernel launch/sync floor.",
+ "families": {
+  "simt_gpu": {"description": "SIMT GPUs: CUDA (NVIDIA), OpenCL (Adreno)", "backends": ["cuda", "opencl"]},
+  "vector_cpu": {"description": "in-order CPUs with a vector unit (RISC-V V)", "backends": ["riscv", "rvv"]},
+  "systolic": {"description": "systolic-array accelerators (Gemmini)", "backends": ["gemmini"]}
+ },
+ "targets": {
+  "cuda:sm_75": {"family": "simt_gpu", "name": "TITAN RTX", "peak_gflops": 16300.0, "peak_gbps": 672.0,
+                 "sms": 72, "threads_per_sm": 1024, "warp": 32, "smem_kb": 64, "l2_kb": 6144,
+                 "launch_us": 4.0, "profiler": "ncu"},
+  "cuda:sm_80": {"family": "simt_gpu", "name": "A100 40GB", "peak_gflops": 19500.0, "peak_gbps": 1555.0,
+                 "sms": 108, "threads_per_sm": 2048, "warp": 32, "smem_kb": 164, "l2_kb": 40960,
+                 "launch_us": 3.0, "profiler": "ncu"},
+  "cuda:sm_86": {"family": "simt_gpu", "name": "RTX 3090", "peak_gflops": 35600.0, "peak_gbps": 936.0,
+                 "sms": 82, "threads_per_sm": 1536, "warp": 32, "smem_kb": 100, "l2_kb": 6144,
+                 "launch_us": 3.0, "profiler": "ncu"},
+  "cuda:sm_89": {"family": "simt_gpu", "name": "L40S", "peak_gflops": 91600.0, "peak_gbps": 864.0,
+                 "sms": 142, "threads_per_sm": 1536, "warp": 32, "smem_kb": 100, "l2_kb": 98304,
+                 "launch_us": 3.0, "profiler": "ncu"},
+  "cuda:sm_90": {"family": "simt_gpu", "name": "H100 SXM", "peak_gflops": 67000.0, "peak_gbps": 3350.0,
+                 "sms": 132, "threads_per_sm": 2048, "warp": 32, "smem_kb": 228, "l2_kb": 51200,
+                 "launch_us": 3.0, "profiler": "ncu"},
+  "opencl:adreno_740": {"family": "simt_gpu", "name": "Adreno 740", "peak_gflops": 2000.0, "peak_gbps": 64.0,
+                        "sms": 6, "threads_per_sm": 1024, "warp": 64, "smem_kb": 32, "l2_kb": 1024,
+                        "launch_us": 20.0, "profiler": "adreno"},
+  "rvv:vlen256": {"family": "vector_cpu", "name": "Saturn VLEN=256", "peak_gflops": 8.0, "peak_gbps": 16.0,
+                  "sms": 1, "threads_per_sm": 8, "warp": 8, "smem_kb": 32, "l2_kb": 512,
+                  "launch_us": 1.0, "profiler": "mcycle", "aliases": ["riscv:rvv-vlen256"]},
+  "gemmini:default": {"family": "systolic", "name": "Gemmini 16x16", "peak_gflops": 256.0, "peak_gbps": 16.0,
+                      "sms": 1, "threads_per_sm": 256, "warp": 16, "smem_kb": 256, "l2_kb": 512,
+                      "launch_us": 1.0, "profiler": "roofline"}
+ }
+}
