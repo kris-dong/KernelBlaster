@@ -4,11 +4,14 @@
 
 Statistics are kept per (item, node) where an item is a technique or
 hypothesis id and a node is (level, scope, op, state). One outcome updates
-every node on its path, most specific first::
+every node on its path, most specific first: the target, then every scope
+node of its chain (any depth), then universal, then the state chain::
 
     (target, cuda:sm_89, conv|fp16, leaf)          only for non-fp32 dtypes
     (target, cuda:sm_89, conv, leaf)
-    (family, simt_gpu,   conv, leaf)
+    (node,   ada,        conv, leaf)
+    (node,   nvidia_gpu, conv, leaf)
+    (node,   simt_gpu,   conv, leaf)
     (universal, -,       conv, leaf)
     (universal, -,       conv, parent) ... (universal, -, conv, root)
     (universal, -,       conv, *)
@@ -18,7 +21,10 @@ and the estimate shrinks each node toward the next one up::
 
     est(k) = (n_k * mean_k + kappa * est(parent(k))) / (n_k + kappa)
 
-so a new target starts from its family's (then universal) evidence. The
+with ``kappa`` per edge: a target or scope node may set its own ``kappa`` (its pull
+toward its parent; ``targets.json`` / runtime nodes), every other edge uses the
+default. A new target starts from its nearest scope's evidence. v1 rows with
+level ``family`` are read as ``node``. The
 bandit's UCB adds ``c * sqrt(log(N + 1) / (n_local + 1))`` on the local count.
 """
 from __future__ import annotations
@@ -27,7 +33,7 @@ import math
 import random
 from typing import Optional
 
-from .targets import FAMILY, TARGET, UNIVERSAL, TargetRegistry
+from .targets import FAMILY, NODE, ROOT, TARGET, UNIVERSAL, TargetRegistry
 
 ANY = "*"
 KAPPA = 3.0
@@ -41,7 +47,9 @@ def path(registry: TargetRegistry, *, target_key: str, op_class: str, chain: lis
     nodes = []
     if dtype and dtype != "fp32":
         nodes.append((TARGET, t.key, f"{op_class}|{dtype}", leaf))
-    nodes += [(TARGET, t.key, op_class, leaf), (FAMILY, t.family, op_class, leaf), (UNIVERSAL, "", op_class, leaf)]
+    nodes.append((TARGET, t.key, op_class, leaf))
+    nodes += [(NODE, n, op_class, leaf) for n in registry.ancestors(t.node) if n != ROOT]
+    nodes.append((UNIVERSAL, "", op_class, leaf))
     for s in reversed(chain[:-1]):
         nodes.append((UNIVERSAL, "", op_class, s))
     if leaf != ANY:
@@ -62,7 +70,13 @@ class HierStats:
 
     def reload(self) -> None:
         if self.db is not None:
-            self.data = self.db.all_stats()
+            self.data = {}
+            for k, v in self.db.all_stats().items():
+                if k[1] == FAMILY:                       # v1 DB rows
+                    k = (k[0], NODE, *k[2:])
+                a = self.data.setdefault(k, [0.0, 0.0, 0.0])
+                for i in range(3):
+                    a[i] += v[i]
 
     def update(self, item: str, nodes: list[tuple], reward: float) -> None:
         for node in nodes:
@@ -85,7 +99,8 @@ class HierStats:
         for node in reversed(nodes):
             a = self.data.get((item, *node))
             if a and a[0]:
-                est = (a[1] + self.kappa * est) / (a[0] + self.kappa)
+                k = self.registry.kappa_of(node[1], self.kappa) if node[0] in (TARGET, NODE) else self.kappa
+                est = (a[1] + k * est) / (a[0] + k)
         return est
 
     def evidence_level(self, item: str, nodes: list[tuple]) -> tuple[str, float]:
@@ -94,7 +109,7 @@ class HierStats:
             n = self.count(item, node)
             if n:
                 level, scope, op, state = node
-                where = {TARGET: f"{scope.split(':')[-1]}", FAMILY: f"{scope} family", UNIVERSAL: "all targets"}[level]
+                where = {TARGET: f"{scope.split(':')[-1]}", NODE: f"{scope}", UNIVERSAL: "all targets"}[level]
                 ctx = "" if state == ANY else f", {state}"
                 return f"{where}{ctx}", n
         return "untested", 0.0

@@ -26,21 +26,22 @@ from ..outcomes import COMPILE_ERROR, IMPROVED, NEUTRAL, REGRESSED, RUNTIME_ERRO
 from ..reflect import EditError, SemanticUpdater, apply_edit, validate_edit
 from .metrics import CANONICAL, flat_band
 from .ontology import direction_agrees
-from .targets import FAMILY, TARGET, UNIVERSAL, target_key
+from .store import claim_scope
+from .targets import NODE, TARGET, UNIVERSAL, target_key
 
 LIFT = "lift"
 FAILURES = (COMPILE_ERROR, WRONG_OUTPUT, RUNTIME_ERROR)
 VERDICTS = ("confirmed", "contradicted", "side_effect")
-LEVEL_ORDER = {TARGET: 0, FAMILY: 1, UNIVERSAL: 2}
 
 V2_INSTRUCTIONS = """
 Knowledge v2 additions:
-- Claims have a level: target (one GPU/arch), family (e.g. every SIMT GPU), universal. New claims
-  start at target level. States are hierarchical (e.g. memory_bound > cache_thrashing); scope a claim
-  to the most general state it holds for.
-- lift: {"kind": "lift", "claim_id": "...", "to": "family|universal", "evidence": [ids], "text": "the
-  lesson reworded without target specifics (optional)"} when a claim holds on SEVERAL targets: family needs consistent support on >= 2 targets of one family (e.g.
-  cuda:sm_75 and cuda:sm_89), universal on >= 2 families. Checked against the cited records' targets.
+- Claims have a scope in a tree: one target (cuda:sm_89), a scope node (e.g. ada > nvidia_gpu >
+  simt_gpu) or universal. New claims start at target level. States are hierarchical (e.g.
+  memory_bound > cache_thrashing); scope a claim to the most general state it holds for.
+- lift: {"kind": "lift", "claim_id": "...", "evidence": [ids], "text": "the lesson reworded without
+  target specifics (optional)"} when a claim holds on SEVERAL targets. It moves to the lowest
+  common ancestor of the targets with consistent support (>= 2 targets; e.g. cuda:sm_75 + cuda:sm_89
+  -> nvidia_gpu), checked against the cited records' targets; "to": "<node id>" optionally caps it.
 - mechanism: {"kind": "mechanism", "text": "...", "evidence": [ids], "scope": {"technique": "..."},
   "data": {"metric": "<canonical metric>", "observed": "up|down|flat", "verdict":
   "confirmed|contradicted|side_effect"}} explains what a technique did to a MEASURED metric (records'
@@ -63,26 +64,22 @@ def consistent(c: Claim, status: str) -> bool:
     return True
 
 
-def validate_lift(edit: dict, *, index: dict, claims, registry) -> dict:
-    c = claims.get(edit.get("claim_id")) if isinstance(edit.get("claim_id"), str) else None
-    if c is None or c.status != ACTIVE:
-        raise EditError(f"unknown or retired claim {edit.get('claim_id')!r}")
-    to = edit.get("to")
-    cur = getattr(c, "level", TARGET) or TARGET
-    if to not in (FAMILY, UNIVERSAL) or LEVEL_ORDER[to] <= LEVEL_ORDER[cur]:
-        raise EditError(f"lift.to={to!r} must be above the claim's level {cur!r}")
-    ev = edit.get("evidence") or []
-    if not isinstance(ev, list) or any(i not in index for i in ev):
-        raise EditError("lift evidence cites ids not in the outcome log")
-    ids = list(dict.fromkeys(list(c.support_ids) + list(ev)))
+def _claim_home(c: Claim, registry) -> str:
+    """The claim's current scope id (a target key for target-level claims)."""
+    sid = claim_scope(c, registry)
+    if sid is not None:
+        return sid
+    if c.arch:
+        return registry.get(target_key(c.target, c.arch)).key
+    return registry.node_for_backend(f"{c.target}:x")           # backend-wide v1 claim
+
+
+def per_target_evidence(c: Claim, index: dict, extra=()) -> tuple[Counter, Counter, list]:
+    """(support, contradiction) per target key from the claim's cited records (+ ``extra`` ids)."""
     supp, contra, used = Counter(), Counter(), []
-    for i in ids:
+    for i in dict.fromkeys(list(c.support_ids) + list(extra)):
         r = index.get(i)
-        if r is None:
-            continue
-        if c.technique and r.technique != c.technique:
-            continue
-        if c.op_class and r.op_class != c.op_class:
+        if r is None or (c.technique and r.technique != c.technique) or (c.op_class and r.op_class != c.op_class):
             continue
         if consistent(c, r.status):
             supp[target_key(r.target, r.arch)] += 1
@@ -91,20 +88,44 @@ def validate_lift(edit: dict, *, index: dict, claims, registry) -> dict:
         r = index.get(i)
         if r is not None:
             contra[target_key(r.target, r.arch)] += 1
-    good = [t for t in supp if supp[t] > contra[t]]
-    fam_of = {t: registry.family_of(t) for t in good}
-    if to == FAMILY:
-        home = c.family or registry.family_of(target_key(c.target, c.arch or "unknown"))
-        good_home = [t for t in good if fam_of[t] == home]
-        if len(good_home) < 2:
-            raise EditError(f"lift to family {home} needs consistent support on >= 2 of its targets, "
-                            f"has {sorted(good_home) or 'none'} (support {dict(supp)}, contradict {dict(contra)})")
-        return {"kind": LIFT, "claim_id": c.id, "to": FAMILY, "family": home, "evidence": used,
-                "targets": sorted(good_home), "text": _lift_text(edit)}
-    fams = sorted(set(fam_of.values()))
-    if len(fams) < 2:
-        raise EditError(f"lift to universal needs support on >= 2 families, has {fams or 'none'}")
-    return {"kind": LIFT, "claim_id": c.id, "to": UNIVERSAL, "family": None, "evidence": used, "families": fams,
+    return supp, contra, used
+
+
+def validate_lift(edit: dict, *, index: dict, claims, registry) -> dict:
+    """Lift to the lowest common ancestor of the targets with consistent support (>= 2 targets).
+
+    Lifting is stepwise: a claim already at node N moves only if the evidence's
+    common ancestor is strictly above N. ``to`` may cap the lift at a node; v1's
+    ``to: family|universal`` still work (``universal`` must be what the evidence supports)."""
+    c = claims.get(edit.get("claim_id")) if isinstance(edit.get("claim_id"), str) else None
+    if c is None or c.status != ACTIVE:
+        raise EditError(f"unknown or retired claim {edit.get('claim_id')!r}")
+    ev = edit.get("evidence") or []
+    if not isinstance(ev, list) or any(i not in index for i in ev):
+        raise EditError("lift evidence cites ids not in the outcome log")
+    cur = _claim_home(c, registry)
+    supp, contra, used = per_target_evidence(c, index, ev)
+    good = sorted(t for t in supp if supp[t] > contra[t])
+    counts = f"(support {dict(supp)}, contradict {dict(contra)})"
+    if len(good) < 2:
+        raise EditError(f"lift needs consistent support on >= 2 targets, has {good or 'none'} {counts}")
+    dest = registry.lca(good)
+    to = edit.get("to")
+    if to == UNIVERSAL and dest != UNIVERSAL:
+        raise EditError(f"lift to universal needs support under >= 2 families (children of universal); "
+                        f"the evidence supports {dest} {counts}")
+    if isinstance(to, str) and to in registry.nodes and to != dest:
+        if registry.is_above(to, dest):
+            raise EditError(f"evidence supports {dest}, not {to} {counts}")
+        if registry.is_above(dest, to):
+            dest = to                                                 # a shorter step was asked for
+    if not registry.is_above(dest, cur):
+        raise EditError(f"lift needs consistent support on >= 2 targets whose common ancestor is above "
+                        f"{cur}; {good} meet at {dest} {counts}")
+    bad = [t for t in contra if contra[t] >= supp.get(t, 0) and dest in registry.chain(t)]
+    if bad:
+        raise EditError(f"targets under {dest} disagree: {sorted(bad)} {counts}")
+    return {"kind": LIFT, "claim_id": c.id, "to": dest, "from": cur, "evidence": used, "targets": good,
             "text": _lift_text(edit)}
 
 
@@ -117,15 +138,82 @@ def apply_lift(e: dict, claims) -> dict:
     with claims._lock:
         c = claims.get(e["claim_id"])
         c.add_support(e["evidence"])
-        frm = c.level
-        c.level, c.family = e["to"], e["family"]
-        c.arch = None
+        frm = e.get("from") or c.level
+        set_claim_scope(c, e["to"])
         if e.get("text"):                       # the general wording (no target specifics)
             c.text = e["text"]
         claims._touch(c)
     return {"kind": LIFT, "claim_id": c.id, "result": f"lifted {frm}->{e['to']}", "support": c.support,
-            "contradict": c.contradict, "evidence": e["evidence"],
-            "targets": e.get("targets") or e.get("families")}
+            "contradict": c.contradict, "evidence": e["evidence"], "targets": e.get("targets")}
+
+
+def set_claim_scope(c: Claim, sid: str, registry=None) -> None:
+    """Move a claim to scope id ``sid`` (universal | node id | target key)."""
+    if sid == UNIVERSAL:
+        c.level, c.family, c.arch = UNIVERSAL, None, None
+    elif ":" in sid:                            # back to one target
+        c.level, c.family = TARGET, None
+        c.target, c.arch = sid.split(":", 1)
+    else:
+        c.level, c.family, c.arch = NODE, sid, None
+
+
+def _rollback_scope(registry, good: list, bad: list, supp: Counter) -> Optional[str]:
+    """Where a claim goes when ``bad`` targets disagree: the node that covers the most
+    supporting targets (>= 2; deeper on ties) and none of the disagreeing ones, else the
+    best-supported single target, else None (retire)."""
+    best, best_key = None, None
+    for g in good:
+        for n in registry.chain(g)[1:]:
+            if any(n in registry.chain(b) for b in bad):
+                break
+            cov = [x for x in good if n in registry.chain(x)]
+            key = (len(cov), registry.depth(n))
+            if len(cov) >= 2 and (best_key is None or key > best_key):
+                best, best_key = n, key
+    if best is not None:
+        return best
+    if good:
+        return sorted(good, key=lambda t: (-supp[t], t))[0]
+    return None
+
+
+def revalidate_lifts(claims, index: dict, registry, mirror=None, db=None) -> list[dict]:
+    """Roll back lifts the later evidence no longer supports (no human review, so this is automatic).
+
+    For every claim above target level: if some target under its scope now has
+    contradictions >= support, the claim moves down to the largest node that covers
+    >= 2 still-supporting targets and none of the disagreeing ones, else back to the
+    best-supported single target, and is retired when none is left."""
+    from ..claims import RETIRED
+    events = []
+    with claims._lock:
+        for c in list(claims.active()):
+            sid = claim_scope(c, registry)
+            if sid is None:
+                continue
+            supp, contra, _ = per_target_evidence(c, index)
+            under = lambda t: sid in registry.chain(t)                      # noqa: E731
+            bad = sorted(t for t in contra if under(t) and contra[t] >= supp.get(t, 0))
+            if not bad:
+                continue
+            good = sorted(t for t in supp if under(t) and supp[t] > contra[t])
+            dest = _rollback_scope(registry, good, bad, supp)
+            if dest == sid:
+                continue
+            if dest is None:
+                c.status = RETIRED
+                kind = "claim_retired"
+            else:
+                set_claim_scope(c, dest)
+                kind = "claim_demoted"
+            claims._touch(c)
+            ev = {"event": kind, "claim_id": c.id, "from": sid, "to": dest, "disagreeing": bad, "supporting": good,
+                  "support": dict(supp), "contradict": dict(contra)}
+            events.append(ev)
+            if db is not None:
+                db.audit(kind, c.id, ev, mirror)
+    return events
 
 
 def validate_mechanism(edit: dict, *, index: dict, claims, ontology) -> dict:
@@ -196,7 +284,7 @@ class SemanticUpdaterV2(SemanticUpdater):
                 if kind == LIFT:
                     e = validate_lift(raw, index=index, claims=self.claims, registry=self.kv.registry)
                     applied.append(apply_lift(e, self.claims))
-                    self.kv.db.review("claim_lifted", e["claim_id"], applied[-1], self.kv.review_path)
+                    self.kv.db.audit("claim_lifted", e["claim_id"], applied[-1], self.kv.review_path)
                     continue
                 if kind == MECHANISM:
                     e = validate_mechanism(raw, index=index, claims=self.claims, ontology=self.kv.ontology)
@@ -217,11 +305,9 @@ class SemanticUpdaterV2(SemanticUpdater):
         batch's techniques / op classes (what a lift would generalise)."""
         out = {c.id: c for c in super()._context_claims(records)}
         reg = self.kv.registry
-        fams = {reg.family_of(target_key(r.target, r.arch)) for r in records}
         keys = {(r.technique, r.op_class) for r in records}
-        for c in self.claims.active():
-            if (getattr(c, "level", TARGET) == TARGET and (c.technique, c.op_class) in keys
-                    and reg.family_of(target_key(c.target, c.arch or "unknown")) in fams):
+        for c in self.claims.active():                    # claims on other targets / lower scopes
+            if (c.technique, c.op_class) in keys and claim_scope(c, reg) != UNIVERSAL:
                 out.setdefault(c.id, c)
         return sorted(out.values(), key=lambda c: -c.rank(self.claims.epoch))[: self.max_prompt_claims + 10]
 
@@ -230,14 +316,16 @@ class SemanticUpdaterV2(SemanticUpdater):
         its family that agree with it (the model still decides; validate_lift checks)."""
         lines = []
         for c in existing:
-            if getattr(c, "level", TARGET) != TARGET or c.kind not in (APPLICABILITY, PITFALL, PARAMETER, MECHANISM):
+            if c.kind not in (APPLICABILITY, PITFALL, PARAMETER, MECHANISM):
                 continue
-            home = target_key(c.target, c.arch or "unknown")
+            reg = self.kv.registry
+            home = _claim_home(c, reg)
+            if home == UNIVERSAL:
+                continue
             ev = [r.id for r in records if r.technique == c.technique and (not c.op_class or r.op_class == c.op_class)
-                  and target_key(r.target, r.arch) != home and consistent(c, r.status)
-                  and self.kv.registry.family_of(target_key(r.target, r.arch)) == self.kv.registry.family_of(home)]
+                  and home not in reg.chain(target_key(r.target, r.arch)) and consistent(c, r.status)]
             if ev:
-                lines.append(f"- claim {c.id} ({home}) is supported by {ev[:6]} on other targets of its family")
+                lines.append(f"- claim {c.id} ({home}) is supported by {ev[:6]} on targets outside its scope")
         return lines[:8]
 
     def build_messages(self, records, existing) -> list:

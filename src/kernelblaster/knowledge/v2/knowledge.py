@@ -6,12 +6,13 @@
     exploration budget) -> prompt from retrieval -> record (metric vectors,
     state chain, item id, mechanism check, stats, hypothesis attempt)
 
-plus :meth:`maybe_upkeep`, the slower passes: hypothesis review (no LLM),
+plus :meth:`maybe_upkeep`, the slower passes: hypothesis decisions and the
+automatic rollback of promotions / lifts (no LLM),
 hypothesis generation and state discovery (one LLM call each, on the
 ``upkeep_model``, only when deterministic triggers fire) and probation.
 
-Everything lives in ``<root>/knowledge.db``; the human review queue is
-mirrored to ``<root>/review.jsonl``. Seeds (targets, states, techniques, the
+Everything lives in ``<root>/knowledge.db``; the audit log of automatic
+changes (nothing waits on it) is mirrored to ``<root>/review.jsonl``. Seeds (targets, states, techniques, the
 legacy technique DB) are loaded idempotently on first open.
 """
 from __future__ import annotations
@@ -36,7 +37,7 @@ from .stats import HierStats, path as stat_path
 from .store import KnowledgeDB, SQLiteClaimStore, SQLiteOutcomeLog
 from .targets import TargetRegistry
 
-SEED_VERSION = 1
+SEED_VERSION = 2              # 2: scope tree, node-level techniques
 
 
 @dataclass
@@ -69,6 +70,7 @@ class KnowledgeV2:
         self.explore_frac, self.ucb_c = explore_frac, ucb_c
         self.upkeep_every, self.max_new_hyp = upkeep_every, max_new_hypotheses
         self._seed()
+        self._load_scopes()
         self.hierarchy = self._load_hierarchy()
         self.ontology = self._load_ontology()
         self.stats = HierStats(self.registry, self.db, kappa=kappa)
@@ -82,19 +84,54 @@ class KnowledgeV2:
 
     # ---------------------------------------------------------------- seeding / loading
     def _seed(self) -> None:
-        if (self.db.get_meta("seed_version") or 0) >= SEED_VERSION:
+        """Load the seed data idempotently; a newer SEED_VERSION refreshes seed-sourced rows only
+        (discovered states, promoted techniques and runtime scopes are never touched)."""
+        have = self.db.get_meta("seed_version") or 0
+        if have >= SEED_VERSION:
             return
         for k, t in self.registry.targets.items():
-            with self.db.tx() as c:
-                c.execute("INSERT OR IGNORE INTO targets VALUES (?, ?, ?)", (k, t.family, json.dumps(t.__dict__)))
+            self.db.put_target(k, t.node, t.to_dict())
         states, legacy = load_seed()
+        old_states = {d["id"]: d for d in self.db.rows("states")}
         for s in states:
-            self.db.put("states", s.id, s.to_dict(), replace=False)
+            if old_states.get(s.id, {}).get("source", "seed") == "seed":
+                self.db.put("states", s.id, s.to_dict())
         o = Ontology.seed(self.registry, legacy=True)       # reads the old JSON DB + footers once
+        old_t = {d["id"]: d for d in self.db.techniques()}
         for t in o.techniques.values():
-            self.db.put("techniques", t.id, t.to_dict(), replace=False)
+            src = old_t.get(t.id, {}).get("source", t.source)
+            if not src.startswith("hypothesis:"):
+                self.db.put("techniques", t.id, t.to_dict())
         self.db.set_meta("legacy_state_map", legacy)
         self.db.set_meta("seed_version", SEED_VERSION)
+
+    def _load_scopes(self) -> None:
+        """Scope nodes and targets added at run time (DB) on top of targets.json."""
+        for n in self.db.scopes():
+            try:
+                self.registry.add_node(n["id"], n.get("parent") or "universal", n.get("description", ""),
+                                       n.get("kappa"))
+            except ValueError as e:
+                self._log("warning", f"scope {n.get('id')}: {e}")
+        for key, node, data in self.db.target_rows():
+            if key in self.registry.targets:
+                continue
+            node = data.get("node") or (node if node in self.registry.nodes else None)
+            info = {k: v for k, v in data.items() if k not in ("key", "node", "family")}
+            self.registry.add_target(key, node, **info)
+
+    def add_scope(self, nid: str, parent: str = "universal", description: str = "",
+                  kappa: Optional[float] = None) -> None:
+        """Add (or move) a scope node at run time; persisted and audited."""
+        n = self.registry.add_node(nid, parent, description, kappa)
+        self.db.put_scope(nid, parent, n.to_dict())
+        self.db.audit("scope_added", nid, n.to_dict(), self.review_path)
+
+    def add_target(self, key: str, node: str, **info) -> None:
+        """Add a target under ``node`` at run time; persisted and audited."""
+        t = self.registry.add_target(key, node, **info)
+        self.db.put_target(t.key, t.node, t.to_dict())
+        self.db.audit("target_added", t.key, t.to_dict(), self.review_path)
 
     def _load_hierarchy(self) -> StateHierarchy:
         rows = [State.from_dict(d) for d in self.db.rows("states")]
@@ -286,6 +323,12 @@ class KnowledgeV2:
                 evs.append(e)
             rows = self.outcomes.rows()
             evs += D.review_probation(self.hierarchy, rows, self.db, self.review_path)
+            # no human gate: automatic rollback of promotions and lifts later evidence contradicts
+            evs += self.hypotheses.revalidate(rows, self.review_path)
+            from .reflect_v2 import revalidate_lifts
+            index = {r.id: r for r in self.outcomes}
+            evs += revalidate_lifts(self.claims, index, self.registry, self.review_path, self.db)
+            self.claims.save()
             if self.upkeep_model:
                 evs += await self.discover_states(rows)
                 evs += await self.generate_hypotheses(rows)
@@ -331,7 +374,7 @@ class KnowledgeV2:
                 evs.append({"event": "state_admitted", "state": s.id, "parent": s.parent,
                             "predicate": P.render(s.predicate), "reason": reason})
             else:
-                self.db.review("state_rejected", pid, {"proposal": prop, "reason": reason}, self.review_path)
+                self.db.audit("state_rejected", pid, {"proposal": prop, "reason": reason}, self.review_path)
                 evs.append({"event": "state_rejected", "proposal": pid, "reason": reason,
                             "predicate": P.render(prop["predicate"]) if isinstance(prop, dict) and
                             isinstance(prop.get("predicate"), dict) else None})

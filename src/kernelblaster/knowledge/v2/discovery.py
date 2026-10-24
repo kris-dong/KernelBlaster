@@ -17,9 +17,10 @@ Replaces v1's "NEW_STATE_NEEDED -> copy the nearest state's techniques x0.8".
    the within-side reward variance by >= 30% vs the parent on the held-out
    outcomes (on the whole cluster when fewer than 4 are held out; recorded).
    Otherwise the proposal is stored as rejected with the reason.
-4. Admitted states are ``probationary``; :func:`review_probation` makes them
+4. Admitted states are ``probationary`` (live immediately); :func:`review_probation` makes them
    ``core`` after >= 10 more decidable outcomes keep the separation, and
-   retires them when it collapses. Every change goes to the review queue.
+   retires them when it collapses. No human gate: an admitted state is used for
+   classification and prompts at once; every change is written to the audit log.
 """
 from __future__ import annotations
 
@@ -225,7 +226,7 @@ def admit(raw: dict, trig: dict, hierarchy, db, numbers: dict, *, seq: int, mirr
                                   "predicted_effects": raw.get("predicted_effects") or {}})
     hierarchy.add(s)
     db.put("states", s.id, s.to_dict(), status=s.status)
-    db.review("state_admitted", s.id, {"parent": s.parent, "predicate": P.render(s.predicate),
+    db.audit("state_admitted", s.id, {"parent": s.parent, "predicate": P.render(s.predicate),
                                        "mechanism": s.mechanism, "numbers": numbers}, mirror)
     return s
 
@@ -249,6 +250,6 @@ def review_probation(hierarchy, rows: list[dict], db, mirror=None) -> list[dict]
         else:
             continue
         db.put("states", s.id, s.to_dict(), status=s.status)
-        db.review(f"state_{s.status}", s.id, {"probation": sep}, mirror)
+        db.audit(f"state_{s.status}", s.id, {"probation": sep}, mirror)
         events.append({"state": s.id, "status": s.status, "reduction": sep["reduction"]})
     return events

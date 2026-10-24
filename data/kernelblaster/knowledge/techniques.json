@@ -1,5 +1,5 @@
 {
- "_doc": "Curated technique ontology (knowledge_architecture.md section 5): mechanism, preconditions (predicate DSL), predicted metric directions (up | down | flat | up_or_flat | down_or_flat, on canonical metrics), realizations by scope (target:<key> | target:<backend>:sm_NN+ | target:<backend> | family:<name> | universal). 'aliases' are v1 / technique-DB / footer names folded into the entry. 'states' gates a technique to state chains (empty: any state); 'op_classes' to op classes (empty: any); 'slot': offered by the multi-slot agent. Techniques of the old JSON DB and the footers that are not folded in here are imported by ontology.seed_legacy() with slot=false.",
+ "_doc": "Curated technique ontology (knowledge_architecture.md section 5): mechanism, preconditions (predicate DSL), predicted metric directions (up | down | flat | up_or_flat | down_or_flat, on canonical metrics), realizations by scope (target:<key> | target:<backend>:sm_NN+ | target:<backend> | node:<scope node> (v1: family:<name>) | universal). 'aliases' are v1 / technique-DB / footer names folded into the entry. 'states' gates a technique to state chains (empty: any state); 'op_classes' to op classes (empty: any); 'slot': offered by the multi-slot agent. Techniques of the old JSON DB and the footers that are not folded in here are imported by ontology.seed_legacy() with slot=false.",
  "techniques": [
   {"id": "memory_coalescing", "level": "universal",
    "aliases": ["memory_coalescing_optimization", "coalesced_access", "access_pattern_optimization", "1.2_data_layout_soa", "data_layout_transformation"],
@@ -8,8 +8,8 @@
    "risks": ["a transposed mapping can break coalescing of the other operand"],
    "states": [], "op_classes": [], "slot": true,
    "realizations": [
-    {"scope": "family:simt_gpu", "how": "Make consecutive threads (work-items) touch consecutive addresses; reorder the thread->element mapping, transposing through on-chip memory when the natural mapping is strided."},
-    {"scope": "family:vector_cpu", "how": "Keep the unit-stride dimension innermost so vector loads are vle (unit stride), not vlse (strided)."}]},
+    {"scope": "node:simt_gpu", "how": "Make consecutive threads (work-items) touch consecutive addresses; reorder the thread->element mapping, transposing through on-chip memory when the natural mapping is strided."},
+    {"scope": "node:vector_cpu", "how": "Keep the unit-stride dimension innermost so vector loads are vle (unit stride), not vlse (strided)."}]},
 
   {"id": "vectorized_memory_access", "level": "universal",
    "aliases": ["vectorized_operations", "SIMD_operations", "vectorized_loads", "2.3_rvv_vectorization"],
@@ -20,7 +20,7 @@
    "realizations": [
     {"scope": "target:cuda", "how": "Use float4/float2 (half2 for fp16) loads and stores where alignment and sizes allow; keep a scalar tail."},
     {"scope": "target:opencl", "how": "Use vload4/vstore4 (float4, half8) where alignment allows; keep a scalar tail."},
-    {"scope": "family:vector_cpu", "how": "Strip-mine with vsetvli at LMUL=m4/m8 and vle32/vse32 so each instruction moves VLEN*LMUL bits."}]},
+    {"scope": "node:vector_cpu", "how": "Strip-mine with vsetvli at LMUL=m4/m8 and vle32/vse32 so each instruction moves VLEN*LMUL bits."}]},
 
   {"id": "launch_configuration_tuning", "level": "universal",
    "aliases": ["block_size_adaptation", "grid_size_optimization", "occupancy_tuning", "work_group_size_tuning", "adaptive_block_sizing"],
@@ -39,10 +39,10 @@
    "risks": ["register growth lowers occupancy"],
    "states": [], "op_classes": [], "slot": true,
    "realizations": [
-    {"scope": "family:simt_gpu", "how": "Unroll inner loops (#pragma unroll) and give each thread several independent elements / accumulators to hide latency."},
-    {"scope": "family:vector_cpu", "how": "Unroll 4-8x with independent accumulators; in-order cores have no OoO to hide the load-use bubble."}]},
+    {"scope": "node:simt_gpu", "how": "Unroll inner loops (#pragma unroll) and give each thread several independent elements / accumulators to hide latency."},
+    {"scope": "node:vector_cpu", "how": "Unroll 4-8x with independent accumulators; in-order cores have no OoO to hide the load-use bubble."}]},
 
-  {"id": "read_only_cache_and_restrict", "level": "family", "scope": "simt_gpu",
+  {"id": "read_only_cache_and_restrict", "level": "node", "scope": "simt_gpu",
    "aliases": ["read_only_cache_optimization", "texture_memory_usage"],
    "mechanism": "declare inputs non-aliasing and read-only so loads can be reordered, batched and served from the read-only cache path",
    "predicts": {"l1_hit": "up_or_flat", "bw_util": "up_or_flat"},
@@ -65,7 +65,7 @@
     {"scope": "target:cuda", "how": "Tile the operands through __shared__ memory (e.g. 32x32 or 64x64 tiles), __syncthreads() per k-step, so each element is read from DRAM once per tile."},
     {"scope": "target:cuda:sm_80+", "how": "__shared__ tiles filled with cp.async in a 2-3 stage pipeline (cuda::memcpy_async / __pipeline_memcpy_async).", "params_prior": {"stages": 3}},
     {"scope": "target:opencl", "how": "Tile through __local memory with barrier(CLK_LOCAL_MEM_FENCE) per k-step."},
-    {"scope": "family:vector_cpu", "how": "Block loops so each block's working set stays L1-resident; strip-mine the inner loop at VLEN."}]},
+    {"scope": "node:vector_cpu", "how": "Block loops so each block's working set stays L1-resident; strip-mine the inner loop at VLEN."}]},
 
   {"id": "register_blocking", "level": "universal",
    "aliases": ["register_tiling", "4.1_register_tiling", "register_optimization", "outer_product_microkernel"],
@@ -75,8 +75,8 @@
    "params": {"TM": [2, 4, 8], "TN": [2, 4, 8]},
    "states": [], "op_classes": ["gemm", "conv"], "slot": true,
    "realizations": [
-    {"scope": "family:simt_gpu", "how": "Each thread computes a small TMxTN block of outputs in registers (outer-product micro-kernel over the k loop)."},
-    {"scope": "family:vector_cpu", "how": "Keep a 4x4 (or LMUL-wide) accumulator block in registers across the reduction; write back once."}]},
+    {"scope": "node:simt_gpu", "how": "Each thread computes a small TMxTN block of outputs in registers (outer-product micro-kernel over the k loop)."},
+    {"scope": "node:vector_cpu", "how": "Keep a 4x4 (or LMUL-wide) accumulator block in registers across the reduction; write back once."}]},
 
   {"id": "double_buffering", "level": "universal",
    "aliases": ["prefetching_strategies", "software_pipelining", "4.2_software_pipelining", "memory_compute_overlap", "async_work_group_copy", "3.3_prefetch_hints"],
@@ -89,7 +89,7 @@
     {"scope": "target:cuda", "how": "Prefetch the next shared-memory tile into registers (or a second buffer) while computing the current one."},
     {"scope": "target:cuda:sm_80+", "how": "cp.async into a second shared buffer with cp.async.wait_group; compute on the other."},
     {"scope": "target:opencl", "how": "async_work_group_copy the next tile into a second __local buffer, wait_group_events before use."},
-    {"scope": "family:vector_cpu", "how": "Software-pipeline: issue loads for iteration k+1 before the FMAs of iteration k; __builtin_prefetch 64-128 elements ahead."}]},
+    {"scope": "node:vector_cpu", "how": "Software-pipeline: issue loads for iteration k+1 before the FMAs of iteration k; __builtin_prefetch 64-128 elements ahead."}]},
 
   {"id": "implicit_gemm", "level": "universal",
    "aliases": ["im2col_transform", "conv_as_gemm"],
@@ -98,10 +98,10 @@
    "risks": ["index math per k-step"],
    "states": [], "op_classes": ["conv"], "slot": true,
    "realizations": [
-    {"scope": "family:simt_gpu", "how": "Treat the convolution as a GEMM (M=N*OH*OW, N=OC, K=IC*KH*KW) without materialising im2col; tile it like a GEMM."},
-    {"scope": "family:vector_cpu", "how": "im2col into an L1-sized buffer, then the vectorised GEMM micro-kernel."}]},
+    {"scope": "node:simt_gpu", "how": "Treat the convolution as a GEMM (M=N*OH*OW, N=OC, K=IC*KH*KW) without materialising im2col; tile it like a GEMM."},
+    {"scope": "node:vector_cpu", "how": "im2col into an L1-sized buffer, then the vectorised GEMM micro-kernel."}]},
 
-  {"id": "warp_shuffle_reduction", "level": "family", "scope": "simt_gpu",
+  {"id": "warp_shuffle_reduction", "level": "node", "scope": "simt_gpu",
    "aliases": ["warp_level_primitives", "subgroup_reduction"],
    "mechanism": "reduce in registers across the lanes of a warp, with no shared-memory round trips or barriers per step",
    "predicts": {"mem_util": "down_or_flat", "compute_util": "up_or_flat"},
@@ -118,17 +118,17 @@
    "risks": ["floating-point reassociation changes rounding"],
    "states": [], "op_classes": ["reduction"], "slot": false,
    "realizations": [
-    {"scope": "family:vector_cpu", "how": "vfredosum.vs / vfredusum.vs in-vector reductions over K independent partial sums."},
-    {"scope": "family:simt_gpu", "how": "Block-level tree reduction in on-chip memory, one partial per thread first."}]},
+    {"scope": "node:vector_cpu", "how": "vfredosum.vs / vfredusum.vs in-vector reductions over K independent partial sums."},
+    {"scope": "node:simt_gpu", "how": "Block-level tree reduction in on-chip memory, one partial per thread first."}]},
 
-  {"id": "one_block_per_row", "level": "family", "scope": "simt_gpu",
+  {"id": "one_block_per_row", "level": "node", "scope": "simt_gpu",
    "aliases": ["row_parallel_reduction"],
    "mechanism": "map one block (or warp) to each reduced row and parallelise the reduced dimension, so every lane has work",
    "predicts": {"parallel_fill": "up_or_flat", "occupancy": "up"},
    "risks": [],
    "states": [], "op_classes": ["reduction"], "slot": true,
    "realizations": [
-    {"scope": "family:simt_gpu", "how": "Map one block (or warp / subgroup) to each reduced row; parallelise the reduction dimension across its threads."}]},
+    {"scope": "node:simt_gpu", "how": "Map one block (or warp / subgroup) to each reduced row; parallelise the reduction dimension across its threads."}]},
 
   {"id": "single_pass_fusion", "level": "universal",
    "aliases": ["loop_fusion_optimization", "fused_operations", "fuse_activation", "5.2_producer_consumer_fusion", "kernel_fusion_in_slot"],
@@ -137,10 +137,10 @@
    "risks": ["numerically different single-pass statistics (use Welford)"],
    "states": [], "op_classes": ["reduction"], "slot": true,
    "realizations": [
-    {"scope": "family:simt_gpu", "how": "Compute statistics and the normalised output in as few passes over memory (and as few kernels) as possible."},
-    {"scope": "family:vector_cpu", "how": "Fuse the passes into one loop nest so intermediates stay in vector registers."}]},
+    {"scope": "node:simt_gpu", "how": "Compute statistics and the normalised output in as few passes over memory (and as few kernels) as possible."},
+    {"scope": "node:vector_cpu", "how": "Fuse the passes into one loop nest so intermediates stay in vector registers."}]},
 
-  {"id": "grid_stride_vectorized", "level": "family", "scope": "simt_gpu",
+  {"id": "grid_stride_vectorized", "level": "node", "scope": "simt_gpu",
    "aliases": ["grid_stride_loop"],
    "mechanism": "a grid sized to the machine, each thread looping over wide elements: full bandwidth with minimal index math and launch cost",
    "predicts": {"bw_util": "up"},
@@ -166,9 +166,9 @@
    "risks": ["online-softmax rescaling bugs"],
    "states": [], "op_classes": ["attention"], "slot": true,
    "realizations": [
-    {"scope": "family:simt_gpu", "how": "Tile Q/K/V through shared/local memory with an online softmax so the score matrix is never materialised."}]},
+    {"scope": "node:simt_gpu", "how": "Tile Q/K/V through shared/local memory with an online softmax so the score matrix is never materialised."}]},
 
-  {"id": "tensor_core_mma", "level": "family", "scope": "simt_gpu",
+  {"id": "tensor_core_mma", "level": "node", "scope": "simt_gpu",
    "aliases": ["tensor_core_utilization", "specialized_instruction_usage"],
    "mechanism": "matrix units execute a whole 16x16xK multiply-accumulate per instruction, far above the scalar FMA ceiling",
    "preconditions": {"op_class": "in", "v": ["gemm", "conv", "attention"]},
@@ -179,14 +179,14 @@
     {"scope": "target:cuda", "how": "nvcuda::wmma 16x16x16 fragments (fp16 inputs, fp32 accumulators); for fp32 problems only if the tolerance allows rounding inputs to fp16."},
     {"scope": "target:cuda:sm_80+", "how": "mma.sync with tf32 or bf16 inputs and fp32 accumulators (wmma::precision::tf32 for fp32 tensors)."}]},
 
-  {"id": "bank_conflict_padding", "level": "family", "scope": "simt_gpu",
+  {"id": "bank_conflict_padding", "level": "node", "scope": "simt_gpu",
    "aliases": ["access_pattern_swizzling", "memory_layout_permutation", "shared_memory_padding"],
    "mechanism": "pad or swizzle shared-memory rows so a warp's accesses hit distinct banks instead of serialising",
    "predicts": {"mem_util": "down_or_flat", "compute_util": "up_or_flat"},
    "risks": [],
    "states": ["on_chip_memory_bound", "underutilized_memory", "cache_thrashing"], "op_classes": ["gemm", "conv", "attention", "data_movement"], "slot": true,
    "realizations": [
-    {"scope": "family:simt_gpu", "how": "Pad shared/local tiles by one element per row (e.g. [32][33]) or XOR-swizzle the column index so lanes hit distinct banks."}]},
+    {"scope": "node:simt_gpu", "how": "Pad shared/local tiles by one element per row (e.g. [32][33]) or XOR-swizzle the column index so lanes hit distinct banks."}]},
 
   {"id": "thread_coarsening", "level": "universal",
    "aliases": ["work_per_thread_increase", "work_distribution_optimization"],
@@ -195,7 +195,7 @@
    "risks": ["too few threads for small problems"],
    "states": ["underutilized_compute", "compute_bound", "underutilized_memory"], "op_classes": [], "slot": true,
    "realizations": [
-    {"scope": "family:simt_gpu", "how": "Give each thread 2-8 outputs (along the contiguous dimension), reusing loaded inputs and index math across them."}]},
+    {"scope": "node:simt_gpu", "how": "Give each thread 2-8 outputs (along the contiguous dimension), reusing loaded inputs and index math across them."}]},
 
   {"id": "split_k_parallelism", "level": "universal",
    "aliases": ["split_k", "parallel_reduction_split", "workload_restructuring"],
@@ -205,7 +205,7 @@
    "risks": ["an extra reduction pass / atomics; atomics change rounding order"],
    "states": ["low_parallelism", "latency_bound", "underutilized"], "op_classes": ["gemm", "conv", "reduction"], "slot": true,
    "realizations": [
-    {"scope": "family:simt_gpu", "how": "Split K across blocks (grid.z); each writes a partial tile, then a second small kernel (or atomicAdd) sums them."}]},
+    {"scope": "node:simt_gpu", "how": "Split K across blocks (grid.z); each writes a partial tile, then a second small kernel (or atomicAdd) sums them."}]},
 
   {"id": "launch_batching", "level": "universal",
    "aliases": ["persistent_kernels", "persistent_kernel_pattern", "cuda_graphs", "asynchronous_execution", "kernel_fusion"],
@@ -225,7 +225,7 @@
    "realizations": [
     {"scope": "target:cuda", "how": "Use __expf/__logf/__fdividef/rsqrtf intrinsics where the tolerance allows; avoid double-precision literals."},
     {"scope": "target:opencl", "how": "native_exp / native_divide / half_ intrinsics where the tolerance allows."},
-    {"scope": "family:vector_cpu", "how": "Degree-4 minimax polynomial after range reduction instead of libm expf/tanhf."}]},
+    {"scope": "node:vector_cpu", "how": "Degree-4 minimax polynomial after range reduction instead of libm expf/tanhf."}]},
 
   {"id": "register_pressure_reduction", "level": "universal",
    "aliases": ["spill_elimination", "variable_scoping_optimization", "algorithmic_register_reduction", "launch_bounds_tuning"],
@@ -236,7 +236,7 @@
    "realizations": [
     {"scope": "target:cuda", "how": "__launch_bounds__(threads, minBlocks), narrower live ranges, recompute cheap values instead of keeping them."}]},
 
-  {"id": "shared_memory_optimization", "level": "family", "scope": "simt_gpu",
+  {"id": "shared_memory_optimization", "level": "node", "scope": "simt_gpu",
    "aliases": ["dynamic_shared_memory", "shared_memory_reuse", "local_memory_reuse"],
    "mechanism": "less on-chip memory per block (reuse buffers, right-sized dynamic allocation) so more blocks are resident",
    "predicts": {"occupancy": "up"},
@@ -252,7 +252,7 @@
    "risks": [],
    "states": ["underutilized_compute"], "op_classes": [], "slot": true,
    "realizations": [
-    {"scope": "family:simt_gpu", "how": "Hoist bounds checks out of inner loops (interior/edge split), use predicated selects instead of divergent branches."}]},
+    {"scope": "node:simt_gpu", "how": "Hoist bounds checks out of inner loops (interior/edge split), use predicated selects instead of divergent branches."}]},
 
   {"id": "algorithmic_changes", "level": "universal",
    "aliases": ["algorithmic_optimization", "algorithmic_rebalancing", "dynamic_programming", "data_structure_optimizations"],
@@ -281,6 +281,6 @@
    "risks": [],
    "states": ["cache_thrashing", "dram_streaming", "memory_bound"], "op_classes": ["gemm", "conv", "attention"], "slot": true,
    "realizations": [
-    {"scope": "family:simt_gpu", "how": "Swizzle the block index (grouped/raster order) so concurrently running blocks share A/B tiles in L2."}]}
+    {"scope": "node:simt_gpu", "how": "Swizzle the block index (grouped/raster order) so concurrently running blocks share A/B tiles in L2."}]}
  ]
 }
