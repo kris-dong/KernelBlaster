@@ -163,7 +163,8 @@ atexit.register(flush)
 
 LLM_FIELDS = ("calls", "errors", "input_tokens", "uncached_input_tokens", "cache_read_input_tokens",
               "cache_write_input_tokens", "output_tokens", "cost_usd", "est_usd", "truncated", "latency_s",
-              "server_latency_s", "ttft_s", "provider_retries", "backoff_s", "backoffs")
+              "server_latency_s", "ttft_s", "provider_retries", "backoff_s", "backoffs", "relay_queue_s",
+              "relay_network_s")
 
 
 def _llm_zero() -> dict:

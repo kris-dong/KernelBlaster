@@ -294,6 +294,9 @@ def format_summary(s: dict, *, title: str, evs: Optional[list] = None, top: int 
                 for b in s["llm"]["by_role_model"]]
         out.append(_table(rows, ["role", "model", "calls", "err", "in", "cache_r", "cache_w", "out", "trunc",
                                  "lat_mean", "lat_max", "backoff_s", "usd"]))
+        if llm.get("relay_queue_s") or llm.get("relay_network_s"):
+            out.append(f"LLM relay (docs/llm_server.md): server queue {llm['relay_queue_s']:.1f} s, "
+                       f"network {llm['relay_network_s']:.1f} s over {llm['calls']} calls")
     if evs:
         tr = [e for e in evs if e.get("t") == "llm" and e.get("truncated")]
         if tr:

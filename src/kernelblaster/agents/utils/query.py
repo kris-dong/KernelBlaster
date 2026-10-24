@@ -26,10 +26,12 @@ from dataclasses import dataclass, asdict
 
 from ...config import config
 from ...telemetry.llm import backoff as _telemetry_backoff, llm_traced as _llm_traced
+from .llm_relay import RelayFatalError as _RelayFatalError
 
 __all__ = [
     "generate_code_openai",
     "generate_code",
+    "generate_code_direct",
     "generate_code_retry",
     "convert_messages_to_string",
     "LLMResponse",
@@ -446,7 +448,20 @@ async def generate_code_openai(client, messages, n_tasks, model: str) -> LLMResp
 
 @_llm_traced
 async def generate_code(messages, n_tasks=1, model=None) -> LLMResponse:
-    """Main function to generate code using either OpenAI REST interface or local models.
+    """Every LLM call goes through here (telemetry wraps it once).
+
+    With ``KB_LLM_SERVER_URL`` set the request is relayed to an LLM relay
+    server that makes the provider call (``llm_relay.py``,
+    ``docs/llm_server.md``); ``stub:`` models always run in-process.
+    """
+    from . import llm_relay
+    if llm_relay.relay_enabled(model):
+        return await llm_relay.generate_via_relay(messages, n_tasks, model)
+    return await generate_code_direct(messages, n_tasks, model)
+
+
+async def generate_code_direct(messages, n_tasks=1, model=None) -> LLMResponse:
+    """Provider dispatch in this process: OpenAI REST interface, Bedrock, local models.
 
     Supports:
     - OpenAI-compatible clients configured via OPENAI_API_KEY
@@ -625,6 +640,8 @@ async def generate_code_retry(
             )
         except NoResponseError as e:
             logger.error(f"No response from LLM. Response: {e}")
+        except _RelayFatalError:
+            raise                                  # relay: auth / budget / model not allowed
         except Exception as e:
             if "timeout" in str(e).lower() or "time-out" in str(e).lower():
                 delay = (2**tries) + random.uniform(0, 60)
