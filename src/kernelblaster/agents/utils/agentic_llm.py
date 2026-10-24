@@ -14,6 +14,8 @@ Two model-name prefixes are routed here by ``query.generate_code``:
 ``stub:<name>``
     Calls a Python function registered with :func:`register_stub`. Unit
     and integration tests use this to script responses deterministically.
+    The function returns the text, or a dict ``{"text": ..., "usage": {...}}``
+    to script token counts / stop reasons too (telemetry tests).
 
 Env:
     KB_CLAUDE_CLI            path to the ``claude`` binary (default: on PATH)
@@ -90,6 +92,10 @@ async def _claude_cli_once(messages: list, model: str) -> tuple[str, dict]:
         + u.get("cache_creation_input_tokens", 0),
         "completion_tokens": u.get("output_tokens", 0),
         "cost_usd": res.get("total_cost_usd", 0.0),
+        # telemetry (docs/telemetry.md); prompt_tokens above already includes the cache tokens
+        "cache_read_input_tokens": u.get("cache_read_input_tokens", 0),
+        "cache_creation_input_tokens": u.get("cache_creation_input_tokens", 0),
+        "telemetry": {"stop_reason": res.get("stop_reason"), "server_latency_ms": res.get("duration_api_ms", 0)},
     }
     return res.get("result", ""), usage
 
@@ -103,15 +109,28 @@ async def generate_code_agentic(messages: list, n_tasks: int, model: str):
         if name not in _stubs:
             raise RuntimeError(f"no stub registered for {model!r}")
         gens = []
+        usage = {"prompt_tokens": 0, "completion_tokens": 0}
         for _ in range(n_tasks):
             r = _stubs[name](messages)
-            gens.append(await r if inspect.isawaitable(r) else r)
-        usage = {"prompt_tokens": 0, "completion_tokens": 0}
+            r = await r if inspect.isawaitable(r) else r
+            if isinstance(r, dict):                # {"text", "usage"}: scripted usage
+                for k, v in (r.get("usage") or {}).items():
+                    if k == "stop_reason":
+                        usage.setdefault("telemetry", {}).setdefault("stop_reasons", []).append(v)
+                    elif isinstance(v, (int, float)) and not isinstance(v, bool):
+                        usage[k] = usage.get(k, 0) + v
+                    else:
+                        usage.setdefault("telemetry", {})[k] = v
+                r = r.get("text", "")
+            gens.append(r)
     else:
         outs = await asyncio.gather(*[
             _claude_cli_once(messages, model[len(CLAUDE_CODE_PREFIX):]) for _ in range(n_tasks)])
         gens = [o[0] for o in outs]
-        usage = {k: sum(o[1].get(k, 0) for o in outs)
-                 for k in ("prompt_tokens", "completion_tokens", "cost_usd")}
+        usage = {k: sum(o[1].get(k, 0) or 0 for o in outs)
+                 for k in ("prompt_tokens", "completion_tokens", "cost_usd", "cache_read_input_tokens",
+                           "cache_creation_input_tokens")}
+        usage["telemetry"] = {"stop_reasons": [o[1]["telemetry"]["stop_reason"] for o in outs],
+                              "server_latency_ms": sum(o[1]["telemetry"]["server_latency_ms"] or 0 for o in outs)}
     return LLMResponse(input_messages=messages, generations=gens, usage=usage, model=model,
                        num_tasks=n_tasks, elapsed_time=int(time.time() - start))

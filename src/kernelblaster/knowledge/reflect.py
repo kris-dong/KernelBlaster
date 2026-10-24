@@ -25,6 +25,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from ..telemetry.core import traced
+
 from .claims import (
     ACTIVE,
     APPLICABILITY,
@@ -526,6 +528,7 @@ class SemanticUpdater:
         return applied, rejected
 
     # -- public API -------------------------------------------------------
+    @traced("reflect", role="reflect")     # telemetry span; its LLM calls are role "reflect"
     async def maybe_reflect(self, *, force: bool = False) -> list[dict]:
         """Reflect when >= every_n records arrived since the last pass (``force``: >= 1).
 

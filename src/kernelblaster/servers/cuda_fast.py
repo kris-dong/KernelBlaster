@@ -46,6 +46,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from ..telemetry.core import traced
 from .utils.build_cache import BuildCache, cache_key, external_inputs, link_or_copy
 from .utils.subprocess import run_subprocess_shell
 
@@ -168,6 +169,7 @@ class FastCudaBuilder:
             self._toolchains[sm_version] = tc
             return tc
 
+    @traced("build.nvcc")                  # telemetry: compiler / linker process time
     async def _run(self, stage: str, template: str, cwd: Path, timeout: float, error_factory, **subst):
         cmd = template
         for k, v in subst.items():

@@ -21,6 +21,8 @@ import json
 from collections import Counter
 from typing import Any, Optional
 
+from ...telemetry.core import traced
+
 from ..claims import ACTIVE, APPLICABILITY, MAX_TEXT_CHARS, MECHANISM, PARAMETER, PITFALL, Claim
 from ..outcomes import COMPILE_ERROR, IMPROVED, NEUTRAL, REGRESSED, RUNTIME_ERROR, WRONG_OUTPUT
 from ..reflect import EditError, SemanticUpdater, apply_edit, validate_edit
@@ -345,6 +347,7 @@ class SemanticUpdaterV2(SemanticUpdater):
                                                             extra + 'Return {"edits": [...]} now.')
         return msgs
 
+    @traced("reflect", role="reflect")     # telemetry span; its LLM calls are role "reflect"
     async def maybe_reflect(self, *, force: bool = False) -> list[dict]:
         applied = await super().maybe_reflect(force=force)
         try:

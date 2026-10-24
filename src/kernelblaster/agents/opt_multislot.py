@@ -41,6 +41,7 @@ from typing import Any, Optional
 
 from loguru import logger as _default_logger
 
+from .. import telemetry as tel
 from ..knowledge import ncu as ncu_mod
 from ..knowledge.impl_store import ImplStore, shape_bucket
 from ..knowledge.outcomes import (COMPILE_ERROR, RUNTIME_ERROR, WRONG_OUTPUT, OutcomeLog,
@@ -168,6 +169,7 @@ def slot_state(problem: SlotProblem, sid: str, slot_us: float, arch: str,
 FUSABLE_CONSUMERS = ("elementwise",)
 
 
+@tel.traced("proposals")
 def propose_fusions(problem: SlotProblem, result: EvalResult, arch: str, min_gain_pct: float = 2.0,
                     arch_label: Optional[str] = None) -> dict:
     """``kb-proposal/1``: fuse producer->consumer pairs where the consumer is an
@@ -231,6 +233,7 @@ def _efficiency(problem: SlotProblem, ops: list[dict], us: float, arch: str) -> 
     return max(byt / t / 1e9 / peak_b, fl / t / 1e9 / peak_f)
 
 
+@tel.traced("proposals")
 def propose_splits(problem: SlotProblem, result: EvalResult, arch: str, min_gain_pct: float = 2.0) -> list[dict]:
     """``kb-proposal/1`` "split" proposals: give a slot shape-specialised
     variants when its instances fall into several shape buckets and the one
@@ -466,6 +469,7 @@ def build_fix_messages(*, problem: SlotProblem, sid: str, source: str, error: st
              f"Current source:\n```{tp.fence}\n{source}\n```"}]
 
 
+@tel.traced("extract")
 def extract_code(text: str) -> Optional[str]:
     blocks = re.findall(r"```(?:cuda|cpp|c\+\+|cu|c)?\s*\n(.*?)```", text, re.S)
     if not blocks:
@@ -653,7 +657,8 @@ class MultiSlotAgent:
 
     async def _llm(self, messages, model, role: str = "codegen") -> str:
         self.llm_calls += 1
-        resp = await generate_code_retry(messages, model, self.log, n_tasks=1)
+        with tel.attrs(role=role):            # telemetry: the llm.<role> span + token record
+            resp = await generate_code_retry(messages, model, self.log, n_tasks=1)
         u = getattr(resp, "usage", None) or {}
         if not isinstance(u, dict):
             u = {k: getattr(u, k, 0) for k in ("prompt_tokens", "completion_tokens")}
@@ -735,6 +740,7 @@ class MultiSlotAgent:
         return rec.id
 
     # ---- initialise: baseline + store seeds
+    @tel.traced("init")
     async def initialize(self) -> EvalResult:
         seeds = self.p.seed_sources()
         base = await self.ev.evaluate(self.p, seeds, "baseline")
@@ -775,7 +781,24 @@ class MultiSlotAgent:
 
     # ---- one step
     async def _step(self, ridx: int, step: int, cur: dict[str, str], cur_us: dict[str, float]) -> None:
+        """One step inside a telemetry ``step`` span; its breakdown goes into the step's context."""
+        n = len(self.steps_log)
+        with tel.span("step", collect=True, laps=True, rollout=ridx, step=step) as sp:
+            tel.count("step")
+            try:
+                await self._step_body(ridx, step, cur, cur_us)
+            finally:
+                tel.end_laps(sp)
+        summ = tel.ctx_summary(sp)
+        if summ is not None:
+            for s in reversed(self.steps_log[n:]):
+                if s.rollout == ridx and s.step == step:
+                    s.context["telemetry"] = summ
+                    break
+
+    async def _step_body(self, ridx: int, step: int, cur: dict[str, str], cur_us: dict[str, float]) -> None:
         t0 = time.time()
+        tel.lap("knowledge.select")
         async with self._lock:
             sid = self._pick_slot()
             self.slot_tries[sid] += 1
@@ -801,6 +824,7 @@ class MultiSlotAgent:
             key = f"{slot.op_class}|{state}" + ("" if self.p.dtype == "fp32" else f"|{self.p.dtype}")
             tech = self.bandit.select(key, [t for t, _ in techs], self.rng)
             desc = dict(techs)[tech]
+        tel.lap("knowledge.lookup", slot=sid)
         r = self._retrieve(sid)
         examples = []
         if self.store is not None:
@@ -818,6 +842,7 @@ class MultiSlotAgent:
             tried = self.kv.already_tried(self.problem_id, sid)
         else:
             ktext, tried = self._knowledge(sid, state, tech)
+        tel.lap("prompt.build")
         part_us = sum(cur_us.values())
         neigh = [(n, self.p.slots[n].signature) for n in self.p.neighbours(sid)]
         best_note = (f"Best verified so far for this slot: {self.best[sid].slot_us:.1f} us."
@@ -833,6 +858,7 @@ class MultiSlotAgent:
                                                share=self._share(sid), stall=self.slot_stall[sid],
                                                kind=choice.kind if choice is not None else "technique")
         text = await self._llm(msgs, model, role)
+        tel.lap("candidate", technique=tech)
         code = extract_code(text)
         fix_models = []
         fixes, res, status = 0, None, None
@@ -874,6 +900,7 @@ class MultiSlotAgent:
             speedup = None
             status = {"compile": COMPILE_ERROR, "run": RUNTIME_ERROR}.get(res.stage, WRONG_OUTPUT)
             reward = -0.05 if status == COMPILE_ERROR else -0.1
+        tel.lap("knowledge.record")
         if self.kv is None:
             self.bandit.update(key, tech, reward)
         prof_after = None
@@ -892,6 +919,7 @@ class MultiSlotAgent:
             if res.ok and after < self.best[sid].slot_us * (1 - self.confirm_pct / 100):
                 self.best[sid] = SlotBest(code, after, impl_id, self.best[sid].techniques + [tech])
                 self.slot_stall[sid] = 0
+                tel.count("win")
                 self.log.info(f"[{self.p.name}] r{ridx} s{step}: {sid} {before:.1f} -> {after:.1f} us "
                               f"via {tech} (new slot best)")
             else:
@@ -953,6 +981,16 @@ class MultiSlotAgent:
 
     # ---- run
     async def run(self) -> dict:
+        """``_run`` inside a telemetry ``problem`` span; result.json gets its breakdown."""
+        with tel.span("problem", collect=True, problem=self.problem_id) as sp:
+            result = await self._run()
+        summ = tel.full_summary(sp)
+        if summ is not None:
+            result["telemetry"] = summ
+            (self.out / "result.json").write_text(json.dumps(result, indent=1, default=str))
+        return result
+
+    async def _run(self) -> dict:
         if self.baseline is None:
             await self.initialize()
         await asyncio.gather(*[self._rollout(i) for i in range(self.rollouts)])
@@ -992,6 +1030,7 @@ class MultiSlotAgent:
             self.claims.save()
         return result
 
+    @tel.traced("io.result")
     def _write_result(self, final: EvalResult) -> dict:
         best_dir = self.out / "best" / "slots"
         best_dir.mkdir(parents=True, exist_ok=True)

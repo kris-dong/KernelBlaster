@@ -136,6 +136,16 @@ attributed, the profile run, and the scripted agent end to end; `KB_OPENCL_BOARD
 - **Example.** `--model us.anthropic.claude-haiku-5-5 --model-hard us.anthropic.claude-sonnet-5-5 --hetero-policy category,stall:3,fix-escalate` on the ResNet block (sm_75, 2×5 steps) gave 25× in 12 calls. The 4 Sonnet calls cost $0.47; the 8 Haiku calls (6 codegen, 2 fix) cost $0.15.
 - **Output length.** Long structural rewrites from the hard model can exceed Bedrock's default 8192-token output limit. A truncated reply has no code block and is counted as a compile error. Set `BEDROCK_MAX_TOKENS=16384` for the hard model.
 
+## Telemetry
+
+Every run records per-LLM-call tokens (input, cache, output), stop reasons / truncation, latency and cost by role and model, and a wall-clock breakdown of the agent loop. The breakdown covers prompt, LLM wait, compile queue vs nvcc, GPU-lease wait, driver phases, NCU, knowledge and I/O.
+
+- **Where it is written.** Per step in `result.json` (`steps[].context.telemetry`), per problem (`telemetry`), per run (`summary.json`), and as events in `OUT/telemetry.jsonl`.
+- **Reports.** `scripts/telemetry_report.py OUT` prints the tables.
+- **Switching it off.** `KB_TELEMETRY=0`.
+
+See [telemetry.md](telemetry.md).
+
 ## Notes
 
 - `KERNELBLASTER_ALLOW_SHARED_GPU=1` lets the exec server start when other processes use the

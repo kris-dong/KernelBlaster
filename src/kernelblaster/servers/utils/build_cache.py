@@ -31,6 +31,8 @@ import uuid
 from pathlib import Path
 from typing import Awaitable, Callable, Iterable
 
+from ...telemetry.core import count as _tel_count
+
 # absolute paths a TU pulls in that are not part of its text
 _ABS_INPUT_RE = re.compile(r'(?:\.incbin\s+\\?"|#\s*include\s+")(/[^"\\]+)')
 
@@ -82,6 +84,7 @@ class BuildCache:
         async with lock:
             if dst.exists():
                 self.hits += 1
+                _tel_count("build.cache_hit")
                 return dst, True
             dst.parent.mkdir(parents=True, exist_ok=True)
             tmp = dst.with_name(f".{dst.name}.{uuid.uuid4().hex[:8]}.tmp")
@@ -94,6 +97,7 @@ class BuildCache:
                 if tmp.exists():
                     tmp.unlink()
             self.misses += 1
+            _tel_count("build.cache_miss")
             return dst, False
 
 
