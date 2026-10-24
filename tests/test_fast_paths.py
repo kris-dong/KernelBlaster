@@ -284,3 +284,28 @@ def test_fast_and_cmake_builds_agree(tmp_path, env_root, monkeypatch):
     lenet_exe = env_root / "persistent" / "lenet_fast" / f"build_sm_{ARCH}" / "main"
     libs = subprocess.run(["ldd", str(lenet_exe)], capture_output=True, text=True).stdout
     assert "libtorch" not in libs                                         # plain flavour
+
+
+# ---------------------------------------------------------------- exec by path
+
+
+def test_exec_by_path_only_for_local_servers(monkeypatch):
+    from kernelblaster.agents.utils import commands
+
+    monkeypatch.delenv("KERNELBLASTER_EXEC_BY_PATH", raising=False)
+    assert commands._exec_by_path("http://127.0.0.1:2002")
+    assert commands._exec_by_path("http://localhost:2002")
+    assert not commands._exec_by_path("https://api.nvcf.nvidia.com/x")
+    monkeypatch.setenv("KERNELBLASTER_EXEC_BY_PATH", "0")
+    assert not commands._exec_by_path("http://127.0.0.1:2002")
+
+
+def test_local_exec_runs_binary_in_place(tmp_path):
+    from kernelblaster.servers.strategies import LocalExecStrategy
+
+    exe = tmp_path / "my prog"
+    exe.write_text("#!/bin/sh\necho ran \"$0\"\n")
+    exe.chmod(0o755)
+    out, _ = asyncio.run(LocalExecStrategy(gpu_ids=["0"]).exec(
+        worker_id=0, binary_data=b"", filename=exe.name, binary_path=str(exe)))
+    assert out.strip() == f"ran {exe}" and exe.exists()

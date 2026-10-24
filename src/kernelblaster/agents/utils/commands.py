@@ -43,6 +43,53 @@ __all__ = [
 ]
 
 
+# exec servers that rejected ``binary_path`` (older servers need the upload)
+_NO_PATH_EXEC: set[str] = set()
+
+
+def _exec_by_path(url: Optional[str]) -> bool:
+    """Same-host exec server: send the binary's path instead of its bytes
+    (skips the upload and the server's temp copy + fsync -- ~0.7 s for a
+    100 MB multi-slot binary). ``KERNELBLASTER_EXEC_BY_PATH=0`` disables."""
+    if not url or url in _NO_PATH_EXEC:
+        return False
+    if os.getenv("KERNELBLASTER_EXEC_BY_PATH", "1").lower() in ("0", "false", "no", "off"):
+        return False
+    from urllib.parse import urlparse
+
+    return urlparse(url).hostname in ("127.0.0.1", "localhost", "::1")
+
+
+async def _run_gpu_binary_by_path(binary_path, url, timeout, job_name, env_vars, prefix_command, n_runs):
+    """``/gpu/binary`` with ``binary_path``; None if the server wants the upload."""
+    data = aiohttp.FormData()
+    data.add_field("binary_path", str(Path(binary_path).resolve()))
+    data.add_field("n_runs", str(n_runs))
+    data.add_field("timeout", str(timeout))
+    if env_vars:
+        data.add_field("env_vars", json.dumps(env_vars))
+    if prefix_command:
+        data.add_field("prefix_command", prefix_command)
+    client_timeout = aiohttp.ClientTimeout(total=timeout + 3600)
+    async with TCPClient.get_session().post(
+        f"{url}/gpu/binary", data=data, timeout=client_timeout
+    ) as response:
+        if response.status in (400, 422):
+            # older server (binary required) or a path it cannot see
+            logger.info(f"{url} does not run binaries by path ({response.status}); uploading")
+            _NO_PATH_EXEC.add(url)
+            return None
+        if response.status != 200:
+            raise FeedbackError(
+                f"GPU execution failed for {job_name}: {await response.text()}"
+            )
+        result = await response.json()
+    if not result.get("success", False):
+        error_message = result.get("message", result.get("detail", "Unknown error"))
+        raise FeedbackError(f"Execution failed for {job_name}: {error_message}")
+    return result.get("stdout", ""), result.get("stderr", "")
+
+
 async def _run_gpu_binary(
     binary_path,
     url,
@@ -54,6 +101,17 @@ async def _run_gpu_binary(
     attempt=0,
 ):
     """Execute a binary via the new GPU binary upload endpoint."""
+    if attempt == 0 and _exec_by_path(url) and os.path.exists(binary_path):
+        try:
+            out = await _run_gpu_binary_by_path(
+                binary_path, url, timeout, job_name, env_vars, prefix_command, n_runs
+            )
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            # the upload path below has the historical retry/error semantics
+            logger.warning(f"exec by path failed for {job_name}: {e!r}; uploading")
+            out = None
+        if out is not None:
+            return out
     try:
         # Read the binary file first to get size info
         with open(binary_path, "rb") as f:
