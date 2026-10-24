@@ -33,10 +33,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <string>
 #include <vector>
 
 #define MB_THREADS 256
+// _Float16 in host signatures (the CUDA spelling, cuda_dtypes.cuda_signature):
+// 2-byte binary16 storage; kernels read and write it with vload_half / vstore_half
+typedef cl_half __half;
 
 // Device prelude: prepended to every program.
 static const char *mb_cl_prelude = R"CL(
@@ -88,6 +92,7 @@ struct mb_runtime {
     std::vector<mb_kinfo> kinfo; // every kernel created, with the op that first used it
     std::string build_opts;      // global extra options (env MB_CL_OPTS)
     std::deque<std::string> names;   // kernel names (stable addresses for events)
+    std::map<std::pair<cl_kernel, unsigned>, cl_kernel> variants;   // (kernel, NULL-arg mask) -> kernel object
 };
 mb_runtime mb_rt;
 
@@ -196,8 +201,37 @@ static const char *mb_kernel_name(cl_kernel k) {
     return "?";
 }
 
+// NULL pointer arguments: some ICDs (NVIDIA) reject a NULL argument once that
+// argument held an SVM pointer, so each pattern of NULL arguments gets its own
+// kernel object (bias-less and biased calls of one conv/linear slot)
+template <class T> static void mb_null(unsigned &m, cl_uint i, T *p) { if (!p) m |= 1u << (i & 31); }
+static void mb_null(unsigned &m, cl_uint i, std::nullptr_t) { m |= 1u << (i & 31); }
+template <class T> static void mb_null(unsigned &, cl_uint, const T &) {}
+static void mb_null_mask(unsigned &, cl_uint) {}
+template <class A, class... R> static void mb_null_mask(unsigned &m, cl_uint i, A a, R... r) {
+    mb_null(m, i, a); mb_null_mask(m, i + 1, r...);
+}
+static cl_kernel mb_variant(cl_kernel k, unsigned mask) {
+    auto key = std::make_pair(k, mask);
+    auto it = mb_rt.variants.find(key);
+    if (it != mb_rt.variants.end()) return it->second;
+    for (size_t j = 0; j < mb_rt.kinfo.size(); ++j) {
+        mb_kinfo ki = mb_rt.kinfo[j];
+        if (ki.k != k) continue;
+        cl_int e;
+        cl_kernel v = clCreateKernel(ki.prog->prog, ki.name, &e);
+        if (e != CL_SUCCESS) { mb_error("clCreateKernel %s: error %d", ki.name, e); return NULL; }
+        mb_rt.kinfo.push_back({ki.prog, ki.name, v, ki.op});
+        return mb_rt.variants[key] = v;
+    }
+    return k;
+}
+
 template <class... A> void mb_launch(cl_kernel k, const mb_range &r, A... args) {
     if (mb_rt.failed || !k) return;
+    unsigned nulls = 0;
+    mb_null_mask(nulls, 0, args...);
+    if (nulls && !(k = mb_variant(k, nulls))) return;
     if (mb_set_args(k, 0, args...)) return;
     cl_event ev = NULL;
     cl_int e = clEnqueueNDRangeKernel(mb_rt.queue, k, r.dims, NULL, r.g, r.l[0] ? r.l : NULL, 0, NULL, &ev);
