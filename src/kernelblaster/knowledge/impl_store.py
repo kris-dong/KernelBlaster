@@ -139,13 +139,20 @@ class ImplStore:
         same_op = [r for r in recs if r.op == op and r.signature_sha == sig]
         exact = [r for r in same_op if r.arch == arch and want <= set(r.buckets)]
         seed = min(exact, key=lambda r: r.slot_us / max(len(r.shapes), 1), default=None)
-        others = [r for r in same_op if r is not seed]
-        adapt = None if seed else max(others, key=lambda r: (r.arch == arch, r.speedup_vs_seed or 0), default=None)
+        # adapt only from records that share a shape bucket with this slot: a
+        # winner tuned for unrelated shapes anchors the LLM on the wrong
+        # blocking (ResNet18 given a ResNet-block conv: 5.4x vs 25x without);
+        # those become ideas-only examples instead
+        others = [r for r in same_op if r is not seed and (r.speedup_vs_seed or 0) > 1.05]
+        near = [r for r in others if want & set(r.buckets)]
+        adapt = None if seed else max(near, key=lambda r: (r.arch == arch, r.speedup_vs_seed or 0), default=None)
+        far = [] if seed or adapt else sorted(others, key=lambda r: -(r.speedup_vs_seed or 0))[:1]
         ex = [r for r in recs if r.op_class == op_class and r.op != op and (r.speedup_vs_seed or 0) > 1.05]
         best_per_op = {}
         for r in sorted(ex, key=lambda r: -(r.speedup_vs_seed or 0)):
             best_per_op.setdefault(r.op, r)
-        return {"seed": seed, "adapt": adapt, "examples": list(best_per_op.values())[:n_examples]}
+        return {"seed": seed, "adapt": adapt,
+                "examples": (far + list(best_per_op.values()))[:n_examples]}
 
     def winners(self, *, target: str = "cuda", arch: Optional[str] = None) -> list[ImplRecord]:
         """Fastest verified record per (op, signature, arch, shape set)."""
