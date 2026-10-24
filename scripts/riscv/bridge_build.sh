@@ -3,12 +3,13 @@
 # against the modelblaster pipeline (P5.12).
 #
 # Semantics: the RL loop generates a candidate kernel implementation
-# (a single .c file). We drop it into modelblaster's pre-staged
-# ``generated/<TARGET>/kernels.c`` slot and run an INCREMENTAL west
-# build (``-p never``) — the harness, driver, weights.c, io header,
-# and every Zephyr subsystem are already compiled; only ``kernels.c``
-# changes each step, so this is a fast recompile (typically < 20 s
-# vs 60+ s for a pristine build).
+# (a single .c file). We build it against a per-candidate copy of
+# modelblaster's pre-staged ``generated/<TARGET>/`` dir: every file is
+# symlinked to the shared stage except ``kernels.c``, which is the
+# candidate. The shared ``kernels.c`` is never written, so concurrent
+# compile-server workers (``--num-workers N``) can't build each other's
+# code. An existing build dir gets an INCREMENTAL west build
+# (``-p never``); only ``kernels.c`` differs, so that's a fast recompile.
 #
 # Contract with ZephyrCompileStrategy:
 #   KERNELBLASTER_ZEPHYR_BUILD_CMD='bash <this> {job_name} {source_file} {output_path} {board}'
@@ -42,6 +43,8 @@ TARGET="${KERNELBLASTER_MODELBLASTER_TARGET}"
 GEN_DIR="${STAGE}/generated/${TARGET}"
 # Separate build dir per-worker so concurrent workers don't collide.
 BUILD_DIR="${STAGE}/build/${TARGET}_rl_$(basename "${OUT%.elf}")"
+# ... and a separate MODEL_DIR, so they don't share kernels.c either.
+MODEL_DIR="${BUILD_DIR}_model"
 KERNELS_C="${GEN_DIR}/kernels.c"
 
 if [[ ! -f "${KERNELS_C}" ]]; then
@@ -51,12 +54,23 @@ if [[ ! -f "${KERNELS_C}" ]]; then
     exit 1
 fi
 
-# Drop the RL-generated kernel into the staged slot. Back up the original
-# once so a botched RL kernel never clobbers the reference baseline.
-if [[ ! -f "${KERNELS_C}.orig" ]]; then
-    cp "${KERNELS_C}" "${KERNELS_C}.orig"
-fi
-cp "${SRC}" "${KERNELS_C}"
+# Per-candidate MODEL_DIR: symlink the shared stage's files (model.c,
+# weights.c, test_io.S, ... — test_io.S .incbin's absolute paths, so
+# the big blobs are read from the stage either way) and drop the
+# RL-generated kernel in as a real kernels.c. Rebuilt every call so it
+# tracks the stage; the symlinks' mtimes don't change, so an
+# incremental build only recompiles kernels.c.
+mkdir -p "${MODEL_DIR}"
+for f in "${GEN_DIR}"/*; do
+    name="$(basename "${f}")"
+    case "${name}" in
+        kernels.c|kernels.c.orig) continue ;;
+    esac
+    ln -sfn "${f}" "${MODEL_DIR}/${name}"
+done
+# rm first: never write through a stale symlink into the shared stage.
+rm -f "${MODEL_DIR}/kernels.c"
+cp "${SRC}" "${MODEL_DIR}/kernels.c"
 
 # west build must be invoked from within the workspace. We chdir to the
 # zephyr-chipyard-sw repo root and give it a repo-relative harness path.
@@ -88,7 +102,7 @@ print(';'.join(b.resolved_kernel_cflags('${REPO_ROOT}/modelblaster')))
 " 2>/dev/null || echo "")
 
 WEST_CMAKE_ARGS=(
-    "-DMODEL_DIR=${GEN_DIR}"
+    "-DMODEL_DIR=${MODEL_DIR}"
     "-DMODELBLASTER_BACKEND=${TARGET}"
 )
 if [[ -n "${KERNEL_CFLAGS}" ]]; then
