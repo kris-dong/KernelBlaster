@@ -241,3 +241,36 @@ def test_board_evaluator(tmp_path):
         assert not r2.ok and r2.stage == "compile"
     finally:
         asyncio.run(ev.close())
+
+
+def test_server_evaluator_plumbing(tmp_path, monkeypatch):
+    """OpenCLServerEvaluator: one main.cpp through compile_opencl, data.bin as a kernel file,
+    the driver pointed at ./data.bin (and `profile` as argv[2]); the servers are faked here."""
+    from kernelblaster.agents.utils import commands
+    from kernelblaster.knowledge.slots import OpenCLServerEvaluator
+
+    p = SlotProblem(FIX)
+    seen = {}
+
+    async def fake_compile(main, kernel, gpu, timeout=0, job_name="", remote=True):
+        seen["main"], seen["remote"] = Path(main).read_text(), remote
+        return str(tmp_path / "exe")
+
+    async def fake_run(exe, gpu, timeout, job_name, kernel_files=None, extra_files=None, n_runs=1,
+                       profile=False, extra_args=""):
+        seen.setdefault("runs", []).append((kernel_files, extra_args))
+        return (DRIVER_OUT if "profile" not in extra_args else
+                DRIVER_OUT.replace("passed\n", "MB_PROFILE_DONE\n")), ""
+
+    monkeypatch.setattr(commands, "compile_opencl", fake_compile)
+    monkeypatch.setattr(commands, "run_adreno_executable", fake_run)
+    ev = OpenCLServerEvaluator("adreno650", tmp_path / "work")
+    r = asyncio.run(ev.evaluate(p, p.seed_sources(), "srv"))
+    assert r.ok and r.partition_us == 120.5
+    assert "#define MB_SINGLE_TU 1" in seen["main"] and seen["remote"]
+    files, args = seen["runs"][0]
+    assert files == [str(p.root / "data.bin")] and args == "data.bin"
+    prof, err = asyncio.run(ev.profile(p, p.seed_sources(), "srv"))
+    assert err is None and "linear" in prof and seen["runs"][1][1] == "data.bin profile"
+    bad = asyncio.run(ev.evaluate(p, {**p.seed_sources(), "relu": "void f() { clFinish(q); }"}, "srv"))
+    assert not bad.ok and bad.stage == "compile"
