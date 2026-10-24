@@ -1,7 +1,8 @@
 # Knowledge architecture v2: cross-target, mechanism-aware, hypothesis-driven
 
-Status: design (Phase 2 of the multi-slot work). Implementation follows the order in
-"Plan". Companion docs: `docs/semantic_update_pass.md` (claims + reflection, v1),
+Status: steps 1-6 of "Plan" implemented in `src/kernelblaster/knowledge/v2/`, behind a switch
+(`run_multislot.py --knowledge v2`, `KB_KNOWLEDGE=v2` for the single-file flows); v1 stays the
+default. Evaluation (step 7) results and the deviations from this design are in section 14. Companion docs: `docs/semantic_update_pass.md` (claims + reflection, v1),
 `docs/multislot_optimization.md`, ModelBlaster `docs/kernelblaster_multislot.md`.
 
 ## 1. Why
@@ -242,3 +243,43 @@ Retrieval for a slot builds a budgeted prompt section, most specific first:
 | state definition | predicates over canonical metrics | LLM-described profiles | testable, deterministic, mergeable |
 | value inheritance | statistical shrinkage to parent | copying technique lists into new states | no duplicated, drifting entries; evidence flows both ways |
 | store | SQLite (WAL) | JSON files | concurrency, queries across entities, one source of truth |
+
+## 14. Implementation (steps 1-6) and evaluation
+
+### Where things are
+
+| step | module (`knowledge/v2/`) | seed data (`data/kernelblaster/knowledge/`) |
+|---|---|---|
+| 1 levels, targets | `targets.py` | `targets.json` |
+| 1 canonical metrics, adapters | `metrics.py`: `NCUAdapter` (per-slot `ncu.summarize`), `NCUTextAdapter` (single-file text reports), `roofline_vector` (any target), `AdrenoAdapter` / `MCycleAdapter` stubs | |
+| 1 predicate DSL | `predicates.py` (`all`/`any`/`not`, metric comparisons incl. `ref` to another metric, `op_class`/`dtype`/`family`/`target in`) | |
+| 1 states + classifier | `states.py` | `states.json` (15 seed states, `legacy_map` for the 16 technique-DB and the v1 roofline names) |
+| 2 ontology + mechanism check | `ontology.py` (`seed_legacy` reads the old JSON DB and the three footers once) | `techniques.json` (27 curated, 84 v1/DB/footer names folded in as aliases, 21 imported as `slot=false`) |
+| 3 hierarchical stats | `stats.py` | |
+| 4 store, claims, reflection | `store.py` (`KnowledgeDB`, `SQLiteOutcomeLog`, `SQLiteClaimStore`), `reflect_v2.py` (`lift`, `mechanism`, `SemanticUpdaterV2`); `claims.Claim` gains `level`, `family`, `hypothesis_id`, kind `mechanism` | |
+| 5 hypotheses | `hypotheses.py` (`HypothesisBook`, `validate_spec`, graph hypotheses) | |
+| 6 state discovery | `discovery.py` | |
+| facade | `knowledge.py` (`KnowledgeV2`: vector, classify, select, retrieve, record, maybe_upkeep) | |
+
+Integration: `MultiSlotAgent(knowledge_v2=...)` (the bandit, roofline state and claims lookup are
+replaced; nothing changes when it is unset); `run_multislot.py --knowledge v2 --upkeep-model M
+[--upkeep-every 8 --explore-frac 0.15]`; `SemanticKnowledge(version="v2")` / `KB_KNOWLEDGE=v2`
+for `opt_ncu_rl_optimized` (its NCU text reports are passed to `record()` and classified through
+`NCUTextAdapter`; the technique-DB state is kept as `legacy_state` and the DB keeps working as
+before). `scripts/eval_knowledge_v2.py` runs the offline checks on v1 logs or v2 databases.
+Tests: `tests/test_knowledge_v2.py`.
+
+### Deviations (smallest change the code forced; see also the Decisions table)
+
+| design | implemented | why |
+|---|---|---|
+| `targets.yaml`, YAML seeds | JSON (`targets.json`, `states.json`, `techniques.json`) | no PyYAML in the environment; JSON loads the same and is diffable |
+| `occupancy` = achieved / theoretical | achieved occupancy, % of the hardware maximum | it is what NCU and the single-file report give directly; the theoretical limit is reflected in `reg_pressure` and the `register_limited` / `stalled_low_occupancy` states |
+| seed roots `memory_bound` (bw >= 50, compute < 40), `latency_bound` | five ordered roots: `latency_bound`, `balanced_bound`, `memory_bound` (`mem_util >= 50`, compute below it), `compute_bound`, `underutilized` (both < 50) | with both utilisations present the roots are total (nothing is unexplained); roofline estimates rarely reach 50 % of peak, so the old 15 %-threshold roofline names map to `underutilized > underutilized_memory|compute` |
+| stats ancestors "(family, ..., universal, parent states)" | one linear path: target -> family -> universal at the leaf state, then the state chain at universal, then op class `*` (fp16 adds a most specific node) | the shrinkage recursion needs one parent per node; a parent node includes its children's data (empirical-Bayes approximation) |
+| `realizations` linked to impl-store exemplars | realizations carry `how` / `params_prior`; impl-store records keep `techniques` (now ontology ids) | the store's retrieval by op/shape already supplies exemplars; no schema change needed |
+| claims "level + scope" | `level` + `family` on the v1 claim; target-level claims keep v1's backend + optional arch scope | v1 claims load unchanged as target-level |
+| promotion "mechanism confirmed in >= 50 % of measured attempts" | same; with no measured attempt the gate is skipped and recorded ("mechanism unmeasured") | roofline-only targets could never promote otherwise |
+| hypothesis generation "cheap model" | the upkeep model is configurable (`--upkeep-model`); runs below used Sonnet for generation and state discovery, Haiku for codegen and reflection | design reasoning quality matters most there |
+| graph-level hypotheses with the same lifecycle | kb-proposals become `kind=graph` hypotheses keyed by ModelBlaster's `graph_hints/v1` ids (`fuse:<kind>`, `split:<slot>`); MB's accepted / rejected decisions are synced into promoted / retired (`sync_graph_hints`) | MB's hint layer already owns building and deciding graph changes; KB does not duplicate it |
+| "already tried" tally in the claim store | derived from the outcomes table | one source of truth, safe across processes |
