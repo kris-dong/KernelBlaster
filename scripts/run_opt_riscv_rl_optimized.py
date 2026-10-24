@@ -464,6 +464,7 @@ async def async_main(args: argparse.Namespace) -> int:
         io_npz_path=io_npz,
         spike_args_str=args.spike_extra_args or "",
         use_exec_batching=not args.no_exec_batching,
+        modelblaster_target=args.target,
     )
 
     logger.info("=" * 72)

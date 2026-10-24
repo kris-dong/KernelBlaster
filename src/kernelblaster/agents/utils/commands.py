@@ -969,6 +969,7 @@ async def compile_and_run_riscv_batched(
     io_npz_path: Optional[Path] = None,
     spike_args_str: str = "",
     passed_keyword: Optional[str] = None,
+    target: Optional[str] = None,
 ) -> tuple[list[str], list[str], str, bool]:
     """Batched variant of :func:`compile_and_run_riscv`.
 
@@ -988,6 +989,12 @@ async def compile_and_run_riscv_batched(
     seamlessly. Failure semantics also match: any per-job
     ``success=False`` re-raises as :class:`FeedbackError`, letting the
     RL fix-loop catch it unchanged.
+
+    ``target`` is the modelblaster backend (``scalar`` / ``rvv`` / ...)
+    the per-problem stage was built for; the fuse script stages against
+    ``<stage>/generated/<target>``. ``None`` → the
+    ``KERNELBLASTER_MODELBLASTER_TARGET`` env var (same knob
+    ``bridge_build.sh`` reads), then a board-name guess as last resort.
     """
     if batch_client is None:
         return await compile_and_run_riscv(
@@ -1023,30 +1030,31 @@ async def compile_and_run_riscv_batched(
     # gracefully to per-ELF batching.
     base_stage_dir: Optional[Path] = None
     mid: Optional[str] = None
-    target: str = "rvv"
+    target = target or os.getenv("KERNELBLASTER_MODELBLASTER_TARGET")
     if io_npz_path is not None:
         _io_abs = io_npz_path.resolve()
         # io.npz lives at <stage>/generated/io.npz, so:
         #   parent = <stage>/generated
         #   parent.parent = <stage> = kb_<name>/<quant>
         #   parent.parent.parent.name = kb_<name>
-        base_stage_dir = _io_abs.parent.parent  # <stage>/generated/rvv
-        # Actually we want the per-target generated dir. Try to infer
-        # target from the kernel source path (KernelBlaster writes
-        # RL candidates alongside `<stage>/generated/<target>/`).
-        try:
-            # kernel_filepath is the LLM's out .c, not under stage.
-            # target comes from GPU.zephyr_board via the compile server
-            # dispatch — fall back to 'rvv' which is the default target
-            # for the current RISC-V flows.
-            target = gpu.zephyr_board.split("/")[0].replace(
-                "_riscv64", ""
-            ).replace("spike_", "").replace("chipyard_", "")
-            # Normalise: "" / unexpected → 'rvv'
-            if not target or target in ("chipyard", "spike"):
+        if not target:
+            # Last resort: guess from GPU.zephyr_board. The board does
+            # not encode the backend (spike_riscv64 runs scalar and rvv
+            # alike), so this mostly lands on 'rvv'.
+            try:
+                target = gpu.zephyr_board.split("/")[0].replace(
+                    "_riscv64", ""
+                ).replace("spike_", "").replace("chipyard_", "")
+                # Normalise: "" / unexpected → 'rvv'
+                if not target or target in ("chipyard", "spike"):
+                    target = "rvv"
+            except Exception:
                 target = "rvv"
-        except Exception:
-            target = "rvv"
+            logger.warning(
+                f"RISC-V batched exec: modelblaster target not given and "
+                f"KERNELBLASTER_MODELBLASTER_TARGET unset; guessed "
+                f"target={target!r} from the board name"
+            )
         base_stage_dir = _io_abs.parent / target  # <stage>/generated/<target>
         # mid = the kb_<name> segment two levels up from <stage>/generated
         try:
@@ -1071,7 +1079,7 @@ async def compile_and_run_riscv_batched(
         source_c_path=kernel_filepath,
         base_stage_dir=base_stage_dir,
         mid=mid,
-        target=target,
+        target=target or "rvv",
         board=board,
     )
     logger.info(
