@@ -17,3 +17,4 @@
 v1 (``knowledge.claims`` / ``reflect`` / the JSON technique DB) stays the
 default; agents take v2 behind a switch (``run_multislot.py --knowledge v2``).
 """
+from .knowledge import Choice, KnowledgeV2  # noqa: F401

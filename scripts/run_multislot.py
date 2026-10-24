@@ -91,11 +91,22 @@ async def _run(args) -> int:
     out.mkdir(parents=True, exist_ok=True)
     kdir = Path(args.knowledge_dir or out / "knowledge").resolve()
     store = ImplStore(kdir / "impl")
-    olog = OutcomeLog(kdir / "outcomes.jsonl")
-    claims = ClaimStore(kdir / "claims.json")
-    updater = (SemanticUpdater(olog, claims, model=args.reflect_model, every_n=args.reflect_every,
-                               logger=logger, trace_dir=kdir / "reflect_traces")
-               if args.reflect_model else None)
+    kv = None
+    if args.knowledge == "v2":
+        # knowledge.db (SQLite) replaces outcomes.jsonl + claims.json; see docs/knowledge_architecture.md
+        from kernelblaster.knowledge.v2 import KnowledgeV2
+        from kernelblaster.knowledge.v2.reflect_v2 import SemanticUpdaterV2
+        kv = KnowledgeV2(kdir, upkeep_model=args.upkeep_model, logger=logger, upkeep_every=args.upkeep_every,
+                         explore_frac=args.explore_frac)
+        olog, claims = kv.outcomes, kv.claims
+        updater = (SemanticUpdaterV2(kv, model=args.reflect_model, every_n=args.reflect_every, logger=logger,
+                                     trace_dir=kdir / "reflect_traces") if args.reflect_model else None)
+    else:
+        olog = OutcomeLog(kdir / "outcomes.jsonl")
+        claims = ClaimStore(kdir / "claims.json")
+        updater = (SemanticUpdater(olog, claims, model=args.reflect_model, every_n=args.reflect_every,
+                                   logger=logger, trace_dir=kdir / "reflect_traces")
+                   if args.reflect_model else None)
     procs = []
     if args.evaluator == "server":
         gpu, procs = _start_servers(args.gpu, out / "servers")
@@ -116,7 +127,8 @@ async def _run(args) -> int:
                                    out_dir=out / p.name, arch=args.arch, impl_store=store,
                                    outcome_log=olog, claims=claims, semantic_updater=updater,
                                    rollouts=args.rollouts, steps=args.steps,
-                                   max_fix_attempts=args.max_fix, seed=args.seed, logger=logger, ncu=args.ncu)
+                                   max_fix_attempts=args.max_fix, seed=args.seed, logger=logger, ncu=args.ncu,
+                                   knowledge_v2=kv)
             try:
                 res = await agent.run()
             except Exception as e:
@@ -134,6 +146,9 @@ async def _run(args) -> int:
     refl = dict(updater.total_usage) if updater is not None else {}
     if refl:
         summary.append({"reflection_usage": refl})
+    if kv is not None:
+        summary.append({"knowledge_v2": {"upkeep_model": args.upkeep_model, "upkeep_usage": dict(kv.usage),
+                                         **{k: v for k, v in kv.summary().items() if k != "upkeep_usage"}}})
     (out / "summary.json").write_text(json.dumps(summary, indent=1))
     tot = sum((s.get("llm_usage") or {}).get("cost_usd", 0.0) for s in summary) + float(refl.get("cost_usd", 0.0))
     logger.info(f"LLM cost reported by providers (agent + reflection): ${tot:.4f}")
@@ -169,6 +184,12 @@ def main():
     ap.add_argument("--remote-cuda-bin", default="/usr/local/cuda/bin", help="ncu/CUDA bin dir on the ssh host")
     ap.add_argument("--ncu", choices=["off", "best", "all"], default="off",
                     help="NCU per slot: baseline + new slot bests (best) or every verified candidate (all)")
+    ap.add_argument("--knowledge", choices=["v1", "v2"], default="v1",
+                    help="v1: claims.json + technique bandit; v2: knowledge.db (states, ontology, hypotheses)")
+    ap.add_argument("--upkeep-model", default=None,
+                    help="v2: model for hypothesis generation + state discovery (unset: deterministic upkeep only)")
+    ap.add_argument("--upkeep-every", type=int, default=8, help="v2: new outcomes between upkeep passes")
+    ap.add_argument("--explore-frac", type=float, default=0.15, help="v2: share of steps for hypotheses")
     ap.add_argument("--export-winners", default=None, help="dir for winners.json (ModelBlaster ingest)")
     ap.add_argument("--plugin", action="append", default=[],
                     help="python file run before the problems (e.g. it registers stub: models); repeatable")

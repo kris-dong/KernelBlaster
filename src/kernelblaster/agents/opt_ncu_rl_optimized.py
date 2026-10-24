@@ -871,6 +871,7 @@ class OptimizedRLNCUAgent(RLOptimizedAgentBase):
                         technique=chosen_name, status=classify_error(str(e)),
                         state_before=current_state, metric_before=current_cycles,
                         error=str(e), diff_summary=(strategy_description or "")[:300],
+                        **({"ncu_log_before": last_ncu_log} if getattr(self.knowledge, "is_v2", False) else {}),
                     )
                 break
 
@@ -961,6 +962,9 @@ class OptimizedRLNCUAgent(RLOptimizedAgentBase):
                         and after_m[k] != before_m[k]
                     },
                     diff_summary=(strategy_description or "")[:300],
+                    # knowledge v2: the reports themselves (NCU text -> canonical metrics -> states)
+                    **({"ncu_log_before": last_ncu_log, "ncu_log_after": new_ncu_log}
+                       if getattr(self.knowledge, "is_v2", False) else {}),
                 )
 
             current_code = optimized_code

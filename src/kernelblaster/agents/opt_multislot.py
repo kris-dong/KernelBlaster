@@ -431,6 +431,12 @@ def extract_code(text: str) -> Optional[str]:
     return max(blocks, key=len).strip() + "\n"
 
 
+def diff_excerpt(a: str, b: str, max_lines: int = 80) -> str:
+    """The first lines of a unified diff (code mining / state discovery context)."""
+    d = list(difflib.unified_diff(a.splitlines(), b.splitlines(), lineterm="", n=1))
+    return "\n".join(d[2:2 + max_lines])
+
+
 def diff_summary(a: str, b: str) -> str:
     d = list(difflib.unified_diff(a.splitlines(), b.splitlines(), lineterm="", n=0))
     add = sum(1 for l in d if l.startswith("+") and not l.startswith("+++"))
@@ -470,8 +476,12 @@ class MultiSlotAgent:
                  rollouts: int = 4, steps: int = 6, max_fix_attempts: int = 2, min_share: float = 0.01,
                  confirm_pct: float = 3.0, stall_decay: float = 0.6, bandit: Optional[TechniqueBandit] = None,
                  model_fix: Optional[str] = None, seed: int = 0, logger=None, run_id: Optional[str] = None,
-                 problem_id: Optional[str] = None, propose: bool = True, ncu: str = "off"):
+                 problem_id: Optional[str] = None, propose: bool = True, ncu: str = "off",
+                 knowledge_v2: Any = None):
         self.p, self.ev, self.model = problem, evaluator, model
+        # knowledge v2 (knowledge/v2): predicate states, ontology, hierarchical
+        # stats, hypotheses; replaces the bandit, roofline state and claims lookup
+        self.kv = knowledge_v2
         self.propose = propose
         if ncu not in ("off", "best", "all"):
             raise ValueError(f"ncu must be off|best|all, not {ncu!r}")
@@ -591,15 +601,38 @@ class MultiSlotAgent:
         self.llm_usage["cost_usd"] += float(u.get("cost_usd") or 0.0)   # providers that report it
         return resp.generations[0] if resp.generations else ""
 
+    def _outcome(self, **kw) -> OutcomeRecord:
+        sid = kw.pop("sid")
+        s = self.p.slots[sid]
+        return OutcomeRecord(target=self.p.target, arch=f"sm_{self.arch}", problem_id=self.problem_id,
+                             run_id=self.run_id, slot=sid, op_kind=s.op, op_class=s.op_class,
+                             shape_bucket=shape_bucket(s.op_class, s.shapes()[0] if s.instances else {}),
+                             dtype=self.p.dtype, **kw)
+
+    @property
+    def _tkey(self) -> str:
+        return f"{self.p.target}:sm_{self.arch}"
+
+    def _roofline_input(self, sid: str, slot_us: float):
+        """Manifest bytes/flops of the slot's instances + measured time (knowledge v2 estimate)."""
+        from ..knowledge.v2.metrics import RooflineInput
+        byt = fl = 0.0
+        work = 0.0
+        bufs = self.p.manifest["buffers"]
+        n = 0
+        for op in self.p.manifest["ops"]:
+            if op["slot"] == sid:
+                b, f = _op_cost(self.p, op)
+                byt += b
+                fl += f
+                n += 1
+                work = max(work, float(sum(bufs[x]["numel"] for x in op["outputs"])))
+        return RooflineInput(bytes=byt, flops=fl, time_us=slot_us, work_items=work or None, launches=max(n, 1))
+
     def _record_outcome(self, **kw) -> Optional[OutcomeRecord]:
         if self.olog is None:
             return None
-        sid = kw.pop("sid")
-        s = self.p.slots[sid]
-        rec = OutcomeRecord(target="cuda", arch=f"sm_{self.arch}", problem_id=self.problem_id,
-                            run_id=self.run_id, slot=sid, op_kind=s.op, op_class=s.op_class,
-                            shape_bucket=shape_bucket(s.op_class, s.shapes()[0] if s.instances else {}),
-                            dtype=self.p.dtype, **kw)
+        rec = self._outcome(**kw)
         self.olog.append(rec)
         if self.claims is not None and hasattr(self.claims, "observe"):
             self.claims.observe(rec)          # "already tried" visible to parallel rollouts now
@@ -671,13 +704,23 @@ class MultiSlotAgent:
         prof_before = self._ncu_of(sid, cur[sid])
         if prof_before:
             state = prof_before["state"]                 # measured bound beats the roofline estimate
-        techs = techniques_for(slot.op_class)
-        # fp16 arms are their own keys (half2 / tensor-core techniques pay off
-        # differently); fp32 keys keep their names, and the cross-key prior
-        # still seeds an untried fp16 arm from its fp32 record
-        key = f"{slot.op_class}|{state}" + ("" if self.p.dtype == "fp32" else f"|{self.p.dtype}")
-        tech = self.bandit.select(key, [t for t, _ in techs], self.rng)
-        desc = dict(techs)[tech]
+        choice = cls = vec_before = None
+        if self.kv is not None:
+            vec_before = self.kv.vector(self._tkey, estimate=self._roofline_input(sid, cur_us[sid]),
+                                        profile=prof_before)
+            cls = self.kv.classify(vec_before, target_key=self._tkey, op_class=slot.op_class, dtype=self.p.dtype)
+            choice = self.kv.select(target_key=self._tkey, op_class=slot.op_class, dtype=self.p.dtype, cls=cls,
+                                    vec=vec_before, rng=self.rng)
+            tech, desc, state = choice.item_id, choice.desc, cls.label()
+            nums = {**nums, **cls.decided_by}
+        else:
+            techs = techniques_for(slot.op_class)
+            # fp16 arms are their own keys (half2 / tensor-core techniques pay off
+            # differently); fp32 keys keep their names, and the cross-key prior
+            # still seeds an untried fp16 arm from its fp32 record
+            key = f"{slot.op_class}|{state}" + ("" if self.p.dtype == "fp32" else f"|{self.p.dtype}")
+            tech = self.bandit.select(key, [t for t, _ in techs], self.rng)
+            desc = dict(techs)[tech]
         r = self._retrieve(sid)
         examples = []
         if self.store is not None:
@@ -688,7 +731,12 @@ class MultiSlotAgent:
         adapt = None
         if r["adapt"] is not None and self.store is not None:
             adapt = (f"{json.dumps(r['adapt'].shapes[:2])}", self.store.code(r["adapt"]))
-        ktext, tried = self._knowledge(sid, state, tech)
+        if self.kv is not None:
+            ktext = self.kv.retrieve(target_key=self._tkey, op_class=slot.op_class, dtype=self.p.dtype, cls=cls,
+                                     vec=vec_before, problem_id=self.problem_id, slot=sid, technique=tech)
+            tried = self.kv.already_tried(self.problem_id, sid)
+        else:
+            ktext, tried = self._knowledge(sid, state, tech)
         part_us = sum(cur_us.values())
         neigh = [(n, self.p.slots[n].signature) for n in self.p.neighbours(sid)]
         best_note = (f"Best verified so far for this slot: {self.best[sid].slot_us:.1f} us."
@@ -735,7 +783,8 @@ class MultiSlotAgent:
             speedup = None
             status = {"compile": COMPILE_ERROR, "run": RUNTIME_ERROR}.get(res.stage, WRONG_OUTPUT)
             reward = -0.05 if status == COMPILE_ERROR else -0.1
-        self.bandit.update(key, tech, reward)
+        if self.kv is None:
+            self.bandit.update(key, tech, reward)
         prof_after = None
         if res.ok and (self.ncu == "all" or (self.ncu == "best" and after < self.best[sid].slot_us *
                                                 (1 - self.confirm_pct / 100))):
@@ -756,16 +805,33 @@ class MultiSlotAgent:
                               f"via {tech} (new slot best)")
             else:
                 self.slot_stall[sid] += 1
-        self._record_outcome(sid=sid, technique=tech, status=status, state_before=state,
-                             state_after=prof_after["state"] if prof_after else None,
-                             metric_before=before, metric_after=after, speedup=speedup,
-                             metrics_delta=ncu_mod.delta(prof_before, prof_after),
-                             error=None if res.ok else res.error_text(1500),
-                             diff_summary=dsum, impl_id=impl_id, parent_impl_id=parent)
+        okw = dict(sid=sid, technique=tech, status=status, state_before=state,
+                   state_after=prof_after["state"] if prof_after else None,
+                   metric_before=before, metric_after=after, speedup=speedup,
+                   metrics_delta=ncu_mod.delta(prof_before, prof_after),
+                   error=None if res.ok else res.error_text(1500),
+                   diff_summary=dsum, impl_id=impl_id, parent_impl_id=parent)
+        v2 = None
+        if self.kv is not None:
+            vec_after = (self.kv.vector(self._tkey, estimate=self._roofline_input(sid, after), profile=prof_after)
+                         if res.ok and after else None)
+            try:
+                v2 = self.kv.record(self._outcome(**okw), choice=choice, reward=reward, cls=cls, before=vec_before,
+                                    after=vec_after, op_class=slot.op_class, dtype=self.p.dtype,
+                                    extra={"lineage": list(self.best[sid].techniques),
+                                           "ncu_rules": (prof_before or {}).get("rules", []),
+                                           "diff_excerpt": diff_excerpt(cur[sid], code) if code else ""})
+            except Exception as e:                                # knowledge must never break a step
+                self.log.warning(f"knowledge-v2 record failed: {e!r}")
+        else:
+            self._record_outcome(**okw)
         ctx = {"adapt": r["adapt"].id if r["adapt"] is not None else None,
                "examples": [e.id for e in r["examples"]],
                "claims": ktext.count("\n") + 1 if ktext else 0, "already_tried": bool(tried),
                "ncu": bool(prof_before), "state": state}
+        if v2 is not None:
+            ctx.update(kind=choice.kind, est=round(choice.est, 4), evidence=choice.evidence,
+                       explore=choice.explore, mechanism=v2["mechanism"]["label"], chain=cls.chain)
         self.steps_log.append(StepLog(ridx, step, sid, tech, status, before, after, reward, fixes,
                                       round(time.time() - t0, 1), ctx))
         self.log.info(f"[{self.p.name}] r{ridx} s{step}: {sid} {tech} -> {status}"
@@ -785,6 +851,11 @@ class MultiSlotAgent:
                     await self.semantic.maybe_reflect()
                 except Exception as e:
                     self.log.warning(f"semantic update failed: {e!r}")
+            elif self.kv is not None:
+                try:
+                    await self.kv.maybe_upkeep()
+                except Exception as e:
+                    self.log.warning(f"knowledge-v2 upkeep failed: {e!r}")
 
     # ---- run
     async def run(self) -> dict:
@@ -803,6 +874,8 @@ class MultiSlotAgent:
         if final.ok and self.propose:
             props = propose_fusions(self.p, final, self.arch)
             props["proposals"] += propose_splits(self.p, final, self.arch)
+            if self.kv is not None:                  # graph-level hypotheses (ids = MB graph_hints ids)
+                self.kv.hypotheses.from_proposals(props, self._tkey, self.kv.review_path)
             (self.out / "proposals.json").write_text(json.dumps(props, indent=1))
             result["proposals"] = [{"kind": x["kind"], "pattern": x.get("pattern") or [x["slot"]],
                                     "instances": len(x.get("pairs") or x.get("groups")),
@@ -813,6 +886,14 @@ class MultiSlotAgent:
                 await self.semantic.maybe_reflect(force=True)
             except Exception as e:
                 self.log.warning(f"final semantic update failed: {e!r}")
+        elif self.kv is not None:
+            try:
+                await self.kv.maybe_upkeep(force=True)
+            except Exception as e:
+                self.log.warning(f"final knowledge-v2 upkeep failed: {e!r}")
+        if self.kv is not None:
+            result["knowledge"] = self.kv.summary()
+            (self.out / "result.json").write_text(json.dumps(result, indent=1, default=str))
         if self.claims is not None and hasattr(self.claims, "save"):
             self.claims.save()
         return result
