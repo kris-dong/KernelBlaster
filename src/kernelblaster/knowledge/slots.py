@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import uuid
 from dataclasses import dataclass, field
@@ -204,6 +205,20 @@ class Evaluator:
     async def evaluate(self, problem: SlotProblem, sources: Mapping[str, str], tag: str) -> EvalResult:
         raise NotImplementedError
 
+    async def profile(self, problem: SlotProblem, sources: Mapping[str, str], tag: str):
+        """NCU per slot: -> ({slot: summary}, None) or ({}, why not)."""
+        return {}, f"{type(self).__name__} does not profile"
+
+
+def _ncu_result(text: str):
+    from .ncu import ncu_error, profile_by_slot
+
+    err = ncu_error(text)
+    if err:
+        return {}, err
+    by = profile_by_slot(text)
+    return (by, None) if by else ({}, "ncu output had no mbslot_ kernels")
+
 
 class LocalEvaluator(Evaluator):
     """nvcc + run on this host (dev/tests; no KernelBlaster servers needed)."""
@@ -215,33 +230,111 @@ class LocalEvaluator(Evaluator):
         self._sem = asyncio.Semaphore(max_parallel)
         self._gpu = asyncio.Lock()             # one timed run at a time
 
-    async def evaluate(self, problem, sources, tag):
+    def _workdir(self, problem, tag) -> Path:
         root = self.work_root or problem.root / "kb_work"
         work = root / f"{re.sub(r'[^A-Za-z0-9_]+', '_', tag)}_{uuid.uuid4().hex[:6]}"
         work.mkdir(parents=True, exist_ok=True)
+        return work
+
+    async def _build(self, problem, sources, work: Path) -> Optional[EvalResult]:
+        """nvcc the assembled TU + driver into work/problem; an EvalResult on failure."""
+        (work / "kernels.cu").write_text(problem.assemble(sources))
+        async with self._sem:
+            proc = await asyncio.create_subprocess_exec(
+                self.nvcc, "-O3", f"-arch=sm_{self.arch}", "-std=c++17", "-lineinfo", "-o", str(work / "problem"),
+                str(work / "kernels.cu"), str(problem.driver_path),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            out, _ = await asyncio.wait_for(proc.communicate(), self.timeout_s)
+        if proc.returncode != 0:
+            return EvalResult(ok=False, stage="compile", errors=[_compile_errors(out.decode())],
+                              log=out.decode()[-4000:])
+        return None
+
+    async def _run(self, exe: Path, env: Optional[dict] = None, prefix: str = "") -> Optional[str]:
+        """Run exe (optionally under a prefix command, e.g. ncu); stdout+stderr, None on timeout."""
+        cmd = f"{prefix} {shlex.quote(str(exe))}" if prefix else shlex.quote(str(exe))
+        proc = await asyncio.create_subprocess_shell(
+            cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            env={**os.environ, **(env or {})})
         try:
-            (work / "kernels.cu").write_text(problem.assemble(sources))
-            async with self._sem:
-                proc = await asyncio.create_subprocess_exec(
-                    self.nvcc, "-O3", f"-arch=sm_{self.arch}", "-std=c++17", "-o", str(work / "problem"),
-                    str(work / "kernels.cu"), str(problem.driver_path),
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
-                out, _ = await asyncio.wait_for(proc.communicate(), self.timeout_s)
-            if proc.returncode != 0:
-                return EvalResult(ok=False, stage="compile", errors=[_compile_errors(out.decode())],
-                                  log=out.decode()[-4000:])
+            out, _ = await asyncio.wait_for(proc.communicate(), self.timeout_s)
+        except asyncio.TimeoutError:
+            proc.kill()
+            return None
+        return out.decode(errors="replace")
+
+    async def evaluate(self, problem, sources, tag):
+        work = self._workdir(problem, tag)
+        try:
+            bad = await self._build(problem, sources, work)
+            if bad is not None:
+                return bad
             async with self._gpu:
-                proc = await asyncio.create_subprocess_exec(
-                    str(work / "problem"), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
-                try:
-                    out, _ = await asyncio.wait_for(proc.communicate(), self.timeout_s)
-                except asyncio.TimeoutError:
-                    proc.kill()
-                    return EvalResult(ok=False, stage="run", errors=[f"timeout after {self.timeout_s}s"])
-            return parse_driver_output(out.decode(errors="replace"))
+                text = await self._run(work / "problem")
+            if text is None:
+                return EvalResult(ok=False, stage="run", errors=[f"timeout after {self.timeout_s}s"])
+            return parse_driver_output(text)
         finally:
             if not self.keep:
                 shutil.rmtree(work, ignore_errors=True)
+
+    async def profile(self, problem, sources, tag):
+        from .ncu import ncu_command
+
+        work = self._workdir(problem, tag + "_ncu")
+        try:
+            bad = await self._build(problem, sources, work)
+            if bad is not None:
+                return {}, "build failed: " + bad.error_text(300)
+            async with self._gpu:
+                text = await self._run(work / "problem", {"MB_MODE": "profile"}, ncu_command())
+            return _ncu_result(text) if text is not None else ({}, "ncu timed out")
+        finally:
+            if not self.keep:
+                shutil.rmtree(work, ignore_errors=True)
+
+
+class SSHEvaluator(LocalEvaluator):
+    """Build here, run on a remote GPU host over ssh (e.g. an idle L40S with
+    profiler-counter access). The binary is self-contained (data.bin is
+    linked in), so only the executable is copied. Problems whose data is too
+    big to link (read at start-up from a local path) are not supported."""
+
+    def __init__(self, host: str, *, arch: str, remote_dir: str, ssh_key: Optional[str] = None,
+                 cuda_visible_devices: Optional[str] = None, remote_path: str = "/usr/local/cuda/bin", **kw):
+        super().__init__(arch, **kw)
+        self.host, self.remote_dir, self.key = host, remote_dir.rstrip("/"), ssh_key
+        self.cvd, self.remote_path = cuda_visible_devices, remote_path
+
+    def _ssh_base(self) -> list[str]:
+        return ["-o", "BatchMode=yes"] + (["-i", self.key] if self.key else [])
+
+    async def _run(self, exe, env=None, prefix=""):
+        name = f"{exe.parent.name}_{exe.name}"
+        dst = f"{self.remote_dir}/{name}"
+        cp = await asyncio.create_subprocess_exec("scp", "-q", *self._ssh_base(), str(exe), f"{self.host}:{dst}",
+                                                  stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        out, _ = await cp.communicate()
+        if cp.returncode != 0:
+            return f"MB_ERROR scp to {self.host} failed: {out.decode()[-300:]}\nfailed\n"
+        envs = " ".join(f"{k}={shlex.quote(v)}" for k, v in {**({"CUDA_VISIBLE_DEVICES": self.cvd} if self.cvd else {}),
+                                                            **(env or {})}.items())
+        remote = (f"cd {shlex.quote(self.remote_dir)} && export PATH={shlex.quote(self.remote_path)}:$PATH && "
+                  f"env {envs} {prefix} ./{shlex.quote(name)}; rc=$?; rm -f ./{shlex.quote(name)}; exit $rc")
+        proc = await asyncio.create_subprocess_exec("ssh", *self._ssh_base(), self.host, remote,
+                                                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), self.timeout_s)
+        except asyncio.TimeoutError:
+            proc.kill()
+            return None
+        return out.decode(errors="replace")
+
+    async def _build(self, problem, sources, work):
+        if "MB_DATA_PATH" in problem.driver_path.read_text():
+            return EvalResult(ok=False, stage="compile", errors=[
+                "data.bin is read at run time (too big to link); SSHEvaluator needs a self-contained binary"])
+        return await super()._build(problem, sources, work)
 
 
 class ServerEvaluator(Evaluator):
@@ -250,8 +343,8 @@ class ServerEvaluator(Evaluator):
     def __init__(self, gpu, work_root: Path, timeout_s: int = 900):
         self.gpu, self.work_root, self.timeout_s = gpu, Path(work_root), timeout_s
 
-    async def evaluate(self, problem, sources, tag):
-        from ..agents.utils.commands import compile_cu, run_gpu_executable
+    async def _compile(self, problem, sources, tag):
+        from ..agents.utils.commands import compile_cu
         from ..agents.utils import FeedbackError
 
         work = self.work_root / f"{re.sub(r'[^A-Za-z0-9_]+', '_', tag)}_{uuid.uuid4().hex[:6]}"
@@ -259,14 +352,39 @@ class ServerEvaluator(Evaluator):
         cu = work / "kernels.cu"
         cu.write_text(problem.assemble(sources))
         try:
-            exe = await compile_cu(problem.driver_path, cu, self.gpu, timeout=self.timeout_s, job_name=str(cu))
+            return cu, Path(await compile_cu(problem.driver_path, cu, self.gpu, timeout=self.timeout_s,
+                                             job_name=str(cu))), None
         except FeedbackError as e:
-            return EvalResult(ok=False, stage="compile", errors=[_compile_errors(str(e))], log=str(e)[-4000:])
+            return cu, None, EvalResult(ok=False, stage="compile", errors=[_compile_errors(str(e))],
+                                        log=str(e)[-4000:])
+
+    async def evaluate(self, problem, sources, tag):
+        from ..agents.utils.commands import run_gpu_executable
+        from ..agents.utils import FeedbackError
+
+        cu, exe, bad = await self._compile(problem, sources, tag)
+        if bad is not None:
+            return bad
         try:
-            stdout, stderr = await run_gpu_executable(Path(exe), self.gpu, self.timeout_s, job_name=str(cu))
+            stdout, stderr = await run_gpu_executable(exe, self.gpu, self.timeout_s, job_name=str(cu))
         except FeedbackError as e:
             return EvalResult(ok=False, stage="run", errors=[str(e)[-2000:]], log=str(e)[-4000:])
         return parse_driver_output(stdout + "\n" + stderr)
+
+    async def profile(self, problem, sources, tag):
+        from ..agents.utils.commands import run_gpu_executable
+        from ..agents.utils import FeedbackError
+        from .ncu import ncu_command
+
+        cu, exe, bad = await self._compile(problem, sources, tag + "_ncu")
+        if bad is not None:
+            return {}, "build failed: " + bad.error_text(300)
+        try:
+            stdout, stderr = await run_gpu_executable(exe, self.gpu, self.timeout_s, job_name=f"{cu} (ncu)",
+                                                      prefix_command=f"MB_MODE=profile {ncu_command()} ")
+        except FeedbackError as e:
+            return {}, str(e)[-300:]
+        return _ncu_result(stdout + "\n" + stderr)
 
 
 def _compile_errors(log: str, limit: int = 3000) -> str:

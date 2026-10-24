@@ -3,7 +3,7 @@
     python scripts/run_multislot.py PROBLEM_DIR_OR_ROOT [...] --out OUT \
         --model claude-code:sonnet [--reflect-model claude-code:haiku] \
         [--knowledge-dir DIR] [--arch 75] [--rollouts 4 --steps 6] \
-        [--evaluator local|server --gpu titanrtx]
+        [--evaluator local|server|ssh ...] [--ncu off|best|all]
 
 PROBLEM_DIR_OR_ROOT: a directory with manifest.json, or a root searched for
 them (``pipeline/kb_export.py`` output). The knowledge directory holds the
@@ -36,7 +36,8 @@ from kernelblaster.knowledge.claims import ClaimStore  # noqa: E402
 from kernelblaster.knowledge.impl_store import ImplStore  # noqa: E402
 from kernelblaster.knowledge.outcomes import OutcomeLog  # noqa: E402
 from kernelblaster.knowledge.reflect import SemanticUpdater  # noqa: E402
-from kernelblaster.knowledge.slots import LocalEvaluator, ServerEvaluator, SlotProblem, find_problems  # noqa: E402
+from kernelblaster.knowledge.slots import (LocalEvaluator, ServerEvaluator, SlotProblem, SSHEvaluator,  # noqa: E402
+                                           find_problems)
 
 
 def _start_servers(gpu_name: str, log_dir: Path):
@@ -95,6 +96,10 @@ async def _run(args) -> int:
     if args.evaluator == "server":
         gpu, procs = _start_servers(args.gpu, out / "servers")
         evaluator = ServerEvaluator(gpu, out / "work")
+    elif args.evaluator == "ssh":
+        evaluator = SSHEvaluator(args.ssh_host, arch=args.arch, remote_dir=args.remote_dir, ssh_key=args.ssh_key,
+                                 cuda_visible_devices=args.cuda_visible_devices, remote_path=args.remote_cuda_bin,
+                                 work_root=out / "work", max_parallel=args.compile_jobs)
     else:
         evaluator = LocalEvaluator(args.arch, work_root=out / "work", max_parallel=args.compile_jobs)
     dirs = [d for p in args.problems for d in find_problems(Path(p))]
@@ -107,7 +112,7 @@ async def _run(args) -> int:
                                    out_dir=out / p.name, arch=args.arch, impl_store=store,
                                    outcome_log=olog, claims=claims, semantic_updater=updater,
                                    rollouts=args.rollouts, steps=args.steps,
-                                   max_fix_attempts=args.max_fix, seed=args.seed, logger=logger)
+                                   max_fix_attempts=args.max_fix, seed=args.seed, logger=logger, ncu=args.ncu)
             try:
                 res = await agent.run()
             except Exception as e:
@@ -150,8 +155,16 @@ def main():
     ap.add_argument("--max-fix", type=int, default=2)
     ap.add_argument("--compile-jobs", type=int, default=3)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--evaluator", choices=["local", "server"], default="local")
+    ap.add_argument("--evaluator", choices=["local", "server", "ssh"], default="local",
+                    help="local nvcc+run | KB compile/exec servers | build here, run on --ssh-host")
     ap.add_argument("--gpu", default="titanrtx", help="GPUType for --evaluator server")
+    ap.add_argument("--ssh-host", help="user@host with the GPU (--evaluator ssh)")
+    ap.add_argument("--ssh-key", help="ssh identity file")
+    ap.add_argument("--remote-dir", help="writable dir on the ssh host for the binaries")
+    ap.add_argument("--cuda-visible-devices", help="GPU(s) to use on the ssh host")
+    ap.add_argument("--remote-cuda-bin", default="/usr/local/cuda/bin", help="ncu/CUDA bin dir on the ssh host")
+    ap.add_argument("--ncu", choices=["off", "best", "all"], default="off",
+                    help="NCU per slot: baseline + new slot bests (best) or every verified candidate (all)")
     ap.add_argument("--export-winners", default=None, help="dir for winners.json (ModelBlaster ingest)")
     sys.exit(asyncio.run(_run(ap.parse_args())))
 
