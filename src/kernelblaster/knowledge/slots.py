@@ -137,6 +137,8 @@ class SlotProblem:
 
 
 def wrap_slot(slot_id: str, code: str, prefix: str = "mbslot_") -> str:
+    # C linkage would make two slots' entries the same symbol across namespaces
+    code = code.replace('extern "C"', "")
     lines = code.splitlines()
     includes = [l for l in lines if l.strip().startswith("#include")]
     body = "\n".join(l for l in lines if not l.strip().startswith("#include"))

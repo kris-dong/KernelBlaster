@@ -36,6 +36,7 @@ _SM_MAP = {
     "h100": "sm_90",
     "h200": "sm_90",
     "b200": "sm_100",
+    "titanrtx": "sm_75",
 }
 
 # Qualcomm Adreno GPU targets, mapped to their OpenCL version.
@@ -75,6 +76,7 @@ class GPUType(StrEnum):
     B200 = "b200"
     RTX5000 = "rtx5000"
     RTX6000 = "rtx6000"
+    TITAN_RTX = "titanrtx"
     # Qualcomm Adreno targets
     ADRENO_650 = "adreno650"
     ADRENO_660 = "adreno660"
