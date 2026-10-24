@@ -148,12 +148,9 @@ def initialize_compiler_server(
         )
         return False
 
-    num_workers = int(
-        os.getenv(
-            "KERNELBLASTER_COMPILE_SERVER_NUM_WORKERS",
-            str(psutil.cpu_count(logical=False) - 1),
-        )
-    )
+    # a number pins the worker count; unset/"auto": the server sizes itself
+    # from usable CPUs (affinity, cgroup quota), other users' load and memory
+    num_workers = os.getenv("KERNELBLASTER_COMPILE_SERVER_NUM_WORKERS", "").strip() or "auto"
 
     extra_args: list[str] = [
         "--num-workers", str(num_workers),

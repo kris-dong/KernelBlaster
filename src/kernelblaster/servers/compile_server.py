@@ -48,6 +48,11 @@ from .compile_opencl import OpenCLCompilationError
 
 logger = logging.getLogger("uvicorn")
 QUEUE: asyncio.Queue = asyncio.Queue()
+# gates the workers when --num-workers is auto (None: fixed worker count)
+_JOB_LIMITER = None
+# a compile job's compiler processes (driver + kernel TU) and their memory
+_PROCS_PER_JOB = 2
+_JOB_MEM_GIB = 3.0
 _ARTIFACTS_DIR: Optional[Path] = None
 _BOARD_HOST: Optional[str] = None
 
@@ -102,6 +107,13 @@ async def _dispatch_compile_job(
     (job,) = job_args  # single-element job_args: _CompileJob
     assert isinstance(job, _CompileJob)
 
+    if _JOB_LIMITER is not None:
+        async with _JOB_LIMITER:
+            return await _run_compile_job(worker_id, job)
+    return await _run_compile_job(worker_id, job)
+
+
+async def _run_compile_job(worker_id: int, job: "_CompileJob") -> UnifiedCompilationResult:
     strategy = get_compile_strategy(job.backend)
     extras: dict[str, Optional[str]] = {}
     try:
@@ -182,17 +194,44 @@ async def _compile_units(job: _CompileJob) -> None:
 args: argparse.Namespace = argparse.Namespace()
 
 
+def resolve_workers(spec) -> tuple[int, object]:
+    """``--num-workers``: a number -> that many workers, always active;
+    ``auto`` -> enough workers for an idle host, gated by an adaptive limiter
+    that admits ``free CPUs x KERNELBLASTER_CPU_SHARE / 2`` jobs (a job runs
+    about two compiler processes) and no more than ``MemAvailable / 3 GiB``,
+    re-evaluated every few seconds. ``KERNELBLASTER_MAX_COMPILE_WORKERS``
+    caps auto (default 16)."""
+    from .utils.resources import AdaptiveLimiter, GiB, auto_jobs, env_int, mem_jobs, usable_cpus
+
+    if spec is not None and str(spec).strip().lower() not in ("", "auto"):
+        return max(1, int(spec)), None
+    cap = env_int("KERNELBLASTER_MAX_COMPILE_WORKERS") or 16
+    usable = usable_cpus()
+    mem = mem_jobs(int(_JOB_MEM_GIB * GiB))
+    n = max(1, min(cap, int(usable) // _PROCS_PER_JOB, mem if mem is not None else cap))
+
+    def capacity(_in_flight: int) -> int:
+        procs = auto_jobs(max_jobs=n * _PROCS_PER_JOB, per_job_mem=int(_JOB_MEM_GIB * GiB / _PROCS_PER_JOB))
+        return max(1, procs // _PROCS_PER_JOB)
+    # jobs are not counted as our own load: the compiler processes they start
+    # are (FastCudaBuilder), or show up as load (CMake + make)
+    return n, AdaptiveLimiter(capacity, name="compile jobs", counts_as_load=False)
+
+
 @asynccontextmanager
 async def lifespan(app):
+    global _JOB_LIMITER
+    num_workers, _JOB_LIMITER = resolve_workers(args.num_workers)
     logger.info(
         f"Started unified compile server on {args.host}:{args.port} "
-        f"with {args.num_workers} workers "
-        f"(board_host={args.board_host}, artifacts_dir={args.artifacts_dir})"
+        f"with {num_workers} workers"
+        + (f", active jobs adaptive (now {_JOB_LIMITER.capacity()})" if _JOB_LIMITER is not None else "")
+        + f" (board_host={args.board_host}, artifacts_dir={args.artifacts_dir})"
     )
     # Rare edge — worker_pool catches its own errors; we route both
     # domain errors here so the queue's log line has the right tag.
     async with worker_pool(
-        num_workers=args.num_workers,
+        num_workers=num_workers,
         queue=QUEUE,
         handler=_dispatch_compile_job,
         # Two domain errors accepted; use CompilationError as the
@@ -328,7 +367,8 @@ def main():
     parser = argparse.ArgumentParser(description="Unified compile server")
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=2005)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", default="auto",
+                        help="worker count, or auto (default): adaptive to free CPUs and memory")
     parser.add_argument(
         "--artifacts-dir",
         type=Path,

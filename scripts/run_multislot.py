@@ -67,7 +67,6 @@ def _start_servers(gpu_name: str, log_dir: Path):
 
     gpu = GPUType(gpu_name)
     log_dir.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("KERNELBLASTER_COMPILE_SERVER_NUM_WORKERS", "3")
     cwd = os.getcwd()
     os.chdir(ROOT)                    # servers are launched as ``python -m src.kernelblaster...``
     try:
@@ -150,11 +149,13 @@ async def _run(args) -> int:
             procs.extend(ps)
             ev = ServerEvaluator(gpu, out / "work")
         elif args.evaluator == "ssh":
-            ev = SSHEvaluator(args.ssh_host, arch=arch_for("cuda"), remote_dir=args.remote_dir, ssh_key=args.ssh_key,
-                              cuda_visible_devices=args.cuda_visible_devices, remote_path=args.remote_cuda_bin,
+            hosts, cvd = _ssh_hosts(args)
+            ev = SSHEvaluator(hosts, arch=arch_for("cuda"), remote_dir=args.remote_dir, ssh_key=args.ssh_key,
+                              cuda_visible_devices=cvd, remote_path=args.remote_cuda_bin,
                               work_root=out / "work", max_parallel=args.compile_jobs)
         elif args.evaluator == "local":
-            ev = LocalEvaluator(arch_for("cuda"), work_root=out / "work", max_parallel=args.compile_jobs)
+            ev = LocalEvaluator(arch_for("cuda"), work_root=out / "work", max_parallel=args.compile_jobs,
+                                gpus=args.gpus)
         else:
             raise SystemExit(f"--evaluator {args.evaluator} runs OpenCL problems only")
         evaluators[target] = ev
@@ -167,36 +168,68 @@ async def _run(args) -> int:
         return DEFAULT_ARCH if target == "opencl" else "75"
 
     dirs = [d for p in args.problems for d in find_problems(Path(p))]
-    targets = set()
-    summary = []
+    problems = [SlotProblem(d) for d in dirs]
+    names = [p.name for p in problems]
+    if len(set(names)) != len(names):           # OUT/<problem> must stay separate per problem
+        raise SystemExit(f"problem names collide: {sorted(n for n in set(names) if names.count(n) > 1)}")
+    targets = {p.target for p in problems}
+    results: list = [None] * len(problems)
+    t_all = time.time()
     try:
-        for d in dirs:
-            p = SlotProblem(d)
-            targets.add(p.target)
-            t0 = time.time()
-            agent = MultiSlotAgent(p, evaluator_for(p.target), model=args.model, router=router,
-                                   out_dir=out / p.name, arch=arch_for(p.target), impl_store=store,
-                                   outcome_log=olog, claims=claims, semantic_updater=updater,
-                                   rollouts=args.rollouts, steps=args.steps,
-                                   max_fix_attempts=args.max_fix, seed=args.seed, logger=logger, ncu=args.ncu,
-                                   knowledge_v2=kv)
-            try:
-                res = await agent.run()
-            except Exception as e:
-                logger.error(f"{p.name}: {e!r}")
-                summary.append({"problem": p.name, "error": repr(e)})
-                continue
-            res["seconds"] = round(time.time() - t0, 1)
-            summary.append({k: res[k] for k in ("problem", "baseline_partition_us", "final_partition_us",
-                                                 "speedup", "final_ok", "llm_calls", "llm_usage", "seconds")})
-            logger.info(f"{p.name}: {res['baseline_partition_us']:.1f} -> {res['final_partition_us']} us "
-                        f"(speedup {res['speedup']}) in {res['seconds']}s, {res['llm_calls']} LLM calls")
+        n_par = args.parallel_problems or await _default_parallel([evaluator_for(t) for t in sorted(targets)])
+        n_par = max(1, min(n_par, len(problems) or 1))
+        logger.info(f"{len(problems)} problem(s), {n_par} at a time")
+        gate = asyncio.Semaphore(n_par)
+
+        async def one(i: int, p: SlotProblem):
+            async with gate:
+                t0 = time.time()
+                agent = MultiSlotAgent(p, evaluator_for(p.target), model=args.model, router=router,
+                                       out_dir=out / p.name, arch=arch_for(p.target), impl_store=store,
+                                       outcome_log=olog, claims=claims, semantic_updater=updater,
+                                       rollouts=args.rollouts, steps=args.steps,
+                                       max_fix_attempts=args.max_fix, seed=args.seed, logger=logger, ncu=args.ncu,
+                                       knowledge_v2=kv)
+                try:
+                    res = await agent.run()
+                except Exception as e:
+                    logger.error(f"{p.name}: {e!r}")
+                    results[i] = {"problem": p.name, "error": repr(e)}
+                    return
+                res["seconds"] = round(time.time() - t0, 1)
+                results[i] = {k: res[k] for k in ("problem", "baseline_partition_us", "final_partition_us",
+                                                  "speedup", "final_ok", "llm_calls", "llm_usage", "seconds")}
+                logger.info(f"{p.name}: {res['baseline_partition_us']:.1f} -> {res['final_partition_us']} us "
+                            f"(speedup {res['speedup']}) in {res['seconds']}s, {res['llm_calls']} LLM calls")
+
+        await asyncio.gather(*[one(i, p) for i, p in enumerate(problems)])
+        if n_par > 1:
+            # a problem's final forced pass may have overlapped another's; catch up on the rest
+            if updater is not None:
+                try:
+                    await updater.maybe_reflect(force=True)
+                except Exception as e:
+                    logger.warning(f"final semantic update failed: {e!r}")
+            elif kv is not None and len(kv.outcomes) > int(kv.db.get_meta("upkeep_cursor", 0) or 0):
+                try:
+                    await kv.maybe_upkeep(force=True)
+                except Exception as e:
+                    logger.warning(f"final knowledge-v2 upkeep failed: {e!r}")
     finally:
         for pr in procs:
             pr.terminate()
         for ev in evaluators.values():
             if hasattr(ev, "close"):
                 await ev.close()
+    summary = [r for r in results if r is not None]
+    lb = {"parallel_problems": n_par if problems else 0, "seconds": round(time.time() - t_all, 1)}
+    for t, ev in evaluators.items():
+        pool = getattr(ev, "_pool", None)
+        jobs = getattr(ev, "_jobs", None)
+        lb[t] = {"evaluator": type(ev).__name__,
+                 **({"gpus": pool.stats(), "peak_busy_gpus": pool.peak_busy} if pool is not None else {}),
+                 **({"compile_jobs": jobs.describe(), "peak_compile_jobs": jobs.peak} if jobs is not None else {})}
+    summary.append({"load_balance": lb})
     refl = dict(updater.total_usage) if updater is not None else {}
     if refl:
         summary.append({"reflection_usage": refl})
@@ -215,6 +248,34 @@ async def _run(args) -> int:
             logger.info(f"{t} winners -> {p}")
     print(json.dumps(summary, indent=1))
     return 0
+
+
+def _ssh_hosts(args) -> tuple[list[str], dict]:
+    """--ssh-host (repeatable) + --cuda-visible-devices (one for every host, or one per host)."""
+    hosts = args.ssh_host or []
+    if not hosts:
+        raise SystemExit("--evaluator ssh needs --ssh-host")
+    if not args.remote_dir:
+        raise SystemExit("--evaluator ssh needs --remote-dir")
+    cvd = args.cuda_visible_devices or ["auto"]
+    if len(cvd) == 1:
+        cvd = cvd * len(hosts)
+    if len(cvd) != len(hosts):
+        raise SystemExit(f"--cuda-visible-devices: give one value, or one per --ssh-host ({len(hosts)})")
+    return hosts, dict(zip(hosts, cvd))
+
+
+async def _default_parallel(evs) -> int:
+    """Problems at a time by default: the GPUs the evaluators can run on."""
+    n = 1
+    for ev in evs:
+        if hasattr(ev, "pool"):
+            n = max(n, len(await ev.pool()))
+        elif type(ev).__name__ == "ServerEvaluator":
+            from kernelblaster.servers.utils.resources import local_devices
+            ids = os.getenv("KERNELBLASTER_GPU_SERVER_GPU_IDS", "").strip()
+            n = max(n, len(ids.split(",")) if ids else len(await asyncio.to_thread(local_devices, None)))
+    return n
 
 
 def main():
@@ -241,7 +302,14 @@ def main():
     ap.add_argument("--rollouts", type=int, default=3)
     ap.add_argument("--steps", type=int, default=5)
     ap.add_argument("--max-fix", type=int, default=2)
-    ap.add_argument("--compile-jobs", type=int, default=3)
+    ap.add_argument("--compile-jobs", type=int, default=None,
+                    help="concurrent nvcc processes (default: adaptive to free CPUs and memory; "
+                         "env KERNELBLASTER_MULTISLOT_COMPILE_JOBS)")
+    ap.add_argument("--parallel-problems", type=int, default=None,
+                    help="problems optimised at a time over the shared GPU pool (default: number of GPUs)")
+    ap.add_argument("--gpus", default="auto",
+                    help="local GPUs: auto (idle ones; KERNELBLASTER_ALLOW_SHARED_GPU=1 adds busy ones), all, "
+                         "or nvidia-smi indices / UUIDs, e.g. 0,2")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--evaluator", choices=["local", "server", "ssh", "board"], default="local",
                     help="local nvcc|g++ + run | KB compile/exec servers | build here, run on --ssh-host (CUDA) | "
@@ -249,11 +317,14 @@ def main():
     ap.add_argument("--board-host", default=None, help="user@board for --evaluator board "
                     "(default $KERNELBLASTER_ADRENO_BOARD_HOST)")
     ap.add_argument("--gpu", default="titanrtx", help="GPUType for --evaluator server")
-    ap.add_argument("--ssh-host", help="user@host with the GPU (--evaluator ssh)")
+    ap.add_argument("--ssh-host", action="append", default=[],
+                    help="user@host with GPUs (--evaluator ssh); repeatable, runs spread over every host's GPUs")
     ap.add_argument("--ssh-key", help="ssh identity file")
     ap.add_argument("--remote-dir", help="writable dir on the ssh host / board for the binaries "
                     "(board default /tmp/kernelblaster_multislot, removed at the end)")
-    ap.add_argument("--cuda-visible-devices", help="GPU(s) to use on the ssh host")
+    ap.add_argument("--cuda-visible-devices", action="append", default=[],
+                    help="GPUs on the ssh host(s): auto (default: idle ones), all, or ids, e.g. 2,3; "
+                         "once for every host or once per --ssh-host")
     ap.add_argument("--remote-cuda-bin", default="/usr/local/cuda/bin", help="ncu/CUDA bin dir on the ssh host")
     ap.add_argument("--ncu", choices=["off", "best", "all"], default="off",
                     help="NCU per slot: baseline + new slot bests (best) or every verified candidate (all)")

@@ -255,21 +255,78 @@ def _ncu_result(text: str):
 
 
 class LocalEvaluator(Evaluator):
-    """nvcc + run on this host (dev/tests; no KernelBlaster servers needed)."""
+    """nvcc + run on this host (dev/tests; no KernelBlaster servers needed).
+
+    Builds: every nvcc process (slot units, the link, the one-shot assembled
+    build) goes through one limiter. ``build_jobs`` / ``max_parallel`` (or
+    ``KERNELBLASTER_MULTISLOT_COMPILE_JOBS``) fix its size; by default it
+    adapts to the host's free CPUs and memory (``servers/utils/resources.py``).
+
+    Runs: every timed run and NCU pass leases one GPU from a :class:`GPUPool`
+    (one run per GPU at a time, ``CUDA_VISIBLE_DEVICES`` set per run). ``gpus``
+    is ``"auto"`` (default: idle GPUs), ``"all"``, or a list of nvidia-smi
+    indices / UUIDs; ``pool`` passes a ready pool (e.g. shared between
+    evaluators). Leases are grouped by problem, so one problem's runs stay on
+    one GPU model."""
 
     def __init__(self, arch: str = "75", work_root: Optional[Path] = None, nvcc: str = "nvcc",
-                 max_parallel: int = 2, timeout_s: int = 900, keep: bool = False,
+                 max_parallel: Optional[int] = None, timeout_s: int = 900, keep: bool = False,
                  incremental: Optional[bool] = None, cache_dir: Optional[Path] = None,
-                 build_jobs: int = 4):
+                 build_jobs: Optional[int] = None, gpus=None, pool=None, infra_retries: int = 2):
+        from ..servers.utils.resources import build_limiter
+
         self.arch, self.nvcc, self.timeout_s, self.keep = arch, nvcc, timeout_s, keep
         self.work_root = Path(work_root) if work_root else None
-        self._sem = asyncio.Semaphore(max_parallel)
-        self._gpu = asyncio.Lock()             # one timed run at a time
+        # compiler processes (unit objects, links, assembled builds)
+        self._jobs = build_limiter(build_jobs or max_parallel, env="KERNELBLASTER_MULTISLOT_COMPILE_JOBS",
+                                   name="multislot nvcc")
+        self._sem = self._unit_sem = self._jobs
+        self.gpus, self._pool, self._pool_lock = gpus, pool, asyncio.Lock()
+        self.infra_retries = infra_retries
         # one TU per slot, objects + binaries cached by content (see _build_units)
         self.incremental = _incremental_default() if incremental is None else incremental
         self._cache_dir = Path(cache_dir) if cache_dir else None
         self._cache = None
-        self._unit_sem = asyncio.Semaphore(build_jobs)   # nvcc processes for unit objects
+
+    # ---- GPUs
+    async def _devices(self) -> list:
+        from ..servers.utils.resources import local_devices
+
+        return await asyncio.to_thread(local_devices, self.gpus)
+
+    async def pool(self):
+        """The GPU pool (built on first use from ``gpus``)."""
+        from ..servers.utils.resources import GPUPool
+
+        if self._pool is None:
+            async with self._pool_lock:
+                if self._pool is None:
+                    self._pool = GPUPool(await self._devices(), name=type(self).__name__)
+                    _log().info(f"{type(self).__name__}: GPU pool {self._pool.describe()}; "
+                                f"compile jobs {self._jobs.describe()}")
+        return self._pool
+
+    async def _timed_run(self, problem, exe: Path, env: Optional[dict] = None, prefix: str = "") -> Optional[str]:
+        """``_run`` on a leased GPU; an infrastructure failure (device or link
+        down, not the candidate) is retried on another device."""
+        from ..servers.utils.resources import is_infra_failure
+
+        pool = await self.pool()
+        avoid: set = set()
+        for attempt in range(self.infra_retries + 1):
+            async with pool.lease(str(problem.root), avoid) as lease:
+                text = await self._run(exe, env, prefix, device=lease.device)
+                lease.infra_error = text is not None and is_infra_failure(text) and \
+                    not re.search(r"^passed$", text, re.M)
+            if not lease.infra_error:
+                return text
+            dev = lease.device
+            # the link to a host failed: retry on another host if there is one
+            avoid |= ({d.key for d in pool.devices if d.host == dev.host}
+                      if dev.host and "MB_ERROR [infra]" in text else {dev.key})
+            _log().warning(f"{problem.name}: infrastructure failure on {lease.device.label()} "
+                           f"(attempt {attempt + 1}): {text[-300:]!r}")
+        return text
 
     def _workdir(self, problem, tag) -> Path:
         root = self.work_root or problem.root / "kb_work"
@@ -361,12 +418,13 @@ class LocalEvaluator(Evaluator):
                               log=out.decode()[-4000:])
         return None
 
-    async def _run(self, exe: Path, env: Optional[dict] = None, prefix: str = "") -> Optional[str]:
-        """Run exe (optionally under a prefix command, e.g. ncu); stdout+stderr, None on timeout."""
+    async def _run(self, exe: Path, env: Optional[dict] = None, prefix: str = "", device=None) -> Optional[str]:
+        """Run exe (optionally under a prefix command, e.g. ncu) on ``device``;
+        stdout+stderr, None on timeout."""
         cmd = f"{prefix} {shlex.quote(str(exe))}" if prefix else shlex.quote(str(exe))
         proc = await asyncio.create_subprocess_shell(
             cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-            env={**os.environ, **(env or {})})
+            env={**os.environ, **(device.env() if device is not None else {}), **(env or {})})
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), self.timeout_s)
         except asyncio.TimeoutError:
@@ -380,8 +438,7 @@ class LocalEvaluator(Evaluator):
             bad = await self._build(problem, sources, work)
             if bad is not None:
                 return bad
-            async with self._gpu:
-                text = await self._run(work / "problem")
+            text = await self._timed_run(problem, work / "problem")
             if text is None:
                 return EvalResult(ok=False, stage="run", errors=[f"timeout after {self.timeout_s}s"])
             return parse_driver_output(text)
@@ -397,8 +454,7 @@ class LocalEvaluator(Evaluator):
             bad = await self._build(problem, sources, work)
             if bad is not None:
                 return {}, "build failed: " + bad.error_text(300)
-            async with self._gpu:
-                text = await self._run(work / "problem", {"MB_MODE": "profile"}, ncu_command(slots=slots))
+            text = await self._timed_run(problem, work / "problem", {"MB_MODE": "profile"}, ncu_command(slots=slots))
             return _ncu_result(text) if text is not None else ({}, "ncu timed out")
         finally:
             if not self.keep:
@@ -406,40 +462,79 @@ class LocalEvaluator(Evaluator):
 
 
 class SSHEvaluator(LocalEvaluator):
-    """Build here, run on a remote GPU host over ssh (e.g. an idle L40S with
+    """Build here, run on remote GPU hosts over ssh (e.g. idle L40S GPUs with
     profiler-counter access). The binary is self-contained (data.bin is
     linked in), so only the executable is copied. Problems whose data is too
-    big to link (read at start-up from a local path) are not supported."""
+    big to link (read at start-up from a local path) are not supported.
 
-    def __init__(self, host: str, *, arch: str, remote_dir: str, ssh_key: Optional[str] = None,
-                 cuda_visible_devices: Optional[str] = None, remote_path: str = "/usr/local/cuda/bin", **kw):
+    ``host`` is one ``user@host`` or several; ``cuda_visible_devices`` is a GPU
+    spec for every host (``"auto"``/None: the host's idle GPUs, ``"all"``, or
+    ids) or a ``{host: spec}`` mapping; ``remote_dir`` is one directory used on
+    every host, or ``{host: dir}``. Each run leases a free (host, GPU) from the
+    pool and is copied to that host's directory. All hosts must run the
+    binary built for ``arch``; a problem's runs stay on one GPU model."""
+
+    def __init__(self, host, *, arch: str, remote_dir, ssh_key: Optional[str] = None,
+                 cuda_visible_devices=None, remote_path: str = "/usr/local/cuda/bin", ssh: str = "ssh",
+                 scp: str = "scp", **kw):
         super().__init__(arch, **kw)
-        self.host, self.remote_dir, self.key = host, remote_dir.rstrip("/"), ssh_key
-        self.cvd, self.remote_path = cuda_visible_devices, remote_path
+        self.hosts = [host] if isinstance(host, str) else list(host)
+        if not self.hosts:
+            raise ValueError("SSHEvaluator needs at least one host")
+        self.host = self.hosts[0]
+        self.remote_dirs = {h: str(remote_dir[h] if isinstance(remote_dir, Mapping) else remote_dir).rstrip("/")
+                            for h in self.hosts}
+        self.remote_dir = self.remote_dirs[self.host]
+        self.cvd = {h: (cuda_visible_devices.get(h) if isinstance(cuda_visible_devices, Mapping)
+                        else cuda_visible_devices) for h in self.hosts}
+        self.key, self.remote_path, self.ssh, self.scp = ssh_key, remote_path, ssh, scp
 
     def _ssh_base(self) -> list[str]:
-        return ["-o", "BatchMode=yes"] + (["-i", self.key] if self.key else [])
+        return ["-o", "BatchMode=yes", "-o", "ConnectTimeout=15"] + (["-i", self.key] if self.key else [])
 
-    async def _run(self, exe, env=None, prefix=""):
+    async def _devices(self) -> list:
+        from ..servers.utils.resources import NoDevice, remote_devices
+
+        devs = []
+        for h in self.hosts:
+            proc = await asyncio.create_subprocess_exec(
+                self.ssh, *self._ssh_base(), h, f"mkdir -p {shlex.quote(self.remote_dirs[h])}",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            out, _ = await proc.communicate()
+            if proc.returncode != 0:
+                _log().warning(f"{h}: unreachable or {self.remote_dirs[h]} not writable, skipped: "
+                               f"{out.decode(errors='replace')[-200:]}")
+                continue
+            devs += await remote_devices(h, self.cvd[h], ssh_key=self.key, ssh=self.ssh, logger=_log())
+        if not devs:
+            raise NoDevice(f"no usable GPU on {', '.join(self.hosts)}")
+        return devs
+
+    async def _run(self, exe, env=None, prefix="", device=None):
+        host = device.host if device is not None and device.host else self.host
+        rdir = self.remote_dirs.get(host, self.remote_dir)
         name = f"{exe.parent.name}_{exe.name}"
-        dst = f"{self.remote_dir}/{name}"
-        cp = await asyncio.create_subprocess_exec("scp", "-q", *self._ssh_base(), str(exe), f"{self.host}:{dst}",
+        dst = f"{rdir}/{name}"
+        cp = await asyncio.create_subprocess_exec(self.scp, "-q", *self._ssh_base(), str(exe), f"{host}:{dst}",
                                                   stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
         out, _ = await cp.communicate()
         if cp.returncode != 0:
-            return f"MB_ERROR scp to {self.host} failed: {out.decode()[-300:]}\nfailed\n"
-        envs = " ".join(f"{k}={shlex.quote(v)}" for k, v in {**({"CUDA_VISIBLE_DEVICES": self.cvd} if self.cvd else {}),
-                                                            **(env or {})}.items())
-        remote = (f"cd {shlex.quote(self.remote_dir)} && export PATH={shlex.quote(self.remote_path)}:$PATH && "
+            return f"MB_ERROR [infra] scp to {host} failed: {out.decode()[-300:]}\nfailed\n"
+        envs = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in
+                        {**(device.env() if device is not None else {}), **(env or {})}.items())
+        remote = (f"cd {shlex.quote(rdir)} && export PATH={shlex.quote(self.remote_path)}:$PATH && "
                   f"env {envs} {prefix} ./{shlex.quote(name)}; rc=$?; rm -f ./{shlex.quote(name)}; exit $rc")
-        proc = await asyncio.create_subprocess_exec("ssh", *self._ssh_base(), self.host, remote,
+        proc = await asyncio.create_subprocess_exec(self.ssh, *self._ssh_base(), host, remote,
                                                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), self.timeout_s)
         except asyncio.TimeoutError:
             proc.kill()
             return None
-        return out.decode(errors="replace")
+        text = out.decode(errors="replace")
+        if proc.returncode == 255 and not re.search(r"^passed$", text, re.M):     # ssh itself failed
+            text += f"\nMB_ERROR [infra] ssh to {host} failed (rc 255)\n"
+        return text
 
     async def _build(self, problem, sources, work):
         if "MB_DATA_PATH" in problem.driver_path.read_text():
@@ -529,6 +624,15 @@ class ServerEvaluator(Evaluator):
         return _ncu_result(stdout + "\n" + stderr)
 
 
+def _log():
+    try:
+        from loguru import logger
+        return logger
+    except ImportError:                       # pragma: no cover
+        import logging
+        return logging.getLogger(__name__)
+
+
 def _incremental_default() -> bool:
     return os.getenv("KERNELBLASTER_SLOT_UNITS", "1").lower() not in ("0", "false", "no", "off")
 
@@ -592,10 +696,16 @@ class OpenCLLocalEvaluator(LocalEvaluator):
     """g++ + this host's OpenCL GPU (functional stand-in for the board: any
     OpenCL 2.0 device with coarse-grained SVM; its times are not Adreno's)."""
 
-    def __init__(self, work_root: Optional[Path] = None, cxx: str = "g++", max_parallel: int = 2,
+    def __init__(self, work_root: Optional[Path] = None, cxx: str = "g++", max_parallel: Optional[int] = None,
                  timeout_s: int = 900, keep: bool = False, env: Optional[dict] = None):
         super().__init__("opencl", work_root=work_root, max_parallel=max_parallel, timeout_s=timeout_s, keep=keep)
         self.cxx, self.env = cxx, dict(env or {})
+
+    async def _devices(self) -> list:
+        # the OpenCL platform picks the device; one run at a time on it
+        from ..servers.utils.resources import Device
+
+        return [Device(None, None, "opencl")]
 
     async def _build(self, problem, sources, work):
         bad = opencl_source_errors(problem, sources)
@@ -620,8 +730,7 @@ class OpenCLLocalEvaluator(LocalEvaluator):
             if bad is not None:
                 return bad, None
             data = problem.root / problem.manifest["data"]
-            async with self._gpu:
-                text = await self._run(work / "problem", {**self.env, **env, "MB_DATA_PATH": str(data)})
+            text = await self._timed_run(problem, work / "problem", {**self.env, **env, "MB_DATA_PATH": str(data)})
             return None, text
         finally:
             if not self.keep:

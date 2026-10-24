@@ -128,6 +128,7 @@ async def _resolve_assigned_gpu_uuids() -> set[str] | None:
             continue
         index_to_uuid[parts[0]] = parts[1]
     assigned = {index_to_uuid[i] for i in _GPU_IDS if i in index_to_uuid}
+    assigned |= {u for i in _GPU_IDS if i.startswith("GPU-") for u in index_to_uuid.values() if u.startswith(i)}
     return assigned or None
 
 
@@ -299,6 +300,32 @@ async def lifespan(app):
         logger=logger,
     ):
         yield
+
+
+def resolve_local_gpu_ids() -> list[str]:
+    """GPUs of the local strategy, one worker each.
+
+    ``KERNELBLASTER_GPU_SERVER_GPU_IDS`` (indices or UUIDs, or ``auto``) and
+    ``KERNELBLASTER_GPU_SERVER_NUM_WORKERS`` (GPUs ``0..N-1``) override; by
+    default the idle GPUs (no foreign compute process, low utilisation; all
+    GPUs with ``KERNELBLASTER_ALLOW_SHARED_GPU=1``, the least busy one when
+    none is idle), within ``CUDA_VISIBLE_DEVICES`` if that is set. Auto ids
+    are UUIDs, so CUDA's device ordering cannot remap them. Without
+    nvidia-smi: GPU 0."""
+    from .utils.resources import gpu_inventory, select_gpus
+
+    raw = os.getenv("KERNELBLASTER_GPU_SERVER_GPU_IDS", "").strip()
+    if raw and raw.lower() != "auto":
+        return [s.strip() for s in raw.split(",") if s.strip()]
+    n = os.getenv("KERNELBLASTER_GPU_SERVER_NUM_WORKERS", "").strip()
+    if n and not raw:
+        return [str(i) for i in range(max(1, int(n)))]
+    chosen, why = select_gpus(None, gpu_inventory())
+    if not chosen:
+        logger.warning(f"exec server: no GPU detected ({why}); using GPU 0")
+        return ["0"]
+    logger.info(f"exec server GPUs ({why}): " + "; ".join(g.short() for g in chosen))
+    return [g.uuid for g in chosen]
 
 
 def _resolve_strategy_name() -> str:
@@ -630,8 +657,8 @@ def main():
     parser.add_argument("--port", type=int, default=2006)
     parser.add_argument("--num-workers", type=int, default=1,
                         help="Remote-strategy worker count. Local strategy "
-                             "sizes workers from KERNELBLASTER_GPU_SERVER_GPU_IDS / "
-                             "KERNELBLASTER_GPU_SERVER_NUM_WORKERS.")
+                             "runs one worker per GPU: KERNELBLASTER_GPU_SERVER_GPU_IDS / "
+                             "KERNELBLASTER_GPU_SERVER_NUM_WORKERS, else the idle GPUs.")
     parser.add_argument("--board-host", type=str, default=None,
                         help="SSH target for Adreno board (or FPGA host). "
                              "Absent + no --strategy = LocalExecStrategy; "
@@ -702,13 +729,10 @@ def main():
 
     _BOARD_HOST = args.board_host
     if _BOARD_HOST is None:
-        # Local: read GPU_IDS from the same env vars the legacy gpu.py used.
-        gpu_ids_raw = os.getenv("KERNELBLASTER_GPU_SERVER_GPU_IDS", "").strip()
-        if gpu_ids_raw:
-            _GPU_IDS = [s.strip() for s in gpu_ids_raw.split(",") if s.strip()]
-        else:
-            n = int(os.getenv("KERNELBLASTER_GPU_SERVER_NUM_WORKERS", "1"))
-            _GPU_IDS = [str(i) for i in range(max(1, n))]
+        _GPU_IDS = resolve_local_gpu_ids()
+        # the pre-flight check (gpu.check_gpu_processes) scopes to these GPUs
+        from . import gpu as _gpu_mod
+        _gpu_mod.GPU_IDS = list(_GPU_IDS)
 
     # Push _BOARD_HOST into gpu_adreno's module state — its
     # ``upload_and_exec_binary`` reads it as ``_BOARD_HOST`` at request
