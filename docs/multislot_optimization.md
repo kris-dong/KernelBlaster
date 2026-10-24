@@ -18,6 +18,7 @@ the full list of design decisions are in ModelBlaster's
 | `src/kernelblaster/knowledge/{outcomes,claims,reflect,semantic}.py` | outcome records and the semantic update pass (`docs/semantic_update_pass.md`) |
 | `src/kernelblaster/agents/utils/agentic_llm.py` | `claude-code:<model>` (Claude Code CLI, no key) and `stub:<name>` (tests) providers |
 | `scripts/run_multislot.py` | runner |
+| `scripts/time_problems.py` | check + time problems with the local / ssh evaluators outside the agent loop (ModelBlaster's model result and hint re-measurement), paired with an incumbent; on one GPU of a required model |
 
 ## Running
 
@@ -115,6 +116,27 @@ v2 metrics, and the proposals.
 | v2 outcome | the reward is the end-to-end gain, the same unit as before (a fraction of the partition); `extra.e2e` holds the decision | unchanged schema |
 | `result.json` | `reward`, `baseline_e2e_us`, `final_e2e_us`, `e2e_speedup`, `final_e2e_ratio` (final vs seeds, paired), `runtime` (baseline/final `partition_runtime`, evaluator host stats), `attr_op_us`, per slot `baseline_attr_us` / `final_attr_us` / `launches`; steps `reward_basis`, `e2e_before`, `e2e_after` | old fields unchanged (`speedup` is still eager) |
 | `summary.json` | `reward`, `baseline_e2e_us`, `final_e2e_us`, `e2e_speedup`; `load_balance.cuda.runtime` | |
+| `result.json` | `gpu`: the GPU the final (else the baseline) numbers were timed on: `name` (model), `uuid`, `host`, `label`, `index`, `arch` (`EvalResult.gpu`) | absent in older runs; ModelBlaster then cannot match the model's timing to it |
+
+### The hardware a number belongs to
+
+- **Recorded device.** Every `LocalEvaluator` / `SSHEvaluator` result records the device it
+  was leased (`EvalResult.gpu`), and `result.json` keeps the final one (`gpu`).
+- **Pinning a model.** `gpu_model="NVIDIA L40S"` (`--gpu-model`) keeps only the selected GPUs
+  of that model; names compare normalised, so `"l40s"` matches. With none of them, `pool()`
+  raises `NoDevice`, naming the models it found. A run never falls back to another model.
+- **Capping the pool.** `max_devices=N` keeps at most N devices; 1 puts every run on one GPU.
+- **`scripts/time_problems.py`** times a list of jobs with these evaluators: problem, sources,
+  optional incumbent, reps.
+  - The jobs run in rounds (rep k of every job, then rep k + 1) or job by job.
+  - On the persistent host an incumbent is paired in the same request. With one process per
+    run it is evaluated right after the candidate.
+  - Output (`kernelblaster.time_problems/v1`): every `EvalResult`, the device of each, the pool
+    and the host statistics.
+- **Who uses it.** ModelBlaster's `kb_model_run` (the whole-model result) and, with
+  `--ssh-host`, `kb_graph_opt`'s re-measurement. Both run it on the GPU model the
+  KernelBlaster runs recorded, so the model number and the component numbers share the
+  hardware (ModelBlaster `docs/gpu_harness_perf.md`, "The model's result").
 
 ### Persistent runtime (`knowledge/runtime_host.py`)
 

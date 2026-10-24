@@ -177,10 +177,11 @@ async def _run_inner(args, run_span) -> int:
             hosts, cvd = _ssh_hosts(args)
             ev = SSHEvaluator(hosts, arch=arch_for("cuda"), remote_dir=args.remote_dir, ssh_key=args.ssh_key,
                               cuda_visible_devices=cvd, remote_path=args.remote_cuda_bin,
-                              work_root=out / "work", max_parallel=args.compile_jobs, runtime=args.runtime)
+                              work_root=out / "work", max_parallel=args.compile_jobs, runtime=args.runtime,
+                              gpu_model=args.gpu_model)
         elif args.evaluator == "local":
             ev = LocalEvaluator(arch_for("cuda"), work_root=out / "work", max_parallel=args.compile_jobs,
-                                gpus=args.gpus, runtime=args.runtime)
+                                gpus=args.gpus, runtime=args.runtime, gpu_model=args.gpu_model)
         else:
             raise SystemExit(f"--evaluator {args.evaluator} runs OpenCL problems only")
         evaluators[target] = ev
@@ -352,6 +353,9 @@ def main():
     ap.add_argument("--gpus", default="auto",
                     help="local GPUs: auto (idle ones; KERNELBLASTER_ALLOW_SHARED_GPU=1 adds busy ones), all, "
                          "or nvidia-smi indices / UUIDs, e.g. 0,2")
+    ap.add_argument("--gpu-model", default=None,
+                    help="local/ssh evaluators: only GPUs of this model, e.g. 'NVIDIA L40S' (none of them: an error); "
+                         "every result.json records the GPU it was timed on ('gpu')")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--reward", choices=["e2e", "slot"], default=os.getenv("KERNELBLASTER_MULTISLOT_REWARD", "e2e"),
                     help="what a step is rewarded and accepted on: the deployed end-to-end partition time (default) "

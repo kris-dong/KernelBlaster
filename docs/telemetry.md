@@ -90,6 +90,7 @@ enclosing attributes: `codegen_simple` / `codegen_hard` / `fix` from the agent's
 |---|---|
 | `kb.run` (collects, laps) | `run_multislot.py`, the whole run; laps `setup.knowledge` (stores, knowledge v2), `setup.problems`, `problems`, `finish` (catch-up reflection / upkeep, summary) |
 | `problem` (collects) | `MultiSlotAgent.run` |
+| `kb.time_problems` (collects) | `scripts/time_problems.py`, the whole call (`--telemetry FILE`); its summary is in the output's `telemetry` (ModelBlaster's `mb.kb_time` span wraps the call) |
 | `init`, `proposals`, `io.result` | `initialize`, `propose_fusions` / `propose_splits`, `_write_result` |
 | `step` (collects, laps) | `MultiSlotAgent._step`, the wrapper around `_step_body` |
 | laps `knowledge.select`, `knowledge.lookup`, `prompt.build`, `candidate`, `knowledge.record` | one-line `tel.lap(...)` in `_step_body`: slot / technique choice; store retrieval + claims; prompt; extract → evaluate → fix loop → confirm; bandit / store / outcome / v2 record + NCU of a new best |
