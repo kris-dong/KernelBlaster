@@ -10,7 +10,10 @@ unknown. Adapters share one interface::
 
 ``estimate`` is a :class:`RooflineInput` (bytes, flops, time, work items) that
 every target can provide; ``profile`` is whatever the target's profiler gave
-(NCU per-slot summary, NCU text log, Adreno counters, mcycle counts). Measured
+(NCU per-slot summary, NCU text log, ``opencl_profile`` summary, mcycle counts).
+The adapter is chosen by the agent's ``TargetProfile.profiler`` module
+(``knowledge.ncu`` -> :class:`NCUAdapter`, ``knowledge.opencl_profile`` ->
+:class:`OpenCLProfileAdapter`). Measured
 values override estimated ones metric by metric.
 
 Units: utilisations, hit rates, occupancy and register pressure in percent;
@@ -220,17 +223,38 @@ class NCUTextAdapter(MetricAdapter):
         return out
 
 
-class AdrenoAdapter(MetricAdapter):
-    """OpenCL / Adreno (stub): maps the counter names the OpenCL target is expected to report."""
+class OpenCLProfileAdapter(MetricAdapter):
+    """OpenCL / Adreno: :func:`knowledge.opencl_profile.summarize` per-slot summaries.
 
-    profiler = "adreno"
-    _MAP = {"alu_util": "compute_util", "bw_util": "bw_util", "mem_util": "mem_util",
-            "l1_hit": "l1_hit", "l2_hit": "l2_hit", "occupancy": "occupancy",
-            "wave_occupancy": "occupancy", "texture_l1_hit": "l1_hit"}
+    Adreno exposes no counters to OpenCL, so only what ``cl_event`` and the
+    kernel info give is measured: launch overhead (kernel time vs slot time)
+    and register pressure (a kernel's max work-group size below the device's
+    means registers limit residency). Utilisations stay roofline estimates.
+    Counter names a future profiler may add (``alu_util``, ``l1_hit``, ...) map
+    directly."""
 
-    def from_profile(self, profile: Optional[dict]) -> MetricVector:
-        return {dst: metric(profile[src], MEASURED, f"adreno:{src}")
-                for src, dst in self._MAP.items() if (profile or {}).get(src) is not None}
+    profiler = "opencl_profile"
+    _MAP = {"alu_util": "compute_util", "bw_util": "bw_util", "mem_util": "mem_util", "l1_hit": "l1_hit",
+            "l2_hit": "l2_hit", "occupancy": "occupancy", "texture_l1_hit": "l1_hit"}
+
+    def from_profile(self, s: Optional[dict], slot_us: Optional[float] = None) -> MetricVector:
+        s = s or {}
+        out = {dst: metric(s[src], MEASURED, f"opencl:{src}") for src, dst in self._MAP.items() if s.get(src) is not None}
+        if slot_us and s.get("duration_us"):
+            out["launch_frac"] = metric(max(0.0, min(1.0, 1.0 - s["duration_us"] / slot_us)), MEASURED,
+                                        "1 - cl_event kernel time / slot time")
+        if s.get("kernel_wg_max_min") and s.get("device_max_wg"):
+            out["reg_pressure"] = metric(100.0 * (1.0 - s["kernel_wg_max_min"] / s["device_max_wg"]), MEASURED,
+                                         "1 - kernel wg_max / device max_wg")
+        return out
+
+    def vector(self, profile=None, estimate=None, time_us=None) -> MetricVector:
+        est = roofline_vector(self.target, estimate) if estimate is not None else {}
+        meas = self.from_profile(profile, slot_us=time_us or (estimate.time_us if estimate else None))
+        return merge(est, meas)
+
+
+AdrenoAdapter = OpenCLProfileAdapter
 
 
 class MCycleAdapter(MetricAdapter):
@@ -250,7 +274,8 @@ class MCycleAdapter(MetricAdapter):
         return out
 
 
-_ADAPTERS = {"ncu": NCUAdapter, "ncu_text": NCUTextAdapter, "adreno": AdrenoAdapter,
+_ADAPTERS = {"ncu": NCUAdapter, "ncu_text": NCUTextAdapter, "opencl_profile": OpenCLProfileAdapter,
+             "adreno": OpenCLProfileAdapter,
              "mcycle": MCycleAdapter, "roofline": MetricAdapter}
 
 

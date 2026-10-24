@@ -94,6 +94,20 @@ async def exec_local_compilation(
     """Compile OpenCL host code locally (x86). Used for syntax checking."""
     work_dir = get_opencl_env_root(worker_id)
 
+    if str(main_file).endswith(".cpp"):
+        # C++ host program (ModelBlaster multi-slot main.cpp: OpenCL programs embedded)
+        exe = work_dir / f"main_cpp_{uuid.uuid4().hex[:6]}"
+        await run_subprocess_shell(
+            stage="g++:opencl",
+            cmd=f"g++ -O2 -std=c++11 -w -o {exe} {main_file} -lOpenCL -lm",
+            cwd=work_dir,
+            timeout_s=timeout,
+            env=ENV_VARS,
+            error_factory=OpenCLCompilationError,
+            logger=logger,
+        )
+        return exe
+
     # Copy source files into work dir
     shutil.copy2(main_file, work_dir / "main.c")
     shutil.copy2(kernel_file, work_dir / "kernel.cl")
@@ -179,10 +193,12 @@ async def exec_remote_compilation(
 
     # Compile on board
     main_basename = os.path.basename(main_file)
+    # .cpp: a C++ host program (ModelBlaster multi-slot main.cpp)
+    cc = "g++ -O2 -std=c++11 -w" if main_basename.endswith(".cpp") else "gcc"
     compile_cmd = (
         f"ssh {ssh_opts} {board_host} "
         f"'cd {remote_work_dir} && "
-        f"gcc -o main {main_basename} "
+        f"{cc} -o main {main_basename} "
         f"-I/usr/include -L/usr/lib -lOpenCL -lm "
         f"-DCL_TARGET_OPENCL_VERSION=200'"
     )

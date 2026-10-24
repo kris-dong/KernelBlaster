@@ -94,14 +94,15 @@ TECHNIQUES: dict[str, list[tuple[str, str]]] = {
 }
 
 
-def techniques_for(op_class: str) -> list[tuple[str, str]]:
-    return TECHNIQUES.get(op_class, []) + TECHNIQUES["*"]
+def techniques_for(op_class: str, techniques: Optional[dict] = None) -> list[tuple[str, str]]:
+    techniques = techniques or TECHNIQUES
+    return techniques.get(op_class, []) + techniques["*"]
 
 
 # ---------------------------------------------------------------- roofline
 
 # element bytes per manifest buffer dtype (fp16 problems move half the bytes)
-BUFFER_BYTES = {"f32": 4, "f16": 2, "i32": 4}
+BUFFER_BYTES = {"f32": 4, "f16": 2, "i32": 4, "i64": 8}
 
 
 def _nbytes(buf: dict) -> float:
@@ -134,15 +135,16 @@ def _op_cost(problem: SlotProblem, op: dict) -> tuple[float, float]:
     return byt, flops
 
 
-def slot_state(problem: SlotProblem, sid: str, slot_us: float, arch: str) -> tuple[str, dict]:
-    """Roofline regime of a slot and the numbers behind it."""
+def slot_state(problem: SlotProblem, sid: str, slot_us: float, arch: str,
+               peaks: Optional[tuple] = None) -> tuple[str, dict]:
+    """Roofline regime of a slot and the numbers behind it (``peaks``: (GFLOP/s, GB/s), default by sm)."""
     byt = fl = 0.0
     for op in problem.manifest["ops"]:
         if op["slot"] == sid:
             b, f = _op_cost(problem, op)
             byt += b
             fl += f
-    peak_f, peak_b = ARCH_PEAKS.get(arch, ARCH_PEAKS["75"])
+    peak_f, peak_b = peaks or ARCH_PEAKS.get(arch, ARCH_PEAKS["75"])
     t = max(slot_us, 1e-3) * 1e-6
     gbs, gfs = byt / t / 1e9, fl / t / 1e9
     pb, pf = gbs / peak_b, gfs / peak_f
@@ -164,7 +166,8 @@ def slot_state(problem: SlotProblem, sid: str, slot_us: float, arch: str) -> tup
 FUSABLE_CONSUMERS = ("elementwise",)
 
 
-def propose_fusions(problem: SlotProblem, result: EvalResult, arch: str, min_gain_pct: float = 2.0) -> dict:
+def propose_fusions(problem: SlotProblem, result: EvalResult, arch: str, min_gain_pct: float = 2.0,
+                    arch_label: Optional[str] = None) -> dict:
     """``kb-proposal/1``: fuse producer->consumer pairs where the consumer is an
     elementwise op that is the only reader of the producer's output.
 
@@ -208,10 +211,10 @@ def propose_fusions(problem: SlotProblem, result: EvalResult, arch: str, min_gai
                          "consumer_slot_us": result.slot_us.get(problem.slots[ops[g["pairs"][0][1]]["slot"]].id)},
             "rationale": (f"{kb} only reads the {ka} output it follows; fusing it into the {ka} epilogue "
                           f"removes {len(g['pairs'])} kernel launch(es) and {g['bytes'] / 1e6:.1f} MB of DRAM "
-                          f"round trip, ~{pct:.1f}% of the partition on sm_{arch}."),
+                          f"round trip, ~{pct:.1f}% of the partition on {arch_label or 'sm_' + arch}."),
         })
     return {"format": "kb-proposal/1", "problem": problem.name, "problem_dir": str(problem.root),
-            "arch": f"sm_{arch}", "proposals": props}
+            "arch": arch_label or f"sm_{arch}", "proposals": props}
 
 
 def _efficiency(problem: SlotProblem, ops: list[dict], us: float, arch: str) -> float:
@@ -370,6 +373,41 @@ def system_prompt(dtype: str = "fp32", tolerance: Optional[dict] = None) -> str:
 SYSTEM_PROMPT = system_prompt("fp32")
 
 
+@dataclass(frozen=True)
+class TargetProfile:
+    """What differs between slot targets (manifest ``target``): prompt, code fence, technique
+    catalogue, roofline peaks, store/outcome arch label, per-slot profiler, slot file suffix."""
+    name: str
+    system_prompt: str
+    fence: str
+    techniques: dict
+    peaks: dict
+    slot_ext: str
+    profiler: Any                     # module with render() / delta(): knowledge.ncu or knowledge.opencl_profile
+
+    def prompt_for(self, problem) -> str:
+        if self.name == "cuda":                       # dtype rules + the manifest's isolated bound
+            return system_prompt(problem.dtype, problem.tolerance)
+        return self.system_prompt
+
+    def arch_label(self, arch: str) -> str:
+        return f"sm_{arch}" if self.name == "cuda" else arch
+
+    def peaks_for(self, arch: str) -> tuple:
+        return self.peaks.get(arch) or next(iter(self.peaks.values()))
+
+
+def target_profile(target: str) -> TargetProfile:
+    if target == "cuda":
+        return TargetProfile("cuda", SYSTEM_PROMPT, "cuda", TECHNIQUES, ARCH_PEAKS, ".cu", ncu_mod)
+    if target == "opencl":
+        from ..knowledge import opencl_profile
+        from .multislot_opencl import OPENCL_PEAKS, OPENCL_TECHNIQUES, SYSTEM_PROMPT_OPENCL
+        return TargetProfile("opencl", SYSTEM_PROMPT_OPENCL, "cpp", OPENCL_TECHNIQUES, OPENCL_PEAKS, ".cpp",
+                             opencl_profile)
+    raise ValueError(f"unknown slot target {target!r}")
+
+
 def _fmt_instances(slot) -> str:
     rows = [json.dumps(i.get("shape", {}), sort_keys=True) for i in slot.instances[:8]]
     more = f"\n  ... and {len(slot.instances) - 8} more" if len(slot.instances) > 8 else ""
@@ -383,6 +421,7 @@ def build_codegen_messages(*, problem: SlotProblem, sid: str, source: str, techn
                            knowledge_text: str, already_tried: str, best_note: str,
                            profile_text: str = "") -> list[dict]:
     slot = problem.slots[sid]
+    tp = target_profile(problem.target)
     ref = problem.reference_text(sid)
     parts = [
         f"## Slot `{sid}` (op `{slot.op}`, class `{slot.op_class}`)",
@@ -400,28 +439,29 @@ def build_codegen_messages(*, problem: SlotProblem, sid: str, source: str, techn
             f"- `{n}`: {sig}" for n, sig in neighbours))
     if adapt:
         parts.append(f"A verified fast implementation of this same op for overlapping shapes ({adapt[0]}); "
-                     f"adapt it to these instances (re-tune what doesn't fit):\n```cuda\n{adapt[1][:6000]}\n```")
+                     f"adapt it to these instances (re-tune what doesn't fit):\n```{tp.fence}\n{adapt[1][:6000]}\n```")
     for label, code in examples:
-        parts.append(f"Example: a verified fast kernel of the same class ({label}):\n```cuda\n{code[:5000]}\n```")
+        parts.append(f"Example: a verified fast kernel of the same class ({label}):\n```{tp.fence}\n{code[:5000]}\n```")
     if knowledge_text:
         parts.append("Lessons from earlier optimisation runs:\n" + knowledge_text)
     if already_tried:
         parts.append("Already tried on this slot (avoid repeating dead ends):\n" + already_tried)
     parts.append(f"## Technique to apply: {technique}\n{technique_desc}")
-    parts.append(f"Current slot source:\n```cuda\n{source}\n```")
-    return [{"role": "system", "content": system_prompt(problem.dtype, problem.tolerance)},
+    parts.append(f"Current slot source:\n```{tp.fence}\n{source}\n```")
+    return [{"role": "system", "content": tp.prompt_for(problem)},
             {"role": "user", "content": "\n\n".join(p for p in parts if p)}]
 
 
 def build_fix_messages(*, problem: SlotProblem, sid: str, source: str, error: str,
                        pitfalls: str = "") -> list[dict]:
     slot = problem.slots[sid]
+    tp = target_profile(problem.target)
     known = f"Known pitfalls from earlier runs:\n{pitfalls}\n\n" if pitfalls else ""
-    return [{"role": "system", "content": system_prompt(problem.dtype, problem.tolerance)},
+    return [{"role": "system", "content": tp.prompt_for(problem)},
             {"role": "user", "content":
              f"The slot `{sid}` (op `{slot.op}`, signature `{slot.signature}`) failed:\n```\n{error}\n```\n\n"
              f"Instances:\n{_fmt_instances(slot)}\n\n{known}Fix it (keep the optimisation if you can). "
-             f"Current source:\n```cuda\n{source}\n```"}]
+             f"Current source:\n```{tp.fence}\n{source}\n```"}]
 
 
 def extract_code(text: str) -> Optional[str]:
@@ -495,6 +535,12 @@ class MultiSlotAgent:
         self.out = Path(out_dir)
         self.out.mkdir(parents=True, exist_ok=True)
         self.arch, self.store, self.olog = arch, impl_store, outcome_log
+        # target (manifest): prompt, techniques, peaks; records keyed (target, arch label) so
+        # CUDA and OpenCL implementations / lessons never mix
+        self.tp = target_profile(problem.target)
+        self.arch_label = self.tp.arch_label(arch)
+        if self.kv is not None:                # targets.json entries win; the profile's peaks fill gaps
+            self.kv.registry.ensure(self._tkey, peaks=self.tp.peaks_for(arch))
         self.claims, self.semantic = claims, semantic_updater
         self.rollouts, self.steps, self.max_fix = rollouts, steps, max_fix_attempts
         self.min_share, self.confirm_pct = min_share, confirm_pct
@@ -540,7 +586,7 @@ class MultiSlotAgent:
             return "", ""
         slot = self.p.slots[sid]
         try:
-            cl = self.claims.relevant(target="cuda", arch=f"sm_{self.arch}", op_class=slot.op_class,
+            cl = self.claims.relevant(target=self.p.target, arch=self.arch_label, op_class=slot.op_class,
                                       state=state, technique=technique, problem_id=self.problem_id, slot=sid)
             return self.claims.render(cl), self.claims.already_tried(self.problem_id, sid)
         except Exception as e:                                    # knowledge must never block a step
@@ -553,19 +599,29 @@ class MultiSlotAgent:
         return hashlib.sha1(code.encode()).hexdigest()
 
     async def _profile(self, sources: dict, tag: str) -> dict:
-        """NCU every slot of ``sources``; cache per (slot, code). {} if off/unavailable."""
+        """NCU the slots of ``sources`` whose code has no cached profile; cache
+        per (slot, code). {} if off/unavailable.
+
+        Slots already profiled with this exact code are left out of the ncu
+        filter (their kernels are not replayed); their cached summaries are
+        returned alongside the new ones."""
         if self.ncu == "off" or self.ncu_disabled:
             return {}
+        todo = [sid for sid in sources if self._ncu_of(sid, sources[sid]) is None]
+        cached = {sid: self._ncu_of(sid, sources[sid]) for sid in sources if sid not in todo}
+        if not todo:
+            return cached
         self.ncu_runs += 1
-        by, err = await self.ev.profile(self.p, sources, tag)
+        only = {} if len(todo) == len(sources) else {"slots": todo}
+        by, err = await self.ev.profile(self.p, sources, tag, **only)
         if err:
             self.ncu_disabled = err
-            self.log.warning(f"[{self.p.name}] NCU disabled for this run: {err} (roofline states instead)")
+            self.log.warning(f"[{self.p.name}] slot profiles disabled for this run: {err} (roofline states instead)")
             return {}
         for sid, summ in by.items():
             if sid in sources:
                 self.ncu_cache[(sid, self._sha(sources[sid]))] = summ
-        return by
+        return {**cached, **by}
 
     def _ncu_of(self, sid: str, code: str) -> Optional[dict]:
         return self.ncu_cache.get((sid, self._sha(code)))
@@ -574,7 +630,7 @@ class MultiSlotAgent:
         if self.claims is None:
             return ""
         try:
-            cl = self.claims.relevant(target="cuda", arch=f"sm_{self.arch}",
+            cl = self.claims.relevant(target=self.p.target, arch=self.arch_label,
                                       op_class=self.p.slots[sid].op_class, technique=technique,
                                       problem_id=self.problem_id, slot=sid, kinds=["pitfall"], k=6)
             return self.claims.render(cl)
@@ -585,7 +641,7 @@ class MultiSlotAgent:
         if self.store is None:
             return {"seed": None, "adapt": None, "examples": []}
         s = self.p.slots[sid]
-        return self.store.retrieve(target="cuda", arch=f"sm_{self.arch}", op=s.op, op_class=s.op_class,
+        return self.store.retrieve(target=self.p.target, arch=self.arch_label, op=s.op, op_class=s.op_class,
                                    signature=s.signature, shapes=s.shapes(), exclude_problem=self.problem_id,
                                    dtype=self.p.dtype)
 
@@ -604,14 +660,19 @@ class MultiSlotAgent:
     def _outcome(self, **kw) -> OutcomeRecord:
         sid = kw.pop("sid")
         s = self.p.slots[sid]
-        return OutcomeRecord(target=self.p.target, arch=f"sm_{self.arch}", problem_id=self.problem_id,
+        return OutcomeRecord(target=self.p.target, arch=self.arch_label, problem_id=self.problem_id,
                              run_id=self.run_id, slot=sid, op_kind=s.op, op_class=s.op_class,
                              shape_bucket=shape_bucket(s.op_class, s.shapes()[0] if s.instances else {}),
                              dtype=self.p.dtype, **kw)
 
     @property
     def _tkey(self) -> str:
-        return f"{self.p.target}:sm_{self.arch}"
+        return f"{self.p.target}:{self.arch_label}"
+
+    @property
+    def _profile_kind(self) -> str:
+        """knowledge-v2 metric adapter for this target's profiler module (ncu | opencl_profile)."""
+        return self.tp.profiler.__name__.rsplit(".", 1)[-1]
 
     def _roofline_input(self, sid: str, slot_us: float):
         """Manifest bytes/flops of the slot's instances + measured time (knowledge v2 estimate)."""
@@ -644,7 +705,7 @@ class MultiSlotAgent:
             return None
         s = self.p.slots[sid]
         seed_us = self.baseline.slot_us.get(sid) if self.baseline else None
-        rec = self.store.add(code, target="cuda", arch=f"sm_{self.arch}", op=s.op, op_class=s.op_class,
+        rec = self.store.add(code, target=self.p.target, arch=self.arch_label, op=s.op, op_class=s.op_class,
                              signature_sha=s.signature_sha, shapes=s.shapes(),
                              buckets=sorted({shape_bucket(s.op_class, x) for x in s.shapes()}),
                              slot_us=slot_us, baseline_us=baseline_us,
@@ -700,21 +761,21 @@ class MultiSlotAgent:
             sid = self._pick_slot()
             self.slot_tries[sid] += 1
         slot = self.p.slots[sid]
-        state, nums = slot_state(self.p, sid, cur_us[sid], self.arch)
+        state, nums = slot_state(self.p, sid, cur_us[sid], self.arch, self.tp.peaks_for(self.arch))
         prof_before = self._ncu_of(sid, cur[sid])
         if prof_before:
-            state = prof_before["state"]                 # measured bound beats the roofline estimate
+            state = prof_before.get("state") or state    # measured bound beats the roofline estimate
         choice = cls = vec_before = None
         if self.kv is not None:
             vec_before = self.kv.vector(self._tkey, estimate=self._roofline_input(sid, cur_us[sid]),
-                                        profile=prof_before)
+                                        profile=prof_before, profile_kind=self._profile_kind)
             cls = self.kv.classify(vec_before, target_key=self._tkey, op_class=slot.op_class, dtype=self.p.dtype)
             choice = self.kv.select(target_key=self._tkey, op_class=slot.op_class, dtype=self.p.dtype, cls=cls,
                                     vec=vec_before, rng=self.rng)
             tech, desc, state = choice.item_id, choice.desc, cls.label()
             nums = {**nums, **cls.decided_by}
         else:
-            techs = techniques_for(slot.op_class)
+            techs = techniques_for(slot.op_class, self.tp.techniques)
             # fp16 arms are their own keys (half2 / tensor-core techniques pay off
             # differently); fp32 keys keep their names, and the cross-key prior
             # still seeds an untried fp16 arm from its fp32 record
@@ -746,14 +807,14 @@ class MultiSlotAgent:
                                       slot_us=cur_us[sid], partition_us=part_us, neighbours=neigh,
                                       examples=examples, adapt=adapt, knowledge_text=ktext,
                                       already_tried=tried, best_note=best_note,
-                                      profile_text=ncu_mod.render(prof_before) if prof_before else "")
+                                      profile_text=self.tp.profiler.render(prof_before) if prof_before else "")
         text = await self._llm(msgs, self.model)
         code = extract_code(text)
         fixes, res, status = 0, None, None
         before = cur_us[sid]
         while True:
             if code is None:
-                res = EvalResult(ok=False, stage="compile", errors=["no ```cuda block in the response"])
+                res = EvalResult(ok=False, stage="compile", errors=[f"no ```{self.tp.fence} block in the response"])
             else:
                 res = await self.ev.evaluate(self.p, {**cur, sid: code}, f"r{ridx}_s{step}_{sid}_{tech}_f{fixes}")
             if res.ok or fixes >= self.max_fix or code is None:
@@ -806,15 +867,15 @@ class MultiSlotAgent:
             else:
                 self.slot_stall[sid] += 1
         okw = dict(sid=sid, technique=tech, status=status, state_before=state,
-                   state_after=prof_after["state"] if prof_after else None,
+                   state_after=prof_after.get("state") if prof_after else None,
                    metric_before=before, metric_after=after, speedup=speedup,
-                   metrics_delta=ncu_mod.delta(prof_before, prof_after),
+                   metrics_delta=self.tp.profiler.delta(prof_before, prof_after),
                    error=None if res.ok else res.error_text(1500),
                    diff_summary=dsum, impl_id=impl_id, parent_impl_id=parent)
         v2 = None
         if self.kv is not None:
-            vec_after = (self.kv.vector(self._tkey, estimate=self._roofline_input(sid, after), profile=prof_after)
-                         if res.ok and after else None)
+            vec_after = (self.kv.vector(self._tkey, estimate=self._roofline_input(sid, after), profile=prof_after,
+                                        profile_kind=self._profile_kind) if res.ok and after else None)
             try:
                 v2 = self.kv.record(self._outcome(**okw), choice=choice, reward=reward, cls=cls, before=vec_before,
                                     after=vec_after, op_class=slot.op_class, dtype=self.p.dtype,
@@ -872,7 +933,7 @@ class MultiSlotAgent:
             final = await self.ev.evaluate(self.p, self._sources(), "final_repaired")
         result = self._write_result(final)
         if final.ok and self.propose:
-            props = propose_fusions(self.p, final, self.arch)
+            props = propose_fusions(self.p, final, self.arch, arch_label=self.arch_label)
             props["proposals"] += propose_splits(self.p, final, self.arch)
             if self.kv is not None:                  # graph-level hypotheses (ids = MB graph_hints ids)
                 self.kv.hypotheses.from_proposals(props, self._tkey, self.kv.review_path)
@@ -902,11 +963,11 @@ class MultiSlotAgent:
         best_dir = self.out / "best" / "slots"
         best_dir.mkdir(parents=True, exist_ok=True)
         for sid, b in self.best.items():
-            (best_dir / f"{sid}.cu").write_text(b.source)
+            (best_dir / f"{sid}{self.tp.slot_ext}").write_text(b.source)
         base = self.baseline
         res = {
             "problem": self.p.name, "problem_dir": str(self.p.root), "run_id": self.run_id,
-            "arch": f"sm_{self.arch}", "model": self.model, "llm_calls": self.llm_calls,
+            "arch": self.arch_label, "target": self.p.target, "model": self.model, "llm_calls": self.llm_calls,
             "llm_usage": {**self.llm_usage, "cost_usd": round(self.llm_usage["cost_usd"], 4)},
             "ncu": {"mode": self.ncu, "runs": self.ncu_runs, "disabled": self.ncu_disabled,
                     "final": {sid: self._ncu_of(sid, b.source) for sid, b in self.best.items()
