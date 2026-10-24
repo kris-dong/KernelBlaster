@@ -304,7 +304,9 @@ async def async_main(args: argparse.Namespace) -> int:
     )
     kernels_c = stage_dir / "generated" / args.target / "kernels.c"
     orig_kernels_c = kernels_c.with_suffix(".c.orig")
-    # Reset kernels.c to the reference version if a prior RL run left an override.
+    # Reset kernels.c to the reference version if an older RL run left an
+    # override (bridge_build.sh used to copy candidates over it; it now
+    # builds each candidate in its own MODEL_DIR and leaves it alone).
     if orig_kernels_c.exists():
         shutil.copy(orig_kernels_c, kernels_c)
 
