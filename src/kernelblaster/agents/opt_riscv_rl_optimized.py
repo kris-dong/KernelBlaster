@@ -102,6 +102,7 @@ class OptimizedRLRiscvAgent(RLOptimizedAgentBase):
         io_npz_path: Optional[Path] = None,
         spike_args_str: str = "",
         use_exec_batching: bool = True,
+        modelblaster_target: Optional[str] = None,
     ):
         backend = RiscvZephyrBackend(gpu=gpu)
 
@@ -125,6 +126,11 @@ class OptimizedRLRiscvAgent(RLOptimizedAgentBase):
         self.gpu = gpu
         self.io_npz_path = io_npz_path
         self.spike_args_str = spike_args_str
+        # modelblaster backend the stage was built for (scalar / rvv /
+        # ...). Same-problem batching links against
+        # ``<stage>/generated/<target>``; ``None`` lets the batched
+        # exec path read KERNELBLASTER_MODELBLASTER_TARGET instead.
+        self.modelblaster_target = modelblaster_target
 
         # Database — RISC-V uses the base :class:`GPUOptimizationDatabase`
         # with the RISC-V footer markdown (author-tuned states like
@@ -208,6 +214,7 @@ class OptimizedRLRiscvAgent(RLOptimizedAgentBase):
                 io_npz_path=self.io_npz_path,
                 spike_args_str=self.spike_args_str,
                 passed_keyword=None,
+                target=self.modelblaster_target,
             )
         else:
             stdout_list, stderr_list, _elf_path, _success = await compile_and_run_riscv(
