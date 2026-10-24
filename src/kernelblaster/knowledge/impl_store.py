@@ -74,8 +74,10 @@ class ImplRecord:
     shapes: list                                 # instance shape dicts it was verified on
     buckets: list                                # their shape_bucket()s
     slot_us: float                               # summed over the instances, on `arch`
-    baseline_us: Optional[float] = None          # the seed it improved on
-    speedup: Optional[float] = None              # baseline_us / slot_us
+    baseline_us: Optional[float] = None          # its parent's time (the step it improved on)
+    speedup: Optional[float] = None              # baseline_us / slot_us (vs parent)
+    seed_us: Optional[float] = None              # the problem's seed (hand kernel) time
+    speedup_vs_seed: Optional[float] = None      # seed_us / slot_us -- what write-back filters on
     techniques: list = field(default_factory=list)   # lineage, oldest first
     parent_id: Optional[str] = None
     problem_id: Optional[str] = None
@@ -133,10 +135,10 @@ class ImplStore:
         exact = [r for r in same_op if r.arch == arch and want <= set(r.buckets)]
         seed = min(exact, key=lambda r: r.slot_us / max(len(r.shapes), 1), default=None)
         others = [r for r in same_op if r is not seed]
-        adapt = None if seed else max(others, key=lambda r: (r.arch == arch, r.speedup or 0), default=None)
-        ex = [r for r in recs if r.op_class == op_class and r.op != op and (r.speedup or 0) > 1.05]
+        adapt = None if seed else max(others, key=lambda r: (r.arch == arch, r.speedup_vs_seed or 0), default=None)
+        ex = [r for r in recs if r.op_class == op_class and r.op != op and (r.speedup_vs_seed or 0) > 1.05]
         best_per_op = {}
-        for r in sorted(ex, key=lambda r: -(r.speedup or 0)):
+        for r in sorted(ex, key=lambda r: -(r.speedup_vs_seed or 0)):
             best_per_op.setdefault(r.op, r)
         return {"seed": seed, "adapt": adapt, "examples": list(best_per_op.values())[:n_examples]}
 
@@ -152,13 +154,14 @@ class ImplStore:
         return list(best.values())
 
     def export_winners(self, out: Path, *, target: str = "cuda", arch: Optional[str] = None,
-                       min_speedup: float = 1.0) -> Path:
-        """Write ``winners.json`` + sources for ModelBlaster's ingest."""
+                       min_speedup: float = 1.05) -> Path:
+        """Write ``winners.json`` + sources for ModelBlaster's ingest (records
+        at least ``min_speedup`` over their problem's seed; seeds excluded)."""
         out = Path(out)
         (out / "code").mkdir(parents=True, exist_ok=True)
         rows = []
         for r in self.winners(target=target, arch=arch):
-            if r.speedup is not None and r.speedup < min_speedup:
+            if r.speedup_vs_seed is None or r.speedup_vs_seed < min_speedup:
                 continue
             (out / "code" / f"{r.code_sha}.cu").write_text(self.code(r))
             rows.append({**asdict(r), "file": f"code/{r.code_sha}.cu"})

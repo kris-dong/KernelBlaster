@@ -145,6 +145,61 @@ def slot_state(problem: SlotProblem, sid: str, slot_us: float, arch: str) -> tup
                    "pct_peak_bw": round(100 * pb, 1), "pct_peak_flops": round(100 * pf, 1)}
 
 
+# ---------------------------------------------------------------- KernelSpec proposals
+
+FUSABLE_CONSUMERS = ("elementwise",)
+
+
+def propose_fusions(problem: SlotProblem, result: EvalResult, arch: str, min_gain_pct: float = 2.0) -> dict:
+    """``kb-proposal/1``: fuse producer->consumer pairs where the consumer is an
+    elementwise op that is the only reader of the producer's output.
+
+    Estimated gain per pair = the consumer instance's time (its kernel goes
+    away into the producer's epilogue) -- the intermediate's DRAM round trip
+    is the bulk of an elementwise kernel's time, so this already counts it.
+    Pairs are chosen greedily by gain, each op in at most one pair; a pattern
+    (producer kind, consumer kind) is proposed if its pairs together save
+    ``min_gain_pct`` of the partition. ModelBlaster builds, verifies and
+    decides (pipeline/kb_proposals.py).
+    """
+    ops = {o["name"]: o for o in problem.manifest["ops"]}
+    bufs = problem.manifest["buffers"]
+    part_us = result.partition_us or sum(result.slot_us.values()) or 1.0
+    per_inst = {sid: result.slot_us.get(sid, 0.0) / max(len(s.instances), 1) for sid, s in problem.slots.items()}
+    cands = []
+    for a, b, t in problem.adjacent_pairs():
+        sa, sb = problem.slots[ops[a]["slot"]], problem.slots[ops[b]["slot"]]
+        if sb.op_class not in FUSABLE_CONSUMERS:
+            continue
+        nbytes = 4 * next(x["numel"] for x in bufs if x["name"] == t)
+        cands.append((per_inst[sb.id], a, b, t, sa.op, sb.op, nbytes))
+    used, by_pattern = set(), {}
+    for gain, a, b, t, ka, kb, nb in sorted(cands, reverse=True):
+        if a in used or b in used:
+            continue
+        used.update((a, b))
+        g = by_pattern.setdefault((ka, kb), {"pairs": [], "gain_us": 0.0, "bytes": 0})
+        g["pairs"].append([a, b, t])
+        g["gain_us"] += gain
+        g["bytes"] += nb
+    props = []
+    for (ka, kb), g in sorted(by_pattern.items(), key=lambda kv: -kv[1]["gain_us"]):
+        pct = 100.0 * g["gain_us"] / part_us
+        if pct < min_gain_pct:
+            continue
+        props.append({
+            "kind": "fuse", "pattern": [ka, kb], "pairs": g["pairs"],
+            "evidence": {"est_gain_us": round(g["gain_us"], 2), "est_gain_pct": round(pct, 2),
+                         "intermediate_bytes": g["bytes"], "partition_us": part_us,
+                         "consumer_slot_us": result.slot_us.get(problem.slots[ops[g["pairs"][0][1]]["slot"]].id)},
+            "rationale": (f"{kb} only reads the {ka} output it follows; fusing it into the {ka} epilogue "
+                          f"removes {len(g['pairs'])} kernel launch(es) and {g['bytes'] / 1e6:.1f} MB of DRAM "
+                          f"round trip, ~{pct:.1f}% of the partition on sm_{arch}."),
+        })
+    return {"format": "kb-proposal/1", "problem": problem.name, "problem_dir": str(problem.root),
+            "arch": f"sm_{arch}", "proposals": props}
+
+
 # ---------------------------------------------------------------- bandit
 
 class TechniqueBandit:
@@ -255,12 +310,14 @@ def build_codegen_messages(*, problem: SlotProblem, sid: str, source: str, techn
             {"role": "user", "content": "\n\n".join(p for p in parts if p)}]
 
 
-def build_fix_messages(*, problem: SlotProblem, sid: str, source: str, error: str) -> list[dict]:
+def build_fix_messages(*, problem: SlotProblem, sid: str, source: str, error: str,
+                       pitfalls: str = "") -> list[dict]:
     slot = problem.slots[sid]
+    known = f"Known pitfalls from earlier runs:\n{pitfalls}\n\n" if pitfalls else ""
     return [{"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content":
              f"The slot `{sid}` (op `{slot.op}`, signature `{slot.signature}`) failed:\n```\n{error}\n```\n\n"
-             f"Instances:\n{_fmt_instances(slot)}\n\nFix it (keep the optimisation if you can). "
+             f"Instances:\n{_fmt_instances(slot)}\n\n{known}Fix it (keep the optimisation if you can). "
              f"Current source:\n```cuda\n{source}\n```"}]
 
 
@@ -309,8 +366,9 @@ class MultiSlotAgent:
                  rollouts: int = 4, steps: int = 6, max_fix_attempts: int = 2, min_share: float = 0.01,
                  confirm_pct: float = 3.0, stall_decay: float = 0.6, bandit: Optional[TechniqueBandit] = None,
                  model_fix: Optional[str] = None, seed: int = 0, logger=None, run_id: Optional[str] = None,
-                 problem_id: Optional[str] = None):
+                 problem_id: Optional[str] = None, propose: bool = True):
         self.p, self.ev, self.model = problem, evaluator, model
+        self.propose = propose
         self.model_fix = model_fix or model
         self.out = Path(out_dir)
         self.out.mkdir(parents=True, exist_ok=True)
@@ -366,6 +424,17 @@ class MultiSlotAgent:
             self.log.warning(f"claims lookup failed: {e}")
             return "", ""
 
+    def _pitfalls(self, sid: str, technique: str) -> str:
+        if self.claims is None:
+            return ""
+        try:
+            cl = self.claims.relevant(target="cuda", arch=f"sm_{self.arch}",
+                                      op_class=self.p.slots[sid].op_class, technique=technique,
+                                      problem_id=self.problem_id, slot=sid, kinds=["pitfall"], k=6)
+            return self.claims.render(cl)
+        except Exception:
+            return ""
+
     def _retrieve(self, sid: str) -> dict:
         if self.store is None:
             return {"seed": None, "adapt": None, "examples": []}
@@ -387,18 +456,23 @@ class MultiSlotAgent:
                             run_id=self.run_id, slot=sid, op_kind=s.op, op_class=s.op_class,
                             shape_bucket=shape_bucket(s.op_class, s.shapes()[0] if s.instances else {}),
                             dtype="fp32", **kw)
-        return self.olog.append(rec)
+        self.olog.append(rec)
+        if self.claims is not None and hasattr(self.claims, "observe"):
+            self.claims.observe(rec)          # "already tried" visible to parallel rollouts now
+        return rec
 
     def _store(self, sid: str, code: str, slot_us: float, baseline_us: Optional[float],
                techniques: list, parent: Optional[str], rel_err: Optional[float]) -> Optional[str]:
         if self.store is None:
             return None
         s = self.p.slots[sid]
+        seed_us = self.baseline.slot_us.get(sid) if self.baseline else None
         rec = self.store.add(code, target="cuda", arch=f"sm_{self.arch}", op=s.op, op_class=s.op_class,
                              signature_sha=s.signature_sha, shapes=s.shapes(),
                              buckets=sorted({shape_bucket(s.op_class, x) for x in s.shapes()}),
                              slot_us=slot_us, baseline_us=baseline_us,
                              speedup=(baseline_us / slot_us) if baseline_us and slot_us else None,
+                             seed_us=seed_us, speedup_vs_seed=(seed_us / slot_us) if seed_us and slot_us else None,
                              techniques=techniques, parent_id=parent, problem_id=self.problem_id,
                              run_id=self.run_id, slot=sid, max_rel_err=rel_err)
         return rec.id
@@ -485,7 +559,8 @@ class MultiSlotAgent:
                 break
             fixes += 1
             text = await self._llm(build_fix_messages(problem=self.p, sid=sid, source=code,
-                                                      error=res.error_text()), self.model_fix)
+                                                      error=res.error_text(),
+                                                      pitfalls=self._pitfalls(sid, tech)), self.model_fix)
             new = extract_code(text)
             if not new or new == code:
                 break
@@ -558,12 +633,19 @@ class MultiSlotAgent:
                 self.best[sid] = SlotBest(seeds[sid], self.baseline.slot_us.get(sid, 0.0))
             final = await self.ev.evaluate(self.p, self._sources(), "final_repaired")
         result = self._write_result(final)
+        if final.ok and self.propose:
+            props = propose_fusions(self.p, final, self.arch)
+            (self.out / "proposals.json").write_text(json.dumps(props, indent=1))
+            result["proposals"] = [{"pattern": x["pattern"], "pairs": len(x["pairs"]),
+                                    "est_gain_pct": x["evidence"]["est_gain_pct"]} for x in props["proposals"]]
+            (self.out / "result.json").write_text(json.dumps(result, indent=1))
         if self.semantic is not None:
             try:
-                await self.semantic.reflect_pending() if hasattr(self.semantic, "reflect_pending") \
-                    else await self.semantic.maybe_reflect()
+                await self.semantic.maybe_reflect(force=True)
             except Exception as e:
                 self.log.warning(f"final semantic update failed: {e!r}")
+        if self.claims is not None and hasattr(self.claims, "save"):
+            self.claims.save()
         return result
 
     def _write_result(self, final: EvalResult) -> dict:
