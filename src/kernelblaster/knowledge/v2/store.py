@@ -158,6 +158,14 @@ class KnowledgeDB:
                           "(item, level, scope, op, state) DO UPDATE SET n=n+1, s=s+excluded.s, "
                           "ss=ss+excluded.ss", (*node, reward, reward * reward))
 
+    def add_stats_bulk(self, agg: dict) -> None:
+        """{(item, level, scope, op, state): [n, sum, sumsq]} added in one transaction."""
+        with self.tx() as c:
+            for k, (n, sm, ss) in agg.items():
+                c.execute("INSERT INTO stats VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT"
+                          "(item, level, scope, op, state) DO UPDATE SET n=n+excluded.n, s=s+excluded.s, "
+                          "ss=ss+excluded.ss", (*k, n, sm, ss))
+
     def all_stats(self) -> dict[tuple, list]:
         return {tuple(r[:5]): [r[5], r[6], r[7]] for r in self.query("SELECT * FROM stats")}
 

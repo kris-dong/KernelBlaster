@@ -5,8 +5,8 @@
     universal
     ├── simt_gpu ── nvidia_gpu ── turing (cuda:sm_75), ampere, ada (cuda:sm_89), hopper
     │           └── adreno (opencl:adreno650, opencl:adreno740)
-    ├── vector_cpu (rvv:vlen256)
-    └── systolic (gemmini:default)
+    ├── vector_cpu ── rvv (rvv:vlen128, rvv:vlen256, rvv:vlen512)
+    └── systolic ── gemmini (gemmini:default)
 
 Every node has an id, a parent and a description; the root is ``universal``.
 Targets hang off any node. Nodes and targets are data (``targets.json``) and
@@ -27,6 +27,7 @@ the root.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
@@ -36,7 +37,9 @@ FAMILY = "family"                               # v1 alias of NODE (old DBs, cla
 LEVELS = (TARGET, NODE, UNIVERSAL)
 ROOT = UNIVERSAL
 
-DATA_DIR = Path(__file__).resolve().parents[4] / "data" / "kernelblaster" / "knowledge"
+#: seed data directory (``KB_KNOWLEDGE_SEED_DIR`` overrides it, e.g. to build a DB from another seed)
+REPO_DATA_DIR = Path(__file__).resolve().parents[4] / "data" / "kernelblaster" / "knowledge"
+DATA_DIR = Path(os.environ.get("KB_KNOWLEDGE_SEED_DIR") or REPO_DATA_DIR)
 
 
 def target_key(target: str, arch: Optional[str] = None) -> str:
@@ -76,6 +79,7 @@ class Target:
     profiler: str = "roofline"
     aliases: list = field(default_factory=list)
     kappa: Optional[float] = None
+    limits: dict = field(default_factory=dict)  # resource limits (regs, smem, tensor cores, VLEN, scratchpad ...)
     family: str = ""                            # top node under universal (filled by the registry)
 
     @property

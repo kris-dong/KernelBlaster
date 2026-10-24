@@ -76,7 +76,7 @@ def test_seed_classification_chains():
     assert h.classify(vec(launch_frac=0.9, mem_util=5, compute_util=5), target="cuda:sm_75").chain == \
         ["latency_bound", "launch_overhead"]
     assert h.classify({}, target="cuda:sm_75").status == "unknown"
-    assert h.map_legacy("memory_bank_conflicts") == "on_chip_memory_bound"
+    assert h.map_legacy("memory_bank_conflicts") == "smem_bank_conflicted"
     assert h.ancestors("stalled_low_occupancy") == ["stalled_low_occupancy", "underutilized_compute", "underutilized"]
 
 

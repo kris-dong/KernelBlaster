@@ -94,13 +94,20 @@ class HierStats:
         a = self.data.get((item, *node))
         return a[1] / a[0] if a and a[0] else None
 
-    def estimate(self, item: str, nodes: list[tuple]) -> float:
-        est = self.prior
+    def estimate(self, item: str, nodes: list[tuple], prior: Optional[dict] = None) -> float:
+        """Shrunk estimate; ``prior`` ({mean, n}, a technique's seed prior) is the root of the
+        chain with pseudo-count n at the first node that has data (evidence overrides it)."""
+        est = float(prior["mean"]) if prior else self.prior
+        first = True
         for node in reversed(nodes):
             a = self.data.get((item, *node))
             if a and a[0]:
-                k = self.registry.kappa_of(node[1], self.kappa) if node[0] in (TARGET, NODE) else self.kappa
+                if first and prior:
+                    k = float(prior.get("n", 1.0))
+                else:
+                    k = self.registry.kappa_of(node[1], self.kappa) if node[0] in (TARGET, NODE) else self.kappa
                 est = (a[1] + k * est) / (a[0] + k)
+                first = False
         return est
 
     def evidence_level(self, item: str, nodes: list[tuple]) -> tuple[str, float]:
@@ -117,13 +124,14 @@ class HierStats:
     def local_total(self, nodes: list[tuple], items) -> float:
         return sum(self.count(i, nodes[0]) for i in items)
 
-    def ucb(self, items: list[str], nodes: list[tuple], rng: random.Random, c: float = 1.0) -> list[tuple]:
+    def ucb(self, items: list[str], nodes: list[tuple], rng: random.Random, c: float = 1.0,
+            priors: Optional[dict] = None) -> list[tuple]:
         """[(score, est, n_local, item)] sorted best first."""
         total = self.local_total(nodes, items) + 1
         out = []
         for it in items:
             n = self.count(it, nodes[0])
-            est = self.estimate(it, nodes)
+            est = self.estimate(it, nodes, (priors or {}).get(it))
             score = est + c * math.sqrt(math.log(total + 1) / (n + 1)) + 1e-6 * rng.random()
             out.append((score, est, n, it))
         return sorted(out, reverse=True)

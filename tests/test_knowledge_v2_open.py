@@ -209,7 +209,7 @@ def test_promoted_technique_auto_demotion(tmp_path):
 def test_legacy_v1_database_stays_readable(tmp_path):
     """A seed-version-1 DB: family-level claims / techniques / stats rows map onto nodes."""
     root = tmp_path / "k"
-    kv = KnowledgeV2(root)
+    kv = KnowledgeV2(root, seed_mined=False)
     db = kv.db
     db.set_meta("seed_version", 1)
     old = Claim(kind=APPLICABILITY, text="coalescing helps conv on GPUs", technique="memory_coalescing",
@@ -224,7 +224,7 @@ def test_legacy_v1_database_stays_readable(tmp_path):
                       realizations=[{"scope": "family:simt_gpu", "how": "x"}]).to_dict()),))
         c.execute("INSERT OR REPLACE INTO targets VALUES ('cuda:sm_61', 'simt_gpu', ?)",
                   (json.dumps({"key": "cuda:sm_61", "family": "simt_gpu", "peak_gbps": 480.0}),))
-    kv2 = KnowledgeV2(root)
+    kv2 = KnowledgeV2(root, seed_mined=False)
     got = kv2.claims.relevant(target="cuda", arch="sm_89", op_class="conv", technique="memory_coalescing")
     assert [g.id for g in got] == [old.id] and "simt_gpu (" in kv2.claims.render(got)
     assert not kv2.claims.relevant(target="riscv", arch="rvv-vlen256", op_class="conv", technique="memory_coalescing")
