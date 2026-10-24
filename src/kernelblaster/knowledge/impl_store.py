@@ -126,7 +126,8 @@ class ImplStore:
         return next((r for r in self.records() if r.id == rec_id), None)
 
     def retrieve(self, *, target: str, arch: str, op: str, op_class: str, signature: str,
-                 shapes: list, n_examples: int = 2, exclude_problem: Optional[str] = None) -> dict:
+                 shapes: list, n_examples: int = 2, exclude_problem: Optional[str] = None,
+                 far_same_op: bool = False) -> dict:
         """-> {"seed": rec|None, "adapt": rec|None, "examples": [rec, ...]}
 
         ``exclude_problem`` drops the asking problem's own records: during a
@@ -140,13 +141,15 @@ class ImplStore:
         exact = [r for r in same_op if r.arch == arch and want <= set(r.buckets)]
         seed = min(exact, key=lambda r: r.slot_us / max(len(r.shapes), 1), default=None)
         # adapt only from records that share a shape bucket with this slot: a
-        # winner tuned for unrelated shapes anchors the LLM on the wrong
-        # blocking (ResNet18 given a ResNet-block conv: 5.4x vs 25x without);
-        # those become ideas-only examples instead
+        # same-op winner tuned for unrelated shapes anchored the LLM on the
+        # wrong blocking (ResNet18 given a ResNet-block conv: 5.4x as an adapt
+        # seed, 7.5x as an ideas-only example, 25x without; one run each), so
+        # such records are only offered (as examples) when far_same_op is set
         others = [r for r in same_op if r is not seed and (r.speedup_vs_seed or 0) > 1.05]
         near = [r for r in others if want & set(r.buckets)]
         adapt = None if seed else max(near, key=lambda r: (r.arch == arch, r.speedup_vs_seed or 0), default=None)
-        far = [] if seed or adapt else sorted(others, key=lambda r: -(r.speedup_vs_seed or 0))[:1]
+        far = [] if seed or adapt or not far_same_op else \
+            sorted(others, key=lambda r: -(r.speedup_vs_seed or 0))[:1]
         ex = [r for r in recs if r.op_class == op_class and r.op != op and (r.speedup_vs_seed or 0) > 1.05]
         best_per_op = {}
         for r in sorted(ex, key=lambda r: -(r.speedup_vs_seed or 0)):
