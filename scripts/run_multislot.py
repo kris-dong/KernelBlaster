@@ -13,6 +13,12 @@ lessons. ``--model`` is any name ``generate_code`` routes: ``claude-code:<m>``
 (Claude Code CLI, no key), ``stub:<name>`` (registered by a ``--plugin``
 file), or an API model.
 
+Model heterogeneity (``agents/model_router.py``): ``--model-simple`` /
+``--model-hard`` / ``--fix-model`` (or MODEL_CODEGEN_SIMPLE / MODEL_CODEGEN_HARD /
+MODEL_FIX, as in the legacy optimized-RL flow, or ``--models-config`` JSON) give
+each role its model; ``--hetero-policy`` says when codegen escalates to the hard
+model, e.g. ``category,stall:3,share:0.5,explore,fix-escalate``.
+
 Writes OUT/<problem>/result.json and best/slots/*.cu, OUT/summary.json, and
 (with --export-winners) the store's winners for ModelBlaster's kb_ingest.
 
@@ -41,6 +47,7 @@ sys.path.insert(0, str(ROOT))
 
 from loguru import logger  # noqa: E402
 
+from kernelblaster.agents.model_router import ModelRouter  # noqa: E402
 from kernelblaster.agents.opt_multislot import MultiSlotAgent  # noqa: E402
 from kernelblaster.knowledge.claims import ClaimStore  # noqa: E402
 from kernelblaster.knowledge.impl_store import ImplStore  # noqa: E402
@@ -99,6 +106,11 @@ async def _run(args) -> int:
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
     kdir = Path(args.knowledge_dir or out / "knowledge").resolve()
+    router = ModelRouter.build(args.model, simple=args.model_simple, hard=args.model_hard, fix=args.fix_model,
+                               reflect=args.reflect_model, upkeep=args.upkeep_model, policy=args.hetero_policy,
+                               config=args.models_config)
+    args.reflect_model, args.upkeep_model = router.models["reflect"], router.models["upkeep"]
+    logger.info(f"models: {router.describe()}")
     store = ImplStore(kdir / "impl")
     kv = None
     if args.knowledge == "v2":
@@ -162,7 +174,7 @@ async def _run(args) -> int:
             p = SlotProblem(d)
             targets.add(p.target)
             t0 = time.time()
-            agent = MultiSlotAgent(p, evaluator_for(p.target), model=args.model, model_fix=args.fix_model,
+            agent = MultiSlotAgent(p, evaluator_for(p.target), model=args.model, router=router,
                                    out_dir=out / p.name, arch=arch_for(p.target), impl_store=store,
                                    outcome_log=olog, claims=claims, semantic_updater=updater,
                                    rollouts=args.rollouts, steps=args.steps,
@@ -191,6 +203,7 @@ async def _run(args) -> int:
     if kv is not None:
         summary.append({"knowledge_v2": {"upkeep_model": args.upkeep_model, "upkeep_usage": dict(kv.usage),
                                          **{k: v for k, v in kv.summary().items() if k != "upkeep_usage"}}})
+    summary.append({"models": router.describe()})
     (out / "summary.json").write_text(json.dumps(summary, indent=1))
     tot = sum((s.get("llm_usage") or {}).get("cost_usd", 0.0) for s in summary) + float(refl.get("cost_usd", 0.0))
     logger.info(f"LLM cost reported by providers (agent + reflection): ${tot:.4f}")
@@ -209,7 +222,17 @@ def main():
     ap.add_argument("problems", nargs="+")
     ap.add_argument("--out", required=True)
     ap.add_argument("--model", default=os.getenv("MODEL_CODEGEN_HARD", "claude-code:sonnet"))
-    ap.add_argument("--fix-model", default=None)
+    ap.add_argument("--fix-model", default=None, help="fix role (default: --model-simple; env MODEL_FIX)")
+    ap.add_argument("--model-simple", default=None,
+                    help="codegen for mechanical techniques (default --model; env MODEL_CODEGEN_SIMPLE)")
+    ap.add_argument("--model-hard", default=None,
+                    help="codegen for structural techniques / escalations (default --model; env MODEL_CODEGEN_HARD)")
+    ap.add_argument("--hetero-policy", default=None,
+                    help="when codegen uses --model-hard: category,stall:N,share:X,explore,fix-escalate,always,never "
+                         "(default category,fix-escalate; env KB_HETERO_POLICY)")
+    ap.add_argument("--models-config", default=None,
+                    help='JSON {"models": {role: model}, "policy": "..."}; roles codegen_simple, codegen_hard, '
+                         "fix, reflect, upkeep; flags win")
     ap.add_argument("--reflect-model", default=os.getenv("KB_REFLECT_MODEL"))
     ap.add_argument("--reflect-every", type=int, default=8)
     ap.add_argument("--knowledge-dir", default=os.getenv("KB_KNOWLEDGE_DIR"))

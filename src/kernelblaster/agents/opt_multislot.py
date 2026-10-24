@@ -46,6 +46,8 @@ from ..knowledge.impl_store import ImplStore, shape_bucket
 from ..knowledge.outcomes import (COMPILE_ERROR, RUNTIME_ERROR, WRONG_OUTPUT, OutcomeLog,
                                   OutcomeRecord, classify_speedup)
 from ..knowledge.slots import EvalResult, Evaluator, SlotProblem
+from .cost_tracker import lookup_pricing
+from .model_router import ModelRouter, technique_tier
 from .utils import generate_code_retry
 
 # Peak fp32 throughput / DRAM bandwidth per arch, for the roofline state.
@@ -517,8 +519,11 @@ class MultiSlotAgent:
                  confirm_pct: float = 3.0, stall_decay: float = 0.6, bandit: Optional[TechniqueBandit] = None,
                  model_fix: Optional[str] = None, seed: int = 0, logger=None, run_id: Optional[str] = None,
                  problem_id: Optional[str] = None, propose: bool = True, ncu: str = "off",
-                 knowledge_v2: Any = None):
+                 knowledge_v2: Any = None, router: Optional[ModelRouter] = None):
         self.p, self.ev, self.model = problem, evaluator, model
+        # which model runs which call (model_router.py); default: `model` everywhere, `model_fix` for fixes
+        self.router = router or ModelRouter({"codegen_simple": model, "codegen_hard": model,
+                                             "fix": model_fix or model}, policy=[])
         # knowledge v2 (knowledge/v2): predicate states, ontology, hierarchical
         # stats, hypotheses; replaces the bandit, roofline state and claims lookup
         self.kv = knowledge_v2
@@ -531,7 +536,7 @@ class MultiSlotAgent:
         self.ncu_disabled: Optional[str] = None
         self.ncu_cache: dict[tuple, dict] = {}         # (slot, code sha1) -> ncu.summarize()
         self.ncu_runs = 0
-        self.model_fix = model_fix or model
+        self.model_fix = self.router.models["fix"]
         self.out = Path(out_dir)
         self.out.mkdir(parents=True, exist_ok=True)
         self.arch, self.store, self.olog = arch, impl_store, outcome_log
@@ -558,6 +563,7 @@ class MultiSlotAgent:
         self.steps_log: list[StepLog] = []
         self.llm_calls = 0
         self.llm_usage = {"prompt_tokens": 0, "completion_tokens": 0, "cost_usd": 0.0}
+        self.llm_usage_by: dict[str, dict] = {}         # "<role> <model>" -> calls / tokens / cost
         self._lock = asyncio.Lock()
 
     # ---- helpers
@@ -645,16 +651,29 @@ class MultiSlotAgent:
                                    signature=s.signature, shapes=s.shapes(), exclude_problem=self.problem_id,
                                    dtype=self.p.dtype)
 
-    async def _llm(self, messages, model) -> str:
+    async def _llm(self, messages, model, role: str = "codegen") -> str:
         self.llm_calls += 1
         resp = await generate_code_retry(messages, model, self.log, n_tasks=1)
         u = getattr(resp, "usage", None) or {}
         if not isinstance(u, dict):
             u = {k: getattr(u, k, 0) for k in ("prompt_tokens", "completion_tokens")}
         # OpenAI-style (prompt/completion) or Bedrock Converse-style (input/output) keys
-        self.llm_usage["prompt_tokens"] += int(u.get("prompt_tokens") or u.get("input_tokens") or 0)
-        self.llm_usage["completion_tokens"] += int(u.get("completion_tokens") or u.get("output_tokens") or 0)
-        self.llm_usage["cost_usd"] += float(u.get("cost_usd") or 0.0)   # providers that report it
+        pt = int(u.get("prompt_tokens") or u.get("input_tokens") or 0)
+        ct = int(u.get("completion_tokens") or u.get("output_tokens") or 0)
+        cost = float(u.get("cost_usd") or 0.0)                          # providers that report it
+        pin, pout = lookup_pricing(model)                               # else the price table (0 if unknown)
+        est = cost or (pt * pin + ct * pout) / 1e6
+        self.llm_usage["prompt_tokens"] += pt
+        self.llm_usage["completion_tokens"] += ct
+        self.llm_usage["cost_usd"] += cost
+        by = self.llm_usage_by.setdefault(f"{role} {model}", {"role": role, "model": model, "calls": 0,
+                                                               "prompt_tokens": 0, "completion_tokens": 0,
+                                                               "cost_usd": 0.0, "est_usd": 0.0})
+        by["calls"] += 1
+        by["prompt_tokens"] += pt
+        by["completion_tokens"] += ct
+        by["cost_usd"] += cost
+        by["est_usd"] += est
         return resp.generations[0] if resp.generations else ""
 
     def _outcome(self, **kw) -> OutcomeRecord:
@@ -808,8 +827,13 @@ class MultiSlotAgent:
                                       examples=examples, adapt=adapt, knowledge_text=ktext,
                                       already_tried=tried, best_note=best_note,
                                       profile_text=self.tp.profiler.render(prof_before) if prof_before else "")
-        text = await self._llm(msgs, self.model)
+        tdef = self.kv.ontology.techniques.get(tech) if self.kv is not None else None
+        model, role, why = self.router.codegen(technique=tech, tier=technique_tier(tech, tdef),
+                                               share=self._share(sid), stall=self.slot_stall[sid],
+                                               kind=choice.kind if choice is not None else "technique")
+        text = await self._llm(msgs, model, role)
         code = extract_code(text)
+        fix_models = []
         fixes, res, status = 0, None, None
         before = cur_us[sid]
         while True:
@@ -823,9 +847,11 @@ class MultiSlotAgent:
             if other_bad:                                         # shouldn't happen: only `sid` changed
                 break
             fixes += 1
+            fmodel, frole = self.router.fix(attempt=fixes, max_attempts=self.max_fix)
+            fix_models.append(fmodel)
             text = await self._llm(build_fix_messages(problem=self.p, sid=sid, source=code,
                                                       error=res.error_text(),
-                                                      pitfalls=self._pitfalls(sid, tech)), self.model_fix)
+                                                      pitfalls=self._pitfalls(sid, tech)), fmodel, frole)
             new = extract_code(text)
             if not new or new == code:
                 break
@@ -889,7 +915,10 @@ class MultiSlotAgent:
         ctx = {"adapt": r["adapt"].id if r["adapt"] is not None else None,
                "examples": [e.id for e in r["examples"]],
                "claims": ktext.count("\n") + 1 if ktext else 0, "already_tried": bool(tried),
-               "ncu": bool(prof_before), "state": state}
+               "ncu": bool(prof_before), "state": state, "model": model, "model_role": role,
+               "model_why": why}
+        if fix_models:
+            ctx["fix_models"] = fix_models
         if v2 is not None:
             ctx.update(kind=choice.kind, est=round(choice.est, 4), evidence=choice.evidence,
                        explore=choice.explore, mechanism=v2["mechanism"]["label"], chain=cls.chain)
@@ -967,8 +996,10 @@ class MultiSlotAgent:
         base = self.baseline
         res = {
             "problem": self.p.name, "problem_dir": str(self.p.root), "run_id": self.run_id,
-            "arch": self.arch_label, "target": self.p.target, "model": self.model, "llm_calls": self.llm_calls,
+            "arch": self.arch_label, "target": self.p.target, "model": self.model, "models": self.router.describe(),
+            "llm_calls": self.llm_calls,
             "llm_usage": {**self.llm_usage, "cost_usd": round(self.llm_usage["cost_usd"], 4)},
+            "llm_usage_by_model": sorted(self.llm_usage_by.values(), key=lambda d: (d["role"], d["model"])),
             "ncu": {"mode": self.ncu, "runs": self.ncu_runs, "disabled": self.ncu_disabled,
                     "final": {sid: self._ncu_of(sid, b.source) for sid, b in self.best.items()
                               if self._ncu_of(sid, b.source)}},
