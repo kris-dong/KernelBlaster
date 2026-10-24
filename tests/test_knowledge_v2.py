@@ -324,6 +324,11 @@ def test_hypothesis_spec_validation_and_dedupe(tmp_path):
     with pytest.raises(ValueError, match="duplicates technique"):
         validate_spec({**good, "name": "tile_again", "mechanism": kv.ontology.get("shared_memory_tiling").mechanism},
                       ontology=kv.ontology, existing=[], target_key="cuda:sm_89", known_states=set(kv.hierarchy.states))
+    with pytest.raises(ValueError, match="wrong unit"):            # fraction written for a percent
+        validate_spec({**good, "preconditions": {"bw_util": "<", "v": 0.85}}, ontology=kv.ontology, existing=[],
+                      target_key="cuda:sm_89", known_states=set(kv.hierarchy.states))
+    assert P.unit_problems({"all": [{"parallel_fill": "<", "v": 30}, {"l1_hit": ">", "v": 40}]}) == \
+        ["parallel_fill is a fraction (0-1) but compared with 30"]
     with pytest.raises(P.PredicateError):
         validate_spec({**good, "preconditions": {"vibes": ">", "v": 1}}, ontology=kv.ontology, existing=[],
                       target_key="cuda:sm_89", known_states=set(kv.hierarchy.states))
@@ -372,6 +377,9 @@ def test_hypothesis_exploration_budget_and_lifecycle(tmp_path):
     assert ev[0]["event"] == "retired" and "mechanism confirmed in 0%" in ev[0]["reason"]
     kinds = {r["kind"] for r in kv.db.review_items()}
     assert {"hypothesis_proposed", "hypothesis_promoted", "hypothesis_retired"} <= kinds
+    _hyp(kv, name="h_units", preconditions={"bw_util": "<", "v": 0.8})       # stored before the unit check
+    ev = kv.hypotheses.review()
+    assert ev[0]["event"] == "retired" and "wrong unit" in ev[0]["reason"]
 
 
 def test_graph_hypotheses_follow_mb_graph_hints(tmp_path):

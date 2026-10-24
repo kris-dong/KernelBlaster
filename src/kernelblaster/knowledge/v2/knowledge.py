@@ -419,7 +419,8 @@ class KnowledgeV2:
         techs = [{"id": t.id, "mechanism": t.mechanism} for t in self.ontology.techniques.values() if t.slot]
         hyps = [h.to_dict() for h in self.hypotheses.items.values() if h.kind == "slot"]
         msgs = build_generation_messages(trigs, techniques=techs, hypotheses=hyps,
-                                         metrics=list(M.CANONICAL), k=self.max_new_hyp)
+                                         metrics=[f"{k} ({u})" for k, (_, u) in M.CANONICAL.items()],
+                                         k=self.max_new_hyp)
         from ..reflect import parse_json_response
         try:
             raw = await self._llm(msgs)

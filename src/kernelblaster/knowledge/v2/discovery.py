@@ -146,7 +146,8 @@ def build_discovery_messages(trig: dict, hierarchy, rejected: list[dict]) -> lis
     if rejected:
         parts += ["", "EARLIER PROPOSALS FOR THIS CLUSTER WERE REJECTED:"]
         parts += [f"- {json.dumps(p.get('proposal'))}: {p.get('reason')}" for p in rejected[-3:]]
-    system = DISCOVERY_SYSTEM.replace("{metrics}", ", ".join(CANONICAL))
+    system = DISCOVERY_SYSTEM.replace("{metrics}", ", ".join(f"{k} ({u})" for k, (_, u) in CANONICAL.items())
+                                      + "; percent metrics are 0-100, fractions 0-1")
     return [{"role": "system", "content": system}, {"role": "user", "content": "\n".join(parts)}]
 
 
