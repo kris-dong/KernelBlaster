@@ -74,6 +74,7 @@ enclosing attributes: `codegen_simple` / `codegen_hard` / `fix` from the agent's
 | `provider_retries`, `errors`, `backoff_s` | boto3's internal retries (`RetryAttempts`); failed attempts; `generate_code_retry`'s back-off sleeps (span `llm.backoff`) |
 | `cost_usd`, `est_usd` | cost reported by the provider (Claude CLI); estimate from `cost_tracker`'s price table, with cache reads at 0.1× and cache writes at 1.25× the input price when the table has no cache row |
 | `prompt_chars`, `output_chars`, context | sizes, plus problem / rollout / step / slot |
+| `relay_queue_s`, `relay_network_s` | relayed calls only ([llm_server.md](llm_server.md)): waiting for a server slot; round trip minus server time. The server's throttling back-off is counted in `backoff_s` |
 
 - **Where the extra fields come from.** Providers put them under `usage["telemetry"]` (a dict), so code that sums
   the numeric usage fields (reflection, v2 upkeep) is unaffected.
