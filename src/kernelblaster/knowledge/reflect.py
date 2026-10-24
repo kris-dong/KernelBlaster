@@ -530,15 +530,18 @@ class SemanticUpdater:
         """Reflect when >= every_n records arrived since the last pass (``force``: >= 1).
 
         Non-blocking for concurrent callers: if a pass is already running this
-        returns ``[]`` and the next call picks the new records up.
+        returns ``[]`` and the next call picks the new records up. ``force``
+        (a problem's final pass) waits for a running pass instead, so records
+        that arrived during it are not left unreflected when several problems
+        share this updater.
         """
-        if self._lock.locked():
-            return []
-        cursor = int(self.claims.meta.get("reflect_cursor", 0))
-        new, end = self.log.since(cursor)
-        if not new or (len(new) < self.every_n and not force):
+        if self._lock.locked() and not force:
             return []
         async with self._lock:
+            cursor = int(self.claims.meta.get("reflect_cursor", 0))
+            new, end = self.log.since(cursor)
+            if not new or (len(new) < self.every_n and not force):
+                return []
             self.claims.meta["reflect_cursor"] = end
             batch = new[-self.max_batch:]
             if len(new) > len(batch):

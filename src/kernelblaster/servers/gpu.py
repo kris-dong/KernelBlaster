@@ -111,7 +111,9 @@ async def _resolve_assigned_gpu_uuids() -> set[str] | None:
             continue
         index_to_uuid[parts[0]] = parts[1]
 
+    known = set(index_to_uuid.values())
     assigned = {index_to_uuid[i] for i in GPU_IDS if i in index_to_uuid}
+    assigned |= {u for i in GPU_IDS if i.startswith("GPU-") for u in known if u.startswith(i)}
     return assigned or None
 
 

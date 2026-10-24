@@ -130,8 +130,12 @@ class FastCudaBuilder:
         self.cache = BuildCache(Path(os.getenv("KERNELBLASTER_BUILD_CACHE_DIR") or self.root / "build_cache"))
         self._toolchains: dict[str, Toolchain] = {}
         self._tc_lock = asyncio.Lock()
-        # concurrent compiler processes across all jobs (legacy: make -j8 per job)
-        self._jobs = asyncio.Semaphore(int(os.getenv("KERNELBLASTER_FAST_COMPILE_JOBS", "8")))
+        # concurrent compiler processes across all jobs (legacy: make -j8 per
+        # job): KERNELBLASTER_FAST_COMPILE_JOBS pins it, else it follows the
+        # free CPUs and memory (a LibTorch host TU needs ~2-3 GB)
+        from .utils.resources import GiB, build_limiter
+        self._jobs = build_limiter(env="KERNELBLASTER_FAST_COMPILE_JOBS", per_job_mem=int(2.5 * GiB),
+                                   name="fast compile")
         # drivers whose plain (torch-free) build failed -> use LibTorch
         self._plain_failed: set[str] = set()
 
