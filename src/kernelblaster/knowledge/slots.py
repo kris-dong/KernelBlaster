@@ -635,7 +635,7 @@ class OpenCLLocalEvaluator(LocalEvaluator):
             return EvalResult(ok=False, stage="run", errors=[f"timeout after {self.timeout_s}s"])
         return parse_driver_output(text)
 
-    async def profile(self, problem, sources, tag):
+    async def profile(self, problem, sources, tag, slots=None):    # one run profiles every slot
         bad, text = await self._exec(problem, sources, tag + "_prof", {"MB_MODE": "profile"})
         if bad is not None:
             return {}, "build failed: " + bad.error_text(300)
@@ -737,7 +737,7 @@ class AdrenoEvaluator(Evaluator):
             return EvalResult(ok=False, stage="run", errors=[f"timeout after {self.timeout_s}s"])
         return parse_driver_output(text)
 
-    async def profile(self, problem, sources, tag):
+    async def profile(self, problem, sources, tag, slots=None):    # one run profiles every slot
         bad, text = await self._exec(problem, sources, tag + "_prof", {"MB_MODE": "profile"})
         if bad is not None:
             return {}, "build failed: " + bad.error_text(300)
@@ -798,7 +798,7 @@ class OpenCLServerEvaluator(Evaluator):
         bad, text = await self._exec(problem, sources, tag, False)
         return bad if bad is not None else parse_driver_output(text)
 
-    async def profile(self, problem, sources, tag):
+    async def profile(self, problem, sources, tag, slots=None):    # one run profiles every slot
         bad, text = await self._exec(problem, sources, tag + "_prof", True)
         if bad is not None:
             return {}, "build failed: " + bad.error_text(300)
