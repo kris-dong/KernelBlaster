@@ -67,6 +67,14 @@ def test_store_retrieval_tiers(tmp_path):
     assert r["seed"] is None and r["adapt"] is not None                  # same op, other shapes
     r = s.retrieve(target="cuda", arch="sm_89", op="linear", op_class="gemm", signature=sig, shapes=sh)
     assert r["seed"] is None and r["adapt"] is not None                  # other arch -> adapt only
+    r = s.retrieve(target="cuda", arch="sm_75", op="linear", op_class="gemm", signature=sig, shapes=sh,
+                   exclude_problem=None)
+    assert r["seed"] is not None
+    s.add("// own baseline", arch="sm_75", op="linear", shapes=sh, buckets=[shape_bucket("gemm", sh[0])],
+          slot_us=4.0, problem_id="me", **kw)
+    r = s.retrieve(target="cuda", arch="sm_75", op="linear", op_class="gemm", signature=sig, shapes=sh,
+                   exclude_problem="me")
+    assert s.code(r["seed"]) == "// lin fast"                          # own records don't shadow others
     out = s.export_winners(tmp_path / "w")
     import json
     assert {w["op"] for w in json.loads(out.read_text())["winners"]} == {"linear", "bmm"}

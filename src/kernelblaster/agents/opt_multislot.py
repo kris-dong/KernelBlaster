@@ -441,7 +441,7 @@ class MultiSlotAgent:
             return {"seed": None, "adapt": None, "examples": []}
         s = self.p.slots[sid]
         return self.store.retrieve(target="cuda", arch=f"sm_{self.arch}", op=s.op, op_class=s.op_class,
-                                   signature=s.signature, shapes=s.shapes())
+                                   signature=s.signature, shapes=s.shapes(), exclude_problem=self.problem_id)
 
     async def _llm(self, messages, model) -> str:
         self.llm_calls += 1
