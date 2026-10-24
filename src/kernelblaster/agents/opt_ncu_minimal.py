@@ -657,25 +657,13 @@ Generate the complete optimized CUDA code in a single ```cpp code block."""
             raise ValueError("NCU did not profile any kernels")
         
         # Extract total cycles from all kernels (sum all Elapsed Cycles values)
-        # The log may contain multiple "Elapsed Cycles" entries, one per kernel
-        import re
-        cycles_pattern = r"Elapsed Cycles\s+\w+\s+(\d[\d,]*)"
-        cycles_matches = re.findall(cycles_pattern, ncu_stdout, re.IGNORECASE | re.MULTILINE)
-        
-        total_cycles = 0
-        for cycle_str in cycles_matches:
-            try:
-                total_cycles += int(cycle_str.replace(",", ""))
-            except ValueError:
-                continue
-        
-        if total_cycles == 0:
-            # Fallback: try to get cycles using the utility function (gets first one)
-            try:
-                total_cycles = get_elapsed_cycles_ncu_log(ncu_stdout)
-            except Exception as e:
-                self.agent_logger.warning(f"Failed to extract cycles from NCU output: {e}")
-                raise ValueError("Failed to extract cycles from NCU output")
+        # The log may contain multiple "Elapsed Cycles" entries, one per
+        # kernel launch; the utility function sums them.
+        try:
+            total_cycles = get_elapsed_cycles_ncu_log(ncu_stdout)
+        except Exception as e:
+            self.agent_logger.warning(f"Failed to extract cycles from NCU output: {e}")
+            raise ValueError("Failed to extract cycles from NCU output")
         
         # Extract only the GPU Speed Of Light Throughput section for each kernel (with names)
         # The NCU output will have sections for each kernel, we'll extract them
