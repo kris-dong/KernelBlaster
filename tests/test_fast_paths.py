@@ -137,6 +137,34 @@ def test_split_without_torch_for_plain_drivers(tmp_path):
     assert header.replace("#include <cstdint>\n", "").strip().startswith("void launch_gpu_implementation")
 
 
+# ---------------------------------------------------------------- nsys kernel names
+
+
+def test_kernel_base_name():
+    from kernelblaster.agents.utils.parsing import kernel_base_name
+
+    assert kernel_base_name("relu_fp16_kernel(const __half *, __half *, long)") == "relu_fp16_kernel"
+    assert kernel_base_name("void at::native::vectorized_elementwise_kernel<(int)4, at::native::AbsFunctor"
+                            "<c10::Half>, std::array<char *, (unsigned long)2>>(int, T2, T3)") == \
+        "vectorized_elementwise_kernel"
+    assert kernel_base_name("void at::native::<unnamed>::distribution_elementwise_grid_stride_kernel"
+                            "<float, (int)4>(long)") == "distribution_elementwise_grid_stride_kernel"
+    assert kernel_base_name("void mbslot_relu::k_relu<128>(const float *, float *, int)") == "k_relu"
+
+
+def test_find_kernel_names_trace(tmp_path):
+    from kernelblaster.agents.utils.parsing import find_kernel_names_trace
+
+    src = tmp_path / "k.cu"
+    src.write_text("__global__ void gemm_tile(float *a) {}\n__global__ void unused_kernel() {}\n"
+                   "void launch_gpu_implementation() { gemm_tile<<<1, 1>>>(0); }\n")
+    trace = ("nsys noise\n__GPUTRACE_CSV_START__\n"
+             "100,20,void at::native::vectorized_elementwise_kernel<(int)4>(int)\n"
+             "200,30,gemm_tile(float *)\n")
+    assert find_kernel_names_trace(trace, src) == ["gemm_tile"]
+    assert find_kernel_names_trace("no marker", src) == []
+
+
 # ---------------------------------------------------------------- multi-slot units
 
 
