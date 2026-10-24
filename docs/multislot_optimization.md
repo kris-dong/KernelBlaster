@@ -108,6 +108,30 @@ OpenCL GPU, the OpenCL LeNet fixture (`tests/fixtures/mb_lenet_opencl`) baseline
 attributed, the profile run, and the scripted agent end to end; `KB_OPENCL_BOARD_HOST=user@host`
 (`KB_OPENCL_BOARD_DIR`) runs the board evaluator against a real host.
 
+## Model heterogeneity
+
+`agents/model_router.py` decides which model makes each LLM call, in the same way as the legacy optimized-RL flow's `MODEL_*` tiers.
+
+| role | used for | set by |
+|---|---|---|
+| `codegen_simple` | mechanical techniques (coalescing, vectorising, launch config) | `--model-simple`, `MODEL_CODEGEN_SIMPLE` |
+| `codegen_hard` | structural techniques (tiling, implicit GEMM, tensor cores, fusion, flash) and escalations | `--model-hard`, `MODEL_CODEGEN_HARD` |
+| `fix` | compile, runtime and mismatch repairs | `--fix-model`, `MODEL_FIX` (default: `codegen_simple`) |
+| `reflect` | semantic update pass | `--reflect-model` |
+| `upkeep` | v2 hypothesis generation and state discovery | `--upkeep-model` |
+
+- **Defaults and precedence.** A role with no setting falls back to `--model`. Flags win over `--models-config FILE.json` (`{"models": {role: model}, "policy": "..."}`), which wins over the environment variables.
+- **Policy.** `--hetero-policy` (or `KB_HETERO_POLICY`; default `category,fix-escalate`) is a comma-separated list of rules. The first rule that fires sends codegen to `codegen_hard`:
+  - `category`: the technique is structural. A v2 technique's `params.tier` takes precedence over the name patterns.
+  - `stall:N`: the slot has had N or more attempts since its last best.
+  - `share:X`: the slot is at least a fraction X of the partition time.
+  - `explore`: the step tests a v2 hypothesis.
+  - `fix-escalate`: the last fix attempt uses `codegen_hard`.
+  - `always` / `never`.
+- **What the run records.** Each step's `context` in `result.json` records `model`, `model_role` and `model_why` (plus `fix_models`). `llm_usage_by_model` breaks calls, tokens and estimated USD down by role and model. The estimates come from `cost_tracker`'s price table, which `COST_PRICE_*` overrides.
+- **Example.** `--model us.anthropic.claude-haiku-5-5 --model-hard us.anthropic.claude-sonnet-5-5 --hetero-policy category,stall:3,fix-escalate` on the ResNet block (sm_75, 2×5 steps) gave 25× in 12 calls. The 4 Sonnet calls cost $0.47; the 8 Haiku calls (6 codegen, 2 fix) cost $0.15.
+- **Output length.** Long structural rewrites from the hard model can exceed Bedrock's default 8192-token output limit. A truncated reply has no code block and is counted as a compile error. Set `BEDROCK_MAX_TOKENS=16384` for the hard model.
+
 ## Notes
 
 - `KERNELBLASTER_ALLOW_SHARED_GPU=1` lets the exec server start when other processes use the

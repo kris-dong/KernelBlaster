@@ -59,6 +59,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 # not carry).
 _DEFAULT_PRICING: Dict[str, Tuple[float, float]] = {
     # Anthropic — current generation
+    "claude-sonnet-5-5":     (3.00, 15.00),   # estimate; override with COST_PRICE_* env vars
+    "claude-haiku-5-5":      (1.00, 5.00),    # estimate
     "claude-opus-4-7":       (5.00, 25.00),
     "claude-opus-4-6":       (5.00, 25.00),
     "claude-opus-4-5":       (5.00, 25.00),
