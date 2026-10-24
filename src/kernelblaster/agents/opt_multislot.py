@@ -99,13 +99,19 @@ def techniques_for(op_class: str) -> list[tuple[str, str]]:
 
 # ---------------------------------------------------------------- roofline
 
+def primary_shape(shape: dict) -> dict:
+    """A fused op's shape is {"a": stage 0, "b": stage 1, ...}; its work is
+    the first stage's (the producer whose epilogue the others join)."""
+    return shape["a"] if isinstance(shape.get("a"), dict) else shape
+
+
 def _op_cost(problem: SlotProblem, op: dict) -> tuple[float, float]:
     """(bytes, flops) estimate for one op instance from the manifest."""
     bufs = problem.manifest["buffers"]
     byt = 4.0 * sum(bufs[b]["numel"] for b in op["inputs"] + op["outputs"])
     slot = problem.slots[op["slot"]]
     inst = next((i for i in slot.instances if i["index"] == op["index"]), {})
-    sh = inst.get("shape", {})
+    sh = primary_shape(inst.get("shape", {}))
     out_n = sum(bufs[b]["numel"] for b in op["outputs"])
     flops = float(out_n)
     if slot.op_class == "gemm":
@@ -198,6 +204,70 @@ def propose_fusions(problem: SlotProblem, result: EvalResult, arch: str, min_gai
         })
     return {"format": "kb-proposal/1", "problem": problem.name, "problem_dir": str(problem.root),
             "arch": f"sm_{arch}", "proposals": props}
+
+
+def _efficiency(problem: SlotProblem, ops: list[dict], us: float, arch: str) -> float:
+    """Achieved fraction of the binding roofline peak for a set of op instances."""
+    byt = fl = 0.0
+    for op in ops:
+        b, f = _op_cost(problem, op)
+        byt += b
+        fl += f
+    peak_f, peak_b = ARCH_PEAKS.get(arch, ARCH_PEAKS["75"])
+    t = max(us, 1e-3) * 1e-6
+    return max(byt / t / 1e9 / peak_b, fl / t / 1e9 / peak_f)
+
+
+def propose_splits(problem: SlotProblem, result: EvalResult, arch: str, min_gain_pct: float = 2.0) -> list[dict]:
+    """``kb-proposal/1`` "split" proposals: give a slot shape-specialised
+    variants when its instances fall into several shape buckets and the one
+    kernel serves them very unevenly.
+
+    Per bucket group g: measured time t_g (``op_us``) and roofline efficiency
+    e_g (achieved fraction of the binding peak). A kernel tuned for one shape
+    regime is typically efficient there and not elsewhere, so the estimated
+    gain is sum_g t_g * (1 - e_g / max e): every group brought to the best
+    group's efficiency by a kernel of its own. Needs per-op times; proposed
+    if the gain is ``min_gain_pct`` of the partition. ModelBlaster builds the
+    variant (one slot per group, each seeded with the current kernel) and
+    decides by measurement."""
+    if not result.op_us:
+        return []
+    part_us = result.partition_us or sum(result.slot_us.values()) or 1.0
+    by_slot: dict[str, list[dict]] = {}
+    for op in problem.manifest["ops"]:
+        by_slot.setdefault(op["slot"], []).append(op)
+    props = []
+    for sid, ops in by_slot.items():
+        slot = problem.slots[sid]
+        if len(ops) < 2 or "__v" in sid:
+            continue
+        groups: dict[str, list[dict]] = {}
+        for op in ops:
+            inst = next((i for i in slot.instances if i["index"] == op["index"]), {})
+            groups.setdefault(shape_bucket(slot.op_class, inst.get("shape", {})), []).append(op)
+        if len(groups) < 2:
+            continue
+        rows = []
+        for b, gops in groups.items():
+            t = sum(result.op_us.get(o["name"], 0.0) for o in gops)
+            rows.append({"bucket": b, "ops": [o["name"] for o in gops], "us": round(t, 3),
+                         "eff_pct": round(100 * _efficiency(problem, gops, t, arch), 2)})
+        best = max(r["eff_pct"] for r in rows) or 1e-9
+        gain = sum(r["us"] * (1 - r["eff_pct"] / best) for r in rows)
+        pct = 100.0 * gain / part_us
+        if pct < min_gain_pct:
+            continue
+        lo = min(rows, key=lambda r: r["eff_pct"])
+        props.append({
+            "kind": "split", "slot": sid, "op": slot.op, "groups": rows,
+            "evidence": {"est_gain_us": round(gain, 2), "est_gain_pct": round(pct, 2), "partition_us": part_us,
+                         "slot_us": result.slot_us.get(sid)},
+            "rationale": (f"`{sid}` serves {len(rows)} shape regimes with one kernel: {best:.1f}% of peak on its best "
+                          f"group but {lo['eff_pct']:.1f}% on {lo['bucket']} ({lo['us']:.0f} us); a kernel per regime "
+                          f"could save ~{pct:.1f}% of the partition."),
+        })
+    return sorted(props, key=lambda p: -p["evidence"]["est_gain_us"])
 
 
 # ---------------------------------------------------------------- bandit
@@ -650,8 +720,10 @@ class MultiSlotAgent:
         result = self._write_result(final)
         if final.ok and self.propose:
             props = propose_fusions(self.p, final, self.arch)
+            props["proposals"] += propose_splits(self.p, final, self.arch)
             (self.out / "proposals.json").write_text(json.dumps(props, indent=1))
-            result["proposals"] = [{"pattern": x["pattern"], "pairs": len(x["pairs"]),
+            result["proposals"] = [{"kind": x["kind"], "pattern": x.get("pattern") or [x["slot"]],
+                                    "instances": len(x.get("pairs") or x.get("groups")),
                                     "est_gain_pct": x["evidence"]["est_gain_pct"]} for x in props["proposals"]]
             (self.out / "result.json").write_text(json.dumps(result, indent=1))
         if self.semantic is not None:
