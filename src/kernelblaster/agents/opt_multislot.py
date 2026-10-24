@@ -520,8 +520,9 @@ class MultiSlotAgent:
         u = getattr(resp, "usage", None) or {}
         if not isinstance(u, dict):
             u = {k: getattr(u, k, 0) for k in ("prompt_tokens", "completion_tokens")}
-        for k in ("prompt_tokens", "completion_tokens"):
-            self.llm_usage[k] += int(u.get(k) or 0)
+        # OpenAI-style names, or Bedrock's input/output token counts
+        for k, alt in (("prompt_tokens", "input_tokens"), ("completion_tokens", "output_tokens")):
+            self.llm_usage[k] += int(u.get(k) or u.get(alt) or 0)
         self.llm_usage["cost_usd"] += float(u.get("cost_usd") or 0.0)   # providers that report it
         return resp.generations[0] if resp.generations else ""
 
