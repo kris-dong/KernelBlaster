@@ -360,7 +360,7 @@ host, cmd = (f"{user}@{a[0]}" if user else a[0]), " ".join(a[1:])
 state = os.environ["FAKE_SSH_STATE"]
 if os.path.exists(os.path.join(state, "down_" + host)):
     sys.stderr.write(f"ssh: connect to host {host} port 22: Connection refused\n"); sys.exit(255)
-if "nvidia-smi" in cmd:
+if "nvidia-smi" in cmd and os.path.exists(os.path.join(state, "inv_" + host)):
     sys.stdout.write(open(os.path.join(state, "inv_" + host)).read()); sys.exit(0)
 sys.exit(subprocess.call(["bash", "-c", cmd], env={**os.environ, "FAKE_HOST": host}))
 '''
@@ -498,6 +498,344 @@ def test_ssh_unreachable_host_is_skipped(tmp_path, monkeypatch):
     assert {d.host for d in pool.devices} == {"u@h1"} and len(pool) == 4
 
 
+def _gpu_arch():
+    if shutil.which("nvcc") is None:
+        return None
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=30).stdout.split()
+        return out[0].replace(".", "") if out else None
+    except Exception:
+        return None
+
+
+ARCH = _gpu_arch()
+needs_gpu = pytest.mark.skipif(ARCH is None, reason="needs nvcc and a CUDA GPU")
+
+
+# ---------------------------------------------------------------- run-time data.bin over ssh (> 1 GiB problems)
+
+# rsync / scp stand-ins: log every data.bin transfer (start, end, host), fail while a
+# datafail_<host> counter is positive, sleep $FAKE_DATA_SLEEP, then copy for real
+FAKE_DATA_COPY = r'''#!/usr/bin/env python3
+import os, shutil, subprocess, sys, time
+state, tool = os.environ["FAKE_SSH_STATE"], os.path.basename(sys.argv[0])
+dst = sys.argv[-1]
+host = dst.split(":", 1)[0]
+data = ".data.bin.part" in dst
+if os.path.exists(os.path.join(state, "down_" + host)):
+    sys.stderr.write(f"ssh: connect to host {host} port 22: Connection refused\n"); sys.exit(255)
+if data:
+    f = os.path.join(state, "datafail_" + host)
+    n = int(open(f).read() or 0) if os.path.exists(f) else 0
+    if n > 0:
+        open(f, "w").write(str(n - 1))
+        sys.stderr.write(f"{tool}: connection to {host} reset\n"); sys.exit(12)
+    t0 = time.time()
+    time.sleep(float(os.environ.get("FAKE_DATA_SLEEP", "0")))
+if tool.startswith("rsync"):
+    rc = subprocess.call([os.environ.get("REAL_RSYNC", "rsync"), *sys.argv[1:]])
+else:
+    a = [x for x in sys.argv[1:] if x != "-q"]
+    while a and a[0] in ("-o", "-i"):
+        a = a[2:]
+    shutil.copy(a[0], a[1].split(":", 1)[1]); rc = 0
+if data:
+    with open(os.environ["FAKE_COPY_LOG"], "a") as f:
+        f.write(f"{tool} {t0} {time.time()} {host}\n")
+sys.exit(rc)
+'''
+# the driver's run-time data read: fails like the real one without MB_DATA_PATH
+FAKE_DATA_BINARY = r'''#!/bin/bash
+[ -n "$MB_DATA_PATH" ] && [ -r "$MB_DATA_PATH" ] || { echo "MB_ERROR cannot open ${MB_DATA_PATH:-/nonexistent/data.bin}"; echo failed; exit 1; }
+echo "start $(date +%s.%N) $FAKE_HOST $CUDA_VISIBLE_DEVICES $(sha1sum < "$MB_DATA_PATH" | cut -c1-40) $MB_DATA_PATH" >> "$FAKE_RUN_LOG"
+echo "MB_SLOT_US a 1.0"
+echo "MB_PARTITION_US 1.0"
+echo passed
+'''
+FAKE_DATA_HOST = r'''#!%s
+import hashlib, os, sys
+p = os.environ.get("MB_DATA_PATH", "/nonexistent/data.bin")
+if not os.path.exists(p):
+    print(f"MB_ERROR cannot open {p}\nfailed", flush=True); sys.exit(1)
+sha = hashlib.sha1(open(p, "rb").read()).hexdigest()
+print("MB_HOST_READY abi=1 nb=1 nops=1 nslots=1 init_ms=1.0", flush=True)
+for line in sys.stdin:
+    f = line.rstrip("\n").split("\t")
+    if f[0] == "QUIT":
+        break
+    with open(os.environ["FAKE_RUN_LOG"], "a") as log:
+        log.write(f"host {os.environ.get('FAKE_HOST')} {sha} {p}\n")
+    print("MB_CHECK output y max_abs_err=0 bound=1 ok=1", flush=True)
+    print("MB_E2E_US 10.0 basis=graph mean=10.0 reps=5", flush=True)
+    print("passed", flush=True)
+    print(f"MB_HOST_DONE {f[1]} rc=0 poisoned=0 recycle=0", flush=True)
+''' % sys.executable
+
+
+def _data_problem(tmp_path, name, data: bytes, host_marker=False):
+    d = tmp_path / name
+    d.mkdir()
+    (d / "data.bin").write_bytes(data)
+    drv = d / "driver.cpp"
+    drv.write_text('const char *path = getenv("MB_DATA_PATH") ? getenv("MB_DATA_PATH") : "/nonexistent/data.bin";\n'
+                   + ("// MB_HOST_READY\n" if host_marker else ""))
+    return SimpleNamespace(root=d, name=name, driver_path=drv, manifest={"data": "data.bin"}, target="cuda")
+
+
+def _data_env(tmp_path, monkeypatch, hosts, sleep=0.0):
+    state = _fake_ssh_env(tmp_path, monkeypatch, hosts)
+    for tool in ("rsync", "scp"):
+        _exe(tmp_path / f"{tool}_data", FAKE_DATA_COPY)
+        (tmp_path / tool).unlink(missing_ok=True)
+        (tmp_path / tool).symlink_to(tmp_path / f"{tool}_data")
+    monkeypatch.setenv("REAL_RSYNC", shutil.which("rsync") or "rsync")
+    monkeypatch.setenv("FAKE_COPY_LOG", str(tmp_path / "copies.log"))
+    monkeypatch.setenv("FAKE_DATA_SLEEP", str(sleep))
+    monkeypatch.delenv("KERNELBLASTER_SSH_KEEP_DATA", raising=False)
+    return state
+
+
+def _data_evaluator(tmp_path, hosts, binary=FAKE_DATA_BINARY, **kw):
+    from kernelblaster.knowledge.slots import SSHEvaluator
+
+    class FakeBuild(SSHEvaluator):
+        async def _build(self, problem, sources, work):
+            _exe(work / "problem", binary)
+            return None
+
+    kw.setdefault("runtime", "process")
+    return FakeBuild(list(hosts), arch="89", remote_dir={h: str(tmp_path / f"remote_{h}") for h in hosts},
+                     ssh=str(tmp_path / "ssh"), scp=str(tmp_path / "scp"), rsync=str(tmp_path / "rsync"),
+                     work_root=tmp_path / "work", **kw)
+
+
+def _copies(tmp_path):
+    f = tmp_path / "copies.log"
+    return [ln.split() for ln in f.read_text().splitlines()] if f.exists() else []
+
+
+def _runs(tmp_path):
+    return [ln.split() for ln in (tmp_path / "runs.log").read_text().splitlines()]
+
+
+needs_rsync = pytest.mark.skipif(shutil.which("rsync") is None, reason="needs rsync")
+
+
+@needs_rsync
+def test_ssh_data_one_transfer_shared_by_racing_runs(tmp_path, monkeypatch):
+    """12 runs of two problems with the same data race for one host: one rsync, before any GPU is leased."""
+    import hashlib
+    _data_env(tmp_path, monkeypatch, {"u@h1": 0}, sleep=0.5)
+    blob = os.urandom(300_000)
+    sha = hashlib.sha1(blob).hexdigest()
+    from kernelblaster import telemetry as tel
+    ev = _data_evaluator(tmp_path, ["u@h1"], cuda_visible_devices="0,1")
+    probs = [_data_problem(tmp_path, n, blob) for n in ("p1", "p2")]
+    tel.set_enabled(True)
+    tel.configure(tmp_path / "tel.jsonl")
+
+    async def go():
+        with tel.span("problem", collect=True) as sp:
+            return await asyncio.gather(*[ev.evaluate(probs[i % 2], {}, f"c{i}") for i in range(12)]), sp
+    try:
+        res, sp = asyncio.run(go())
+    finally:
+        tel.close()
+    evs = [json.loads(ln) for ln in (tmp_path / "tel.jsonl").read_text().splitlines()]
+    stage = [e for e in evs if e.get("name") == "run.stage.data"]
+    assert len(stage) == 1 and stage[0]["attrs"]["bytes"] == len(blob) and stage[0]["attrs"]["method"] == "rsync"
+    assert stage[0]["dur"] >= 0.5 and tel.summary_of(sp)["counters"]["ssh_data_bytes"] == len(blob)
+    assert all(r.ok for r in res), [r.error_text(200) for r in res]
+    copies = _copies(tmp_path)
+    assert [c[0] for c in copies] == ["rsync"]
+    final = tmp_path / "remote_u@h1" / f"data_{sha[:12]}" / "data.bin"
+    assert final.read_bytes() == blob and not list(final.parent.glob(".data.bin.part*"))
+    runs = _runs(tmp_path)
+    assert len(runs) == 12 and {r[4] for r in runs} == {sha} and {r[5] for r in runs} == {str(final)}
+    assert min(float(r[1]) for r in runs) >= float(copies[0][2])           # no GPU held while it was in flight
+    assert ev.data_transfer["copies"] == 1 and ev.data_transfer["bytes"] == len(blob)
+    assert ev.host_stats()["data"]["copies"] == 1
+    asyncio.run(ev.close())
+    assert not list((tmp_path / "remote_u@h1").iterdir())                 # the copy it made is gone
+
+
+@needs_rsync
+def test_ssh_data_reused_across_runs_and_kept_on_request(tmp_path, monkeypatch):
+    _data_env(tmp_path, monkeypatch, {"u@h1": 0})
+    blob = os.urandom(50_000)
+    prob = _data_problem(tmp_path, "p", blob)
+    monkeypatch.setenv("KERNELBLASTER_SSH_KEEP_DATA", "1")
+    ev = _data_evaluator(tmp_path, ["u@h1"], cuda_visible_devices="0")
+    assert ev.keep_data
+    assert asyncio.run(ev.evaluate(prob, {}, "a")).ok
+    asyncio.run(ev.close())
+    kept = list((tmp_path / "remote_u@h1").glob("data_*/data.bin"))
+    assert len(kept) == 1 and kept[0].read_bytes() == blob                 # kept for the next run
+    ev2 = _data_evaluator(tmp_path, ["u@h1"], cuda_visible_devices="0", keep_data=False)
+    assert asyncio.run(ev2.evaluate(prob, {}, "b")).ok
+    assert ev2.data_transfer == {**ev2.data_transfer, "copies": 0, "reused": 1} and len(_copies(tmp_path)) == 1
+    asyncio.run(ev2.close())
+    assert kept[0].exists()                                                # not its copy: left alone
+    # a copy with the right size but other content is not reused
+    kept[0].write_bytes(bytes(len(blob)))
+    ev3 = _data_evaluator(tmp_path, ["u@h1"], cuda_visible_devices="0", keep_data=False)
+    assert asyncio.run(ev3.evaluate(prob, {}, "c")).ok
+    assert ev3.data_transfer["copies"] == 1 and kept[0].read_bytes() == blob
+    asyncio.run(ev3.close())
+    assert not list((tmp_path / "remote_u@h1").iterdir())
+
+
+@needs_rsync
+def test_ssh_data_copy_failure_is_an_infra_retry(tmp_path, monkeypatch):
+    state = _data_env(tmp_path, monkeypatch, {"u@h1": 0, "u@h2": 0})
+    blob = os.urandom(40_000)
+    prob = _data_problem(tmp_path, "p", blob)
+    (state / "datafail_u@h2").write_text("1000")                          # h2 never takes the data
+    ev = _data_evaluator(tmp_path, ["u@h1", "u@h2"], cuda_visible_devices="0,1")
+
+    async def go():
+        return await asyncio.gather(*[ev.evaluate(prob, {}, f"c{i}") for i in range(6)])
+    res = asyncio.run(go())
+    assert all(r.ok for r in res)                                         # retried on h1, not the candidate's fault
+    assert {r[2] for r in _runs(tmp_path)} == {"u@h1"}
+    by = {d.label(): d for d in ev._pool.devices}
+    assert by["u@h2:0"].infra_fail + by["u@h2:1"].infra_fail + by["u@h2:0"].quarantines >= 1
+    assert ev.data_transfer["failures"] >= 1 and ev.data_transfer["copies"] == 1
+    asyncio.run(ev.close())
+    assert not list((tmp_path / "remote_u@h2").rglob("*.part*"))          # its temporary file is cleaned up
+
+    # one host whose link drops twice (rsync, then the scp fallback): the retry resumes and succeeds
+    (state / "datafail_u@h1").write_text("2")
+    prob2 = _data_problem(tmp_path, "p2", os.urandom(40_000))
+    ev2 = _data_evaluator(tmp_path, ["u@h1"], cuda_visible_devices="0")
+    r = asyncio.run(ev2.evaluate(prob2, {}, "x"))
+    assert r.ok and ev2.data_transfer["failures"] == 1 and ev2.data_transfer["copies"] == 1
+    asyncio.run(ev2.close())
+
+
+@needs_rsync
+def test_ssh_data_prefers_hosts_that_have_it(tmp_path, monkeypatch):
+    """Runs stay on the host holding the data while it has a GPU spare; a busy pool copies to a second host."""
+    _data_env(tmp_path, monkeypatch, {"u@h1": 0, "u@h2": 0})
+    prob = _data_problem(tmp_path, "p", os.urandom(30_000))
+    ev = _data_evaluator(tmp_path, ["u@h1", "u@h2"], cuda_visible_devices="0,1")
+
+    async def one_at_a_time():
+        for i in range(5):
+            assert (await ev.evaluate(prob, {}, f"s{i}")).ok
+    asyncio.run(one_at_a_time())
+    assert len(_copies(tmp_path)) == 1 and len({r[2] for r in _runs(tmp_path)}) == 1
+    monkeypatch.setenv("FAKE_DATA_SLEEP", "0.2")
+
+    async def burst():
+        return await asyncio.gather(*[ev.evaluate(prob, {}, f"b{i}") for i in range(8)])
+    assert all(r.ok for r in asyncio.run(burst()))
+    assert len(_copies(tmp_path)) == 2 and {r[2] for r in _runs(tmp_path)} == {"u@h1", "u@h2"}
+    asyncio.run(ev.close())
+    assert not list((tmp_path / "remote_u@h1").iterdir()) and not list((tmp_path / "remote_u@h2").iterdir())
+
+
+@needs_rsync
+def test_ssh_data_removed_under_a_run_is_copied_again(tmp_path, monkeypatch):
+    _data_env(tmp_path, monkeypatch, {"u@h1": 0})
+    prob = _data_problem(tmp_path, "p", os.urandom(20_000))
+    ev = _data_evaluator(tmp_path, ["u@h1"], cuda_visible_devices="0")
+    assert asyncio.run(ev.evaluate(prob, {}, "a")).ok
+    for f in (tmp_path / "remote_u@h1").glob("data_*/data.bin"):
+        f.unlink()                                                         # e.g. another run's close()
+    assert asyncio.run(ev.evaluate(prob, {}, "b")).ok
+    assert ev.data_transfer["copies"] == 2
+    asyncio.run(ev.close())
+
+
+@needs_rsync
+def test_ssh_data_persistent_host_env(tmp_path, monkeypatch):
+    """The persistent host over ssh is started with MB_DATA_PATH at the remote copy."""
+    import hashlib
+    _data_env(tmp_path, monkeypatch, {"u@h1": 0})
+    blob = os.urandom(60_000)
+    prob = _data_problem(tmp_path, "p", blob, host_marker=True)
+    host = tmp_path / "fake_host.py"
+    _exe(host, FAKE_DATA_HOST)
+    ev = _data_evaluator(tmp_path, ["u@h1"], cuda_visible_devices="0", runtime="host")
+
+    async def host_exe(problem):
+        return host
+
+    async def build_so(problem, sources, work):
+        work.mkdir(parents=True, exist_ok=True)
+        so = work / f"{hashlib.sha1(repr(sorted(sources.items())).encode()).hexdigest()}.so"
+        so.write_bytes(b"so")
+        return so, None
+    ev._host_exe, ev._build_so = host_exe, build_so
+
+    async def go():
+        return await asyncio.gather(*[ev.evaluate(prob, {"a": str(i)}, f"c{i}") for i in range(4)])
+    res = asyncio.run(go())
+    assert all(r.ok and r.runtime == "host" for r in res), [r.error_text(200) for r in res]
+    sha = hashlib.sha1(blob).hexdigest()
+    lines = _runs(tmp_path)
+    assert len(lines) == 4 and {ln[2] for ln in lines} == {sha}
+    assert {ln[3] for ln in lines} == {str(tmp_path / "remote_u@h1" / f"data_{sha[:12]}" / "data.bin")}
+    assert len(_copies(tmp_path)) == 1
+    asyncio.run(ev.close())
+    assert not list((tmp_path / "remote_u@h1").iterdir())
+
+
+def _lenet_runtime_data(tmp_path):
+    """The LeNet fixture as kb_export writes a > 1 GiB problem: data.bin mmapped from
+    $MB_DATA_PATH, the baked-in fallback path does not exist."""
+    import re
+    from kernelblaster.knowledge.slots import SlotProblem
+    d = tmp_path / "lenet_bigdata"
+    shutil.copytree(FIX, d)
+    drv = d / "driver.cpp"
+    mmap = ('#include <fcntl.h>\n#include <sys/mman.h>\n#include <sys/stat.h>\n#include <unistd.h>\n'
+            'static const unsigned char *mb_blob = [] {\n'
+            '    const char *path = getenv("MB_DATA_PATH") ? getenv("MB_DATA_PATH") : "/nonexistent/kb_test/data.bin";\n'
+            '    int fd = open(path, O_RDONLY); struct stat st;\n'
+            '    if (fd < 0 || fstat(fd, &st) != 0) { printf("MB_ERROR cannot open %s\\n", path); printf("failed\\n"); exit(1); }\n'
+            '    void *p = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);\n'
+            '    close(fd);\n'
+            '    if (p == MAP_FAILED) { printf("MB_ERROR cannot map %s\\n", path); printf("failed\\n"); exit(1); }\n'
+            '    return (const unsigned char *)p;\n}();')
+    txt, n = re.subn(r'__asm__\("\.section \.rodata.*\n.*mb_blob\[\];', lambda m: mmap, drv.read_text())
+    assert n == 1
+    drv.write_text(txt)
+    return SlotProblem(d)
+
+
+@needs_gpu
+@needs_rsync
+@pytest.mark.parametrize("runtime", ["process", "host"])
+def test_ssh_runtime_data_driver_runs(tmp_path, monkeypatch, runtime):
+    """A real run-time-data driver (nvcc, this GPU) over the evaluator through a local fake ssh."""
+    from kernelblaster.knowledge.slots import LocalEvaluator, SSHEvaluator
+    _data_env(tmp_path, monkeypatch, {})
+    (tmp_path / "remote_u@h1").mkdir()
+    monkeypatch.setenv("KERNELBLASTER_ALLOW_SHARED_GPU", "1")
+    p = _lenet_runtime_data(tmp_path)
+    seeds = p.seed_sources()
+    ev = SSHEvaluator(["u@h1"], arch=ARCH, remote_dir=str(tmp_path / "remote_u@h1"), ssh=str(tmp_path / "ssh"),
+                      scp=str(tmp_path / "scp"), rsync=str(tmp_path / "rsync"), work_root=tmp_path / "w",
+                      runtime=runtime, cuda_visible_devices="all")
+    local = LocalEvaluator(ARCH, work_root=tmp_path / "l", runtime="process")
+
+    async def go():
+        r = [await ev.evaluate(p, seeds, "seed"),
+             await ev.evaluate(p, {**seeds, "relu": seeds["relu"] + "\n// cand\n"}, "cand")]
+        bad = await local.evaluate(p, seeds, "local")                     # no MB_DATA_PATH: the fallback path
+        await ev.close()
+        return r, bad
+    (seed, cand), bad = asyncio.run(go())
+    assert seed.ok and cand.ok, (seed.error_text(300), cand.error_text(300))
+    assert seed.runtime == cand.runtime == runtime and seed.partition_us and set(seed.slot_us) == set(p.order)
+    assert not bad.ok and "cannot open /nonexistent/kb_test/data.bin" in bad.error_text(2000)
+    assert ev.data_transfer["copies"] == 1 and len(_copies(tmp_path)) == 1
+    assert not list((tmp_path / "remote_u@h1").iterdir())
+
+
 # ---------------------------------------------------------------- servers
 
 def test_exec_server_gpu_ids(monkeypatch):
@@ -597,19 +935,6 @@ def test_forced_reflect_waits_for_a_running_pass(tmp_path):
 
 # ---------------------------------------------------------------- local GPU integration
 
-def _gpu_arch():
-    if shutil.which("nvcc") is None:
-        return None
-    try:
-        out = subprocess.run(["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
-                             capture_output=True, text=True, timeout=30).stdout.split()
-        return out[0].replace(".", "") if out else None
-    except Exception:
-        return None
-
-
-ARCH = _gpu_arch()
-needs_gpu = pytest.mark.skipif(ARCH is None, reason="needs nvcc and a CUDA GPU")
 
 
 @needs_gpu
@@ -713,6 +1038,15 @@ def test_pool_and_limiter_survive_several_event_loops():
     asyncio.run(go())
     asyncio.run(go())                                         # a new loop: fresh primitives, no error
     assert pool.devices[0].runs == 6
+
+
+def test_pick_host_prefers_hosts_with_spare_devices():
+    pool = GPUPool(_devs(2, hosts=("a", "b")))
+    assert pool.pick_host("p", prefer_hosts={"b"}) == "b"                 # the data is there
+    assert pool.pick_host("p", prefer_hosts={"b"}) == "b"
+    assert [pool.pick_host("p", prefer_hosts={"b"}) for _ in range(2)] == ["a", "a"]   # b is full: spill over
+    assert pool.pick_host("p", prefer_hosts={"b"}) == "b"                 # nothing spare: prefer it again
+    assert pool.pick_host("p") == "a"                                     # no preference: the old order
 
 
 def test_pick_host_spreads_staged_runs():

@@ -274,6 +274,51 @@ or NCU pass at a time:
   completely and sends almost no literal data. `KERNELBLASTER_SSH_RSYNC=0` falls back to scp.
 - Hosts that are unreachable at start-up are skipped. The remote directory is created.
 
+Problems whose `data.bin` is too big to link (ModelBlaster `kb_export` above 1 GiB, e.g.
+SwinV2's 2.3 GB): the driver mmaps it at start-up from `$MB_DATA_PATH`, so `SSHEvaluator`
+copies it to each host once and points the runs at the copy.
+
+- **Where.** `<remote_dir>/data_<sha12>/data.bin`, one copy per (host, data sha1). Problems
+  with the same data share it.
+- **When.** After the host is picked and *before* a GPU is leased, as for the binary, so no
+  GPU waits on a 2 GB copy. Concurrent runs that need the same copy wait for one transfer.
+- **How.** rsync `--partial --append-verify` where both ends have it (a retry resumes the
+  partial file), else scp. The copy goes to a temporary name, its size and sha1 are checked
+  on the host, and it is renamed into place. A valid copy left by an earlier run (same size
+  and sha1) is reused without a transfer.
+- **Environment.** `MB_DATA_PATH` is set for the one-process run and for the persistent host,
+  which maps the file once when it starts.
+- **Several hosts.** Each host gets its own copy when it is first picked. `pick_host` prefers
+  hosts that already hold the problem's data while they have a GPU to spare. When they are
+  all busy, a host with free GPUs is picked and gets a copy.
+- **Failures.** A failed copy or check is an infrastructure failure: the run moves to
+  another host (or retries the same one, resuming), and the host gets a strike. Runs that
+  were waiting on that transfer get its error, rather than each starting another copy. A
+  run that finds the copy gone (`MB_ERROR cannot open <copy>`) is retried, and the copy is
+  made again.
+- **Cleanup.** `close()` removes the copies this evaluator made, and their directory if it
+  is empty. Copies it reused are left in place. `KERNELBLASTER_SSH_KEEP_DATA=1` (or
+  `keep_data=True`) keeps them for the next run.
+- **Telemetry.** Each check-or-copy is a `run.stage.data` span with `host`, `reused`,
+  `method`, `bytes`, `seconds` and `mb_per_s`. The `ssh_data_bytes` counter totals the
+  bytes, and `host_stats()["data"]` (in `result.json` under `runtime.evaluator`) counts
+  copies, reuses, failures, bytes and seconds.
+
+Measured with `scripts/bench_runtime.py --evaluator ssh` on SwinV2's seeds: 339 ops, a
+2.27 GB `data.bin`, an idle L40S on firesim2, builds on the dev box.
+
+| | persistent host | one process per run |
+|---|---|---|
+| first copy to the host (rsync + remote sha1 check), once | 23.5 s (92 MB/s) | 23.3 s |
+| reusing a kept copy (remote sha1 check) | 3.0 s | |
+| first evaluation, copy included | 37.3 s | 34.9 s |
+| step candidate, one slot changed (`MB_ONLY_SLOTS` + `MB_SCREEN`), wall | 3.9 s (request 1.96 s) | 4.3 s |
+| full candidate (confirm run), wall | 7.2 s | 7.1 s |
+| eager partition time, median of 3 (CV) | 151 415 µs (0.03 %) | 151 402 µs (0.02 %) |
+| CUDA graph replay | 151 208 µs | |
+
+Every run passed its checks, and the two runtimes agree within 0.01 %.
+
 Several problems in one event loop (`--parallel-problems`):
 
 - The implementation store, outcome log, claims and knowledge-v2 writes are synchronous, so
@@ -409,6 +454,18 @@ The build tests need nvcc and a GPU (CMake and LibTorch for the comparison test)
 - multi-host `SSHEvaluator` dispatch through a fake ssh/scp/rsync: every idle GPU is used, no
   device ever runs two binaries at once, retries skip a host that went down, unreachable hosts
   are skipped, and the scp fallback works;
+- run-time `data.bin` over ssh, through the same fakes:
+  - racing runs of two problems with the same data share one transfer, and no GPU is
+    leased until it is done;
+  - a valid copy is reused across evaluators and a corrupted one is replaced;
+  - `KERNELBLASTER_SSH_KEEP_DATA` keeps copies, and `close()` otherwise removes the ones it
+    made;
+  - a host that cannot take the data is retried elsewhere, and a dropped link is resumed;
+  - hosts holding the data are preferred, and a busy pool copies to a second host;
+  - a copy removed under a run is made again;
+  - the persistent host gets `MB_DATA_PATH`;
+  - with a GPU, a real LeNet driver exported the > 1 GiB way runs on both runtimes, while
+    the same driver without the variable fails;
 - the exec-server GPU ids, compile-server workers and `FastCudaBuilder` jobs;
 - a forced reflection waiting for a running pass;
 - with a GPU: concurrent `LocalEvaluator` runs through the pool, and `run_multislot.py
