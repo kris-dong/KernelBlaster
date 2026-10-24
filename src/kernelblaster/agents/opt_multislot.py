@@ -543,11 +543,21 @@ class MultiSlotAgent:
         return hashlib.sha1(code.encode()).hexdigest()
 
     async def _profile(self, sources: dict, tag: str) -> dict:
-        """NCU every slot of ``sources``; cache per (slot, code). {} if off/unavailable."""
+        """NCU the slots of ``sources`` whose code has no cached profile; cache
+        per (slot, code). {} if off/unavailable.
+
+        Slots already profiled with this exact code are left out of the ncu
+        filter (their kernels are not replayed); their cached summaries are
+        returned alongside the new ones."""
         if self.ncu == "off" or self.ncu_disabled:
             return {}
+        todo = [sid for sid in sources if self._ncu_of(sid, sources[sid]) is None]
+        cached = {sid: self._ncu_of(sid, sources[sid]) for sid in sources if sid not in todo}
+        if not todo:
+            return cached
         self.ncu_runs += 1
-        by, err = await self.ev.profile(self.p, sources, tag)
+        only = {} if len(todo) == len(sources) else {"slots": todo}
+        by, err = await self.ev.profile(self.p, sources, tag, **only)
         if err:
             self.ncu_disabled = err
             self.log.warning(f"[{self.p.name}] NCU disabled for this run: {err} (roofline states instead)")
@@ -555,7 +565,7 @@ class MultiSlotAgent:
         for sid, summ in by.items():
             if sid in sources:
                 self.ncu_cache[(sid, self._sha(sources[sid]))] = summ
-        return by
+        return {**cached, **by}
 
     def _ncu_of(self, sid: str, code: str) -> Optional[dict]:
         return self.ncu_cache.get((sid, self._sha(code)))

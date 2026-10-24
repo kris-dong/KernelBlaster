@@ -231,8 +231,9 @@ class Evaluator:
     async def evaluate(self, problem: SlotProblem, sources: Mapping[str, str], tag: str) -> EvalResult:
         raise NotImplementedError
 
-    async def profile(self, problem: SlotProblem, sources: Mapping[str, str], tag: str):
-        """NCU per slot: -> ({slot: summary}, None) or ({}, why not)."""
+    async def profile(self, problem: SlotProblem, sources: Mapping[str, str], tag: str, slots=None):
+        """NCU per slot (every slot, or only ``slots``): -> ({slot: summary},
+        None) or ({}, why not)."""
         return {}, f"{type(self).__name__} does not profile"
 
 
@@ -381,7 +382,7 @@ class LocalEvaluator(Evaluator):
             if not self.keep:
                 shutil.rmtree(work, ignore_errors=True)
 
-    async def profile(self, problem, sources, tag):
+    async def profile(self, problem, sources, tag, slots=None):
         from .ncu import ncu_command
 
         work = self._workdir(problem, tag + "_ncu")
@@ -390,7 +391,7 @@ class LocalEvaluator(Evaluator):
             if bad is not None:
                 return {}, "build failed: " + bad.error_text(300)
             async with self._gpu:
-                text = await self._run(work / "problem", {"MB_MODE": "profile"}, ncu_command())
+                text = await self._run(work / "problem", {"MB_MODE": "profile"}, ncu_command(slots=slots))
             return _ncu_result(text) if text is not None else ({}, "ncu timed out")
         finally:
             if not self.keep:
@@ -505,7 +506,7 @@ class ServerEvaluator(Evaluator):
             return EvalResult(ok=False, stage="run", errors=[str(e)[-2000:]], log=str(e)[-4000:])
         return parse_driver_output(stdout + "\n" + stderr)
 
-    async def profile(self, problem, sources, tag):
+    async def profile(self, problem, sources, tag, slots=None):
         from ..agents.utils.commands import run_gpu_executable
         from ..agents.utils import FeedbackError
         from .ncu import ncu_command
@@ -515,7 +516,7 @@ class ServerEvaluator(Evaluator):
             return {}, "build failed: " + bad.error_text(300)
         try:
             stdout, stderr = await run_gpu_executable(exe, self.gpu, self.timeout_s, job_name=f"{cu} (ncu)",
-                                                      prefix_command=f"MB_MODE=profile {ncu_command()} ")
+                                                      prefix_command=f"MB_MODE=profile {ncu_command(slots=slots)} ")
         except FeedbackError as e:
             return {}, str(e)[-300:]
         return _ncu_result(stdout + "\n" + stderr)
