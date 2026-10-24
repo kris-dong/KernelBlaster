@@ -75,7 +75,13 @@ class CUDACompileStrategy(CompileStrategy):
             backend_flag,
             debug=debug,
         )
-        output_path.write_bytes(tmp_path.read_bytes())
+        if tmp_path.stat().st_nlink > 1:
+            # fast path: tmp_path is a link into the immutable build cache, so
+            # link too (binaries with linked-in data are 100+ MB)
+            from ..utils.build_cache import link_or_copy
+            link_or_copy(tmp_path, output_path)
+        else:
+            output_path.write_bytes(tmp_path.read_bytes())
         output_path.chmod(0o755)
         logger.info(
             f"[Worker {worker_id}]: Successfully compiled {job_name} and saved to {output_path}"
