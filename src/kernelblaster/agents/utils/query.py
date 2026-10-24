@@ -425,6 +425,11 @@ async def generate_code(messages, n_tasks=1, model=None) -> LLMResponse:
     - Local models (e.g., Qwen2.5-Coder-32B-Instruct) when model name indicates local usage
     - Automatic batching for local models via batch queue
     """
+    # Keyless dev/test providers (claude-code:<model>, stub:<name>).
+    from .agentic_llm import is_agentic_model, generate_code_agentic
+    if is_agentic_model(model):
+        return await generate_code_agentic(messages, n_tasks, model)
+
     # Check if this is a local model
     global _local_llm_module
     if _local_llm_module is None:
