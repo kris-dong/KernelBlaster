@@ -357,6 +357,7 @@ class StepLog:
     reward: float
     fix_attempts: int
     seconds: float
+    context: dict = field(default_factory=dict)      # what the prompt was given (store tiers, claims)
 
 
 class MultiSlotAgent:
@@ -498,6 +499,7 @@ class MultiSlotAgent:
                 trial[sid] = self.store.code(r["seed"])
                 from_store[sid] = r["seed"]
         if from_store:
+            self.log.info(f"[{self.p.name}] store seeds for {sorted(from_store)}")
             res = await self.ev.evaluate(self.p, trial, "store_seeds")
             for sid, rec in from_store.items():
                 ok = res.ok or res.slot_checks.get(sid, {}).get("ok", False)
@@ -599,8 +601,11 @@ class MultiSlotAgent:
                              metric_before=before, metric_after=after, speedup=speedup,
                              metrics_delta={}, error=None if res.ok else res.error_text(1500),
                              diff_summary=dsum, impl_id=impl_id, parent_impl_id=parent)
+        ctx = {"adapt": r["adapt"].id if r["adapt"] is not None else None,
+               "examples": [e.id for e in r["examples"]],
+               "claims": ktext.count("\n") + 1 if ktext else 0, "already_tried": bool(tried)}
         self.steps_log.append(StepLog(ridx, step, sid, tech, status, before, after, reward, fixes,
-                                      round(time.time() - t0, 1)))
+                                      round(time.time() - t0, 1), ctx))
         self.log.info(f"[{self.p.name}] r{ridx} s{step}: {sid} {tech} -> {status}"
                       + (f" {before:.1f}->{after:.1f} us" if after else "") + f" (fixes={fixes})")
 
