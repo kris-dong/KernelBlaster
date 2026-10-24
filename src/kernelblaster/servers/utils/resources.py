@@ -73,6 +73,18 @@ def allow_shared_gpu() -> bool:
     return truthy(os.getenv("KERNELBLASTER_ALLOW_SHARED_GPU"))
 
 
+def loop_local(obj, factory):
+    """``obj`` if it was made on the running event loop, else a new ``factory()``
+    (asyncio primitives bind to the loop they first wait on; an evaluator may
+    outlive one ``asyncio.run``)."""
+    loop = asyncio.get_running_loop()
+    if obj is not None and getattr(obj, "_kb_loop", None) is loop:
+        return obj
+    obj = factory()
+    obj._kb_loop = loop
+    return obj
+
+
 # ---------------------------------------------------------------- CPUs
 
 
@@ -272,8 +284,7 @@ class AdaptiveLimiter:
         return self._cap
 
     def _condition(self) -> asyncio.Condition:
-        if self._cond is None:
-            self._cond = asyncio.Condition()
+        self._cond = loop_local(self._cond, asyncio.Condition)
         return self._cond
 
     async def acquire(self) -> None:
@@ -537,6 +548,9 @@ class Device:
         return cls(g.host, g.uuid or str(g.index), g.name, g.index)
 
 
+_ANY = object()
+
+
 class NoDevice(RuntimeError):
     pass
 
@@ -565,6 +579,7 @@ class GPUPool:
         self._busy: set = set()
         self._started: dict = {}
         self._group_model: dict = {}
+        self._pending: dict = {}                     # host -> runs staged there, not yet leased
         self._cond: Optional[asyncio.Condition] = None
         self.peak_busy = 0
 
@@ -579,20 +594,19 @@ class GPUPool:
         return len(self.models) <= 1
 
     def _condition(self) -> asyncio.Condition:
-        if self._cond is None:
-            self._cond = asyncio.Condition()
+        self._cond = loop_local(self._cond, asyncio.Condition)
         return self._cond
 
-    def _candidates(self, group, avoid=()) -> list[Device]:
+    def _candidates(self, group, avoid=(), host=_ANY) -> list[Device]:
         model = self._group_model.get(group) if group is not None else None
-        cands = [d for d in self.devices if model is None or d.name == model]
+        cands = [d for d in self.devices if (model is None or d.name == model) and (host is _ANY or d.host == host)]
         rest = [d for d in cands if d.key not in avoid]
         return rest or cands                         # avoid is a preference, never a dead end
 
-    def _pick(self, group, avoid=()) -> tuple[Optional[Device], float]:
+    def _pick(self, group, avoid=(), host=_ANY) -> tuple[Optional[Device], float]:
         """A free healthy device, or (None, seconds until a quarantine ends)."""
         now = self.clock()
-        cands = self._candidates(group, avoid)
+        cands = self._candidates(group, avoid, host)
         healthy = [d for d in cands if d.quarantined_until <= now]
         free = [d for d in healthy if d.key not in self._busy]
         if free:
@@ -601,14 +615,55 @@ class GPUPool:
             return None, max(0.05, min(d.quarantined_until for d in cands) - now)
         return None, 0.0
 
-    async def acquire(self, group=None, avoid: Iterable = ()) -> Device:
+    def pick_host(self, group=None, avoid_hosts: Iterable = (), reserve: bool = True):
+        """The host to send the next run of ``group`` to: the most free healthy
+        devices (minus runs already on their way there), then the least
+        recently used one (None: no device). ``reserve`` counts this run as on
+        its way until ``acquire(host=...)`` or ``unreserve``."""
+        now = self.clock()
+        cands = [d for d in self._candidates(group) if d.quarantined_until <= now] or self._candidates(group)
+        rest = [d for d in cands if d.host not in set(avoid_hosts)] or cands
+        if not rest:
+            return None
+        score: dict = {}
+        for d in rest:
+            free, lru = score.get(d.host, (0, float("inf")))
+            score[d.host] = (free + (d.key not in self._busy), min(lru, d.last_used))
+        host = max(score, key=lambda h: (score[h][0] - self._pending.get(h, 0), -score[h][1]))
+        if reserve:
+            self._pending[host] = self._pending.get(host, 0) + 1
+        return host
+
+    def unreserve(self, host) -> None:
+        if self._pending.get(host, 0) > 0:
+            self._pending[host] -= 1
+
+    def _strike(self, dev: Device, now: float) -> None:
+        dev.infra_fail += 1
+        if dev.infra_fail >= self.quarantine_after:
+            dev.quarantined_until = now + self.quarantine_s
+            dev.quarantines += 1
+            dev.infra_fail = 0
+            log.warning(f"[{self.name}] {dev.label()} quarantined for {self.quarantine_s:.0f}s after "
+                        f"{self.quarantine_after} infrastructure failures")
+
+    def host_failure(self, host) -> None:
+        """An infrastructure failure that is the host's, not a device's (e.g. the
+        copy to it failed): a strike for each of its devices."""
+        now = self.clock()
+        for d in self.devices:
+            if d.host == host:
+                self._strike(d, now)
+
+    async def acquire(self, group=None, avoid: Iterable = (), host=_ANY) -> Device:
         """A free device (waits for one); ``avoid``: device keys to pass over
-        while others exist (a retry after an infrastructure failure)."""
+        while others exist (a retry after an infrastructure failure);
+        ``host``: only that host's devices."""
         avoid = set(avoid)
         cond = self._condition()
         async with cond:
             while True:
-                dev, wait = self._pick(group, avoid)
+                dev, wait = self._pick(group, avoid, host)
                 if dev is not None:
                     break
                 try:
@@ -616,6 +671,8 @@ class GPUPool:
                 except asyncio.TimeoutError:
                     pass
             self._busy.add(dev.key)
+            if host is not _ANY:
+                self.unreserve(host)
             self.peak_busy = max(self.peak_busy, len(self._busy))
             self._started[dev.key] = self.clock()
             if group is not None and group not in self._group_model:
@@ -631,21 +688,15 @@ class GPUPool:
             dev.busy_s += now - self._started.pop(dev.key, now)
             dev.last_used = now
             if infra_error:
-                dev.infra_fail += 1
-                if dev.infra_fail >= self.quarantine_after:
-                    dev.quarantined_until = now + self.quarantine_s
-                    dev.quarantines += 1
-                    dev.infra_fail = 0
-                    log.warning(f"[{self.name}] {dev.label()} quarantined for {self.quarantine_s:.0f}s after "
-                                f"{self.quarantine_after} infrastructure failures")
+                self._strike(dev, now)
             else:
                 dev.infra_fail = 0
             cond.notify_all()
 
     @asynccontextmanager
-    async def lease(self, group=None, avoid: Iterable = ()):
+    async def lease(self, group=None, avoid: Iterable = (), host=_ANY):
         """``async with pool.lease(g) as l: ... l.device ...; l.infra_error = True``"""
-        dev = await self.acquire(group, avoid)
+        dev = await self.acquire(group, avoid, host)
         lease = Lease(dev)
         try:
             yield lease
@@ -724,6 +775,24 @@ async def remote_devices(host: str, spec=None, *, ssh_key: Optional[str] = None,
     chosen, why = select_gpus(spec, inv, visible=None)
     lg.info(f"{host} GPUs ({why}): " + ("; ".join(g.short() for g in chosen) or "none"))
     return [Device.from_info(g) for g in chosen]
+
+
+def gpu_lock_wrap(argv: str, ident: Optional[str], *, wait_s: float = 3600) -> str:
+    """Shell text that runs ``argv`` (a shell word list) holding an flock on the
+    GPU ``ident``: one timed run per GPU across every KernelBlaster process on
+    the host (other runs, other agents), not only within this pool.
+
+    The lock is ``$KERNELBLASTER_GPU_LOCK_DIR`` (default ``/dev/shm``)
+    ``/kernelblaster_gpu_<uuid>.lock``. Without flock, or when the lock file
+    cannot be opened (another user's file), the command runs unlocked.
+    ``KERNELBLASTER_GPU_FLOCK=0`` (read here, on the client) turns it off."""
+    if not ident or os.getenv("KERNELBLASTER_GPU_FLOCK", "1").lower() in ("0", "false", "no", "off"):
+        return argv
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", ident)
+    d = os.getenv("KERNELBLASTER_GPU_LOCK_DIR", "/dev/shm")
+    lock = shlex.quote(f"{d}/kernelblaster_gpu_{safe}.lock")
+    return (f"if command -v flock >/dev/null 2>&1 && {{ : >> {lock}; }} 2>/dev/null; "
+            f"then flock -w {int(wait_s)} {lock} {argv}; else {argv}; fi")
 
 
 def shell_env(env: dict) -> str:

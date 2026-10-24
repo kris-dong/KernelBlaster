@@ -173,6 +173,159 @@ slot, and each later best only profiles its own slot: 25 s becomes 7–13 s on R
 | Lean nsys options by default | keep the defaults | the CUDA kernel table is all the agent reads, and the span measures the same |
 | Not adopted: `ncu -c 1`, `--cache-control none`, batching exec requests | – | `-c 1` saves nothing (each candidate launches the bottleneck kernel once); `--cache-control none` changes the cache-dependent metrics and was not faster on ResNet18; after exec by path the per-request overhead is about 0.1 s, so batching has little left to save |
 
+## Load balancing
+
+Builds use the CPUs that are actually free on a shared host, and timed runs spread over every
+idle GPU, local or on remote hosts. The code is in `servers/utils/resources.py`.
+
+### What is detected
+
+| quantity | how |
+|---|---|
+| usable CPUs | `sched_getaffinity`, capped by the cgroup quota (v2 `cpu.max` on every ancestor of the process's cgroup, or v1 `cpu.cfs_quota_us`) |
+| free CPUs | usable CPUs minus other users' load: the 1-minute load average minus the compiler processes this process is running itself |
+| memory headroom | `MemAvailable`, minus 2 GB, divided by a per-process estimate (1.5 GB for nvcc, 2.5 GB for a LibTorch host TU; `KERNELBLASTER_NVCC_MEM_MB` overrides) |
+| GPUs | `nvidia-smi` locally or over ssh: index, UUID, name, memory, utilisation, and the compute processes that are not ours |
+
+An `AdaptiveLimiter` caps concurrent compiler processes at `free CPUs × 0.75`, bounded by
+the memory headroom, in `[1, 16]`. It re-evaluates the cap every 5 s, both on acquire and
+for waiters. When the box gets busy it stops admitting new jobs; running jobs are never
+interrupted. When the box goes idle it scales back up. `KERNELBLASTER_CPU_SHARE` changes the
+0.75 and `KERNELBLASTER_MAX_BUILD_JOBS` the 16.
+
+GPU selection (`select_gpus`):
+
+- `auto` takes the idle GPUs: no foreign compute process and utilisation ≤ 10 %
+  (`KERNELBLASTER_GPU_IDLE_UTIL`).
+- `KERNELBLASTER_ALLOW_SHARED_GPU=1` takes every GPU.
+- When no GPU is idle, auto takes the least busy one, which matches the old one-shared-GPU
+  behaviour, and logs that the GPU is shared.
+- An explicit list (nvidia-smi indices or UUID prefixes) or `all` is always used as given.
+- Locally, an externally set `CUDA_VISIBLE_DEVICES` bounds what auto and `all` may pick.
+
+Runs get `CUDA_VISIBLE_DEVICES=<UUID>`, so CUDA's device ordering cannot remap them. Other
+processes are never signalled or touched.
+
+The `GPUPool` hands out exclusive (host, GPU) leases, so each device has at most one timed run
+or NCU pass at a time:
+
+- It picks the free device used least recently.
+- After 3 consecutive infrastructure failures (no CUDA device, ssh or copy failure; not
+  compile errors, wrong output or crashes), a device sits out for 5 minutes. The evaluator
+  retries that run on another device or host, so the candidate is not charged for it.
+- Every run also holds an `flock` on `/dev/shm/kernelblaster_gpu_<uuid>.lock` on the host
+  that runs it (`KERNELBLASTER_GPU_LOCK_DIR`; `KERNELBLASTER_GPU_FLOCK=0` turns it off). Two
+  KernelBlaster processes that both see a GPU as "idle" between each other's short runs
+  therefore still take turns on it. Processes running code from before this change do not
+  take the lock.
+
+### Defaults and overrides
+
+| component | default now | before | override |
+|---|---|---|---|
+| `LocalEvaluator` nvcc processes | adaptive | 4 unit jobs + 2 assembled builds | `build_jobs=` / `max_parallel=`, `--compile-jobs N`, `KERNELBLASTER_MULTISLOT_COMPILE_JOBS` |
+| `LocalEvaluator` GPUs | pool over the auto GPUs | one `asyncio.Lock`, `CUDA_VISIBLE_DEVICES` untouched | `gpus=`, `--gpus auto\|all\|0,2`, `pool=` |
+| `SSHEvaluator` | every `--ssh-host`, each with its auto (idle) GPUs | one host, one fixed `CUDA_VISIBLE_DEVICES` string | `--cuda-visible-devices` once for all hosts or once per host; `{host: spec}` / `{host: dir}` in the API |
+| `run_multislot.py` problems | `--parallel-problems` = GPUs in the pool | sequential | `--parallel-problems N` |
+| exec server (local strategy) | one worker per auto GPU (UUIDs); the pre-flight check is scoped to them | one worker on GPU 0, global check | `KERNELBLASTER_GPU_SERVER_GPU_IDS`, `KERNELBLASTER_GPU_SERVER_NUM_WORKERS` |
+| compile server workers | `--num-workers auto`: `min(16, CPUs/2, MemAvailable/3 GB)` workers; adaptive admission of `free CPUs × 0.75 / 2` jobs | physical cores − 1 (`management.py`), 4 (CLI) | `--num-workers N`, `KERNELBLASTER_COMPILE_SERVER_NUM_WORKERS`, `KERNELBLASTER_MAX_COMPILE_WORKERS` |
+| `FastCudaBuilder` processes | adaptive | 8 | `KERNELBLASTER_FAST_COMPILE_JOBS` |
+
+`SSHEvaluator` transport:
+
+- It picks the host with the most free GPUs (minus runs already on their way there) and
+  copies the binary there *before* leasing a GPU, so no GPU waits on a copy.
+- ssh connections are multiplexed (`ControlMaster`; `KERNELBLASTER_SSH_MUX=0` turns it off).
+- When both ends have rsync, the binary goes as a delta against the problem's previous binary
+  on that host, kept as `.kb_basis_<problem>`; `close()` removes it. Candidates differ in one
+  slot while the linked `data.bin` dominates the size, so a 117 MB ResNet binary matches
+  completely and sends almost no literal data. `KERNELBLASTER_SSH_RSYNC=0` falls back to scp.
+- Hosts that are unreachable at start-up are skipped. The remote directory is created.
+
+Several problems in one event loop (`--parallel-problems`):
+
+- The implementation store, outcome log, claims and knowledge-v2 writes are synchronous, so
+  they cannot interleave.
+- `SemanticUpdater` and the knowledge-v2 upkeep already run one pass at a time and skip
+  overlapping calls. A problem's final *forced* reflection now waits for a running pass
+  instead of skipping it.
+- After the last problem, the runner runs one more forced reflection or upkeep pass for any
+  records that came in while another pass ran.
+- Each problem keeps its own `OUT/<problem>/` and its own bandit and per-problem lock.
+  Duplicate problem names are rejected.
+
+### Timing comparability
+
+Within a problem, every speedup compares two runs: before against after, and the confirm
+re-measurement against the first run. These may now land on different GPUs. **Decision:** the
+pool pins each problem (the lease group is the problem directory) to the GPU *model* of its
+first lease, which is the baseline run. All later runs of that problem, including confirm and
+NCU runs, go only to GPUs of that model, on any host.
+
+- Same-model GPUs are treated as interchangeable. Their run-to-run spread is the same order
+  as the noise that the confirm re-measurement already guards against.
+- With a mixed pool, problems still spread over all models, but no problem's numbers mix
+  models.
+- The store keys records by arch label, so a mixed pool should only mix GPUs that share
+  `--arch`. `SSHEvaluator` builds one binary for one SM.
+
+Alternatives considered: requiring a homogeneous pool per evaluator, which wastes the other
+GPUs; and pinning a problem to a single device, which serialises the problem's rollouts on
+one GPU and gives no load balancing.
+
+### Measured
+
+`scripts/bench_loadbalance.py` runs an LLM-free scripted candidate stream. Each candidate
+changes one slot of LeNet, `p_1_Conv2D_ReLU_BiasAdd` or `prob_resnet` (round robin), so it
+compiles one slot TU, links and runs, as an RL step does. `--concurrency` candidates are in
+flight at once, which corresponds to rollouts × parallel problems. "before" is `feat/multislot`
+@eee08f1 driven through the same script with run_multislot's old defaults (`--compile-jobs 3`,
+one ssh host, a fixed `CUDA_VISIBLE_DEVICES`).
+
+Candidates per minute; medians, with the range of N runs of 30 candidates each.
+
+*Remote: firesim2, 4× L40S.* GPUs 0 and 1 had other users' resident processes, so only 2
+and 3 were idle. Builds ran on this box (sm_89) and runs went over ssh.
+
+| setup | concurrency | GPUs | cands/min | N |
+|---|---|---|---|---|
+| before: `SSHEvaluator`, scp per run with the GPU held during the copy | 3 | 1 | 16.1 (15.9–16.2) | 2 |
+| after, 1 GPU | 3 | 1 | 31.4 (30.7–32.0) | 2 |
+| after, 1 GPU, scp instead of rsync | 3 | 1 | 33.0 (32.3–33.7) | 2 |
+| after, 1 GPU | 6 | 1 | 35.5 (34.3–36.8) | 2 |
+| after, 2 GPUs (`--cuda-visible-devices 2,3`) | 6 | 2 | **58.5** (51.9–65.1) | 2 |
+
+- Before → after on one GPU is 2×. It comes from copying before leasing the GPU and from
+  ssh multiplexing, not from rsync: at 3 in flight the link keeps up with scp as well.
+- 1 → 2 GPUs at the same concurrency is 1.65×, with runs split 15/18 over the two GPUs.
+- Four GPUs could not be measured: GPUs 0 and 1 stayed occupied, and auto correctly left
+  them out.
+
+*Exec server on firesim2.* `exec_server` ran there and the compile server here, with
+`ServerEvaluator` going through an ssh tunnel. The problems were LeNet and
+`p_1_Conv2D_ReLU_BiasAdd`, whose binaries are uploaded per run.
+
+| exec server GPUs | concurrency 3 | concurrency 6 |
+|---|---|---|
+| `KERNELBLASTER_GPU_SERVER_GPU_IDS=<GPU 2>` | 80.7 | 104.7 |
+| default (auto picked GPUs 2 and 3; the old default would have been GPU 0, which is busy) | 82.4 | **132.2** (1.26×) |
+
+*Local: this box, 48 CPUs (load 17–26 from other users), 1 TITAN RTX.* One GPU means one
+run at a time either way.
+
+| setup | GPU state | concurrency 3 | concurrency 6 |
+|---|---|---|---|
+| before (`--compile-jobs 3`) | idle | 56.5 (51.8–68.0), N=3 | 74.5 (70.4–78.7), N=2 |
+| after (adaptive, peak 6 nvcc) | idle | **84.3** (83.7–85.8), N=3 | 78.9 (72.5–85.4), N=2 |
+| before | shared with a 100 %-utilisation job | 43.0 (42.6–43.5), N=2 | 50.6 (36.0–65.1), N=2 |
+| after | shared with a 100 %-utilisation job | 34.6 (31.5–37.7), N=2 | 51.9 (39.7–64.2), N=2 |
+
+- With the GPU to itself, the adaptive build limit gives +50 % at 3 in flight.
+- At 6 in flight both versions are GPU-bound.
+- With another user's job saturating the GPU, run times roughly double and vary run to run.
+  The after-c3 rows came out lower, but per-phase probes showed the same nvcc and run
+  times, and the spread is as large as the gap, so this is noise from the shared GPU.
+
 ## Remaining bottlenecks
 
 - **Multi-slot driver runtime** on whole-model partitions: SwinV2 takes 22–52 s per run with
@@ -208,3 +361,20 @@ slot, and each later best only profiles its own slot: 25 s becomes 7–13 s on R
 - nsys kernel names, the NCU slot filter and the skipping of cached slots, and exec by path.
 
 The build tests need nvcc and a GPU (CMake and LibTorch for the comparison test).
+
+`tests/test_loadbalance.py` covers the load balancing without multiple GPUs:
+
+- cgroup v1/v2 quota parsing, and the free-CPU, memory and job-count math;
+- the adaptive limiter scaling up and down, including waiters re-probing without a release;
+- nvidia-smi inventory parsing and GPU selection (auto, shared, explicit, `CUDA_VISIBLE_DEVICES`);
+- the pool on fake devices: at most one run per device, LRU spread, GPU-model pinning,
+  quarantine, waiting while every device is quarantined, host picking with reservations, and
+  reuse across event loops;
+- the cross-process `flock`;
+- multi-host `SSHEvaluator` dispatch through a fake ssh/scp/rsync: every idle GPU is used, no
+  device ever runs two binaries at once, retries skip a host that went down, unreachable hosts
+  are skipped, and the scp fallback works;
+- the exec-server GPU ids, compile-server workers and `FastCudaBuilder` jobs;
+- a forced reflection waiting for a running pass;
+- with a GPU: concurrent `LocalEvaluator` runs through the pool, and `run_multislot.py
+  --parallel-problems 2` on two LeNet copies.

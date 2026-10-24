@@ -351,10 +351,12 @@ def test_pool_waits_when_all_quarantined():
 
 FAKE_SSH = r'''#!/usr/bin/env python3
 import os, subprocess, sys
-a = sys.argv[1:]
-while a and a[0] in ("-o", "-i"):
+a, user = sys.argv[1:], None
+while a and a[0] in ("-o", "-i", "-l"):
+    if a[0] == "-l":
+        user = a[1]
     a = a[2:]
-host, cmd = a[0], " ".join(a[1:])
+host, cmd = (f"{user}@{a[0]}" if user else a[0]), " ".join(a[1:])
 state = os.environ["FAKE_SSH_STATE"]
 if os.path.exists(os.path.join(state, "down_" + host)):
     sys.stderr.write(f"ssh: connect to host {host} port 22: Connection refused\n"); sys.exit(255)
@@ -402,6 +404,7 @@ def _fake_ssh_env(tmp_path, monkeypatch, hosts):
     monkeypatch.setenv("FAKE_SSH_STATE", str(state))
     monkeypatch.setenv("FAKE_RUN_LOG", str(tmp_path / "runs.log"))
     monkeypatch.delenv("KERNELBLASTER_ALLOW_SHARED_GPU", raising=False)
+    monkeypatch.setenv("KERNELBLASTER_GPU_LOCK_DIR", str(state))
     return state
 
 
@@ -448,8 +451,26 @@ def test_ssh_multi_host_dispatch(tmp_path, monkeypatch):
     assert {r.device for r in res} == {f"{d.host} {d.ident}" for d in pool.devices}
     assert pool.peak_busy == 5
     assert wall < 15 * 0.15                                                # ran concurrently
-    # binaries are removed from the remote dirs
+    # rsync deltas against each host's last binary of the problem; only that basis stays behind
+    assert ev.transfer == {"rsync": 15, "scp": 0}
+    for h in ("u@h1", "u@h2"):
+        assert [f.name.startswith(".kb_basis_") for f in (tmp_path / f"remote_{h}").iterdir()] == [True]
+    asyncio.run(ev.close())
     assert not list((tmp_path / "remote_u@h1").iterdir()) and not list((tmp_path / "remote_u@h2").iterdir())
+
+
+def test_ssh_scp_without_rsync(tmp_path, monkeypatch):
+    _fake_ssh_env(tmp_path, monkeypatch, {"u@h1": 0})
+    monkeypatch.setenv("KERNELBLASTER_SSH_RSYNC", "0")
+    ev = _fake_ssh_evaluator(tmp_path, ["u@h1"], cuda_visible_devices="2,3")
+    prob = SimpleNamespace(root=tmp_path, name="p")
+
+    async def go():
+        return await asyncio.gather(*[ev.evaluate(prob, {}, f"c{i}") for i in range(4)])
+    assert all(r.ok for r in asyncio.run(go()))
+    assert ev.transfer == {"rsync": 0, "scp": 4}
+    assert not list((tmp_path / "remote_u@h1").iterdir())
+    assert {d.label() for d in ev._pool.devices} == {"u@h1:2", "u@h1:3"}
 
 
 def test_ssh_explicit_gpus_and_infra_retry(tmp_path, monkeypatch):
@@ -602,9 +623,9 @@ def test_local_evaluator_concurrent_on_pool(tmp_path, monkeypatch):
     seen = []
     orig = ev._run
 
-    async def spy(exe, env=None, prefix="", device=None):
+    async def spy(exe, env=None, prefix="", device=None, **kw):
         seen.append(device.env().get("CUDA_VISIBLE_DEVICES"))
-        return await orig(exe, env, prefix, device=device)
+        return await orig(exe, env, prefix, device=device, **kw)
     ev._run = spy
     cands = [{**seeds, "relu": seeds["relu"] + f"\n// candidate {i}\n"} for i in range(4)]
 
@@ -652,3 +673,54 @@ def test_run_multislot_parallel_problems(tmp_path, monkeypatch):
     lb = next(s["load_balance"] for s in summary if "load_balance" in s)
     assert lb["parallel_problems"] == 2 and lb["cuda"]["compile_jobs"] == "4"
     assert sum(g["runs"] for g in lb["cuda"]["gpus"]) >= 2 * 3      # baseline + step + final per problem
+
+
+def test_gpu_lock_serialises_processes(tmp_path, monkeypatch):
+    if shutil.which("flock") is None:
+        pytest.skip("no flock")
+    monkeypatch.setenv("KERNELBLASTER_GPU_LOCK_DIR", str(tmp_path))
+
+    def wall(idents):
+        t0 = time.time()
+        ps = [subprocess.Popen(["bash", "-c", R.gpu_lock_wrap("sleep 0.4", i)]) for i in idents]
+        for p in ps:
+            assert p.wait() == 0
+        return time.time() - t0
+    assert wall(["GPU-x", "GPU-x"]) >= 0.8              # same GPU: one after the other
+    assert wall(["GPU-x", "GPU-y"]) < 0.75             # different GPUs: together
+    assert (tmp_path / "kernelblaster_gpu_GPU-x.lock").exists()
+    monkeypatch.setenv("KERNELBLASTER_GPU_FLOCK", "0")
+    assert R.gpu_lock_wrap("true", "GPU-x") == "true"
+    assert R.gpu_lock_wrap("true", None) == "true"
+    # an unopenable lock file: run unlocked rather than fail
+    monkeypatch.delenv("KERNELBLASTER_GPU_FLOCK")
+    monkeypatch.setenv("KERNELBLASTER_GPU_LOCK_DIR", str(tmp_path / "missing_dir"))
+    assert subprocess.run(["bash", "-c", R.gpu_lock_wrap("echo ran", "GPU-z")], capture_output=True,
+                          text=True).stdout.strip() == "ran"
+
+
+def test_pool_and_limiter_survive_several_event_loops():
+    pool = GPUPool([Device(None, "0", "g", 0)])
+    lim = AdaptiveLimiter(fixed=1)
+
+    async def go():
+        async def one():
+            async with lim:
+                d = await pool.acquire()
+                await asyncio.sleep(0.01)
+                await pool.release(d)
+        await asyncio.gather(*[one() for _ in range(3)])     # contended: primitives bind to this loop
+    asyncio.run(go())
+    asyncio.run(go())                                         # a new loop: fresh primitives, no error
+    assert pool.devices[0].runs == 6
+
+
+def test_pick_host_spreads_staged_runs():
+    pool = GPUPool(_devs(2, hosts=("a", "b")) + [Device("c", "GPU-c0", "L40S", 0)])
+    picks = [pool.pick_host("p") for _ in range(5)]          # nothing leased yet: reservations spread them
+    assert sorted(picks) == ["a", "a", "b", "b", "c"]
+    for h in picks:
+        pool.unreserve(h)
+    pool.host_failure("a")
+    assert pool.devices[0].infra_fail == pool.devices[1].infra_fail == 1
+    assert pool.pick_host("p", avoid_hosts={"a", "b"}) == "c"
