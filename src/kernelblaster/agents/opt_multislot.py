@@ -41,6 +41,7 @@ from typing import Any, Optional
 
 from loguru import logger as _default_logger
 
+from ..knowledge import ncu as ncu_mod
 from ..knowledge.impl_store import ImplStore, shape_bucket
 from ..knowledge.outcomes import (COMPILE_ERROR, RUNTIME_ERROR, WRONG_OUTPUT, OutcomeLog,
                                   OutcomeRecord, classify_speedup)
@@ -279,7 +280,8 @@ def build_codegen_messages(*, problem: SlotProblem, sid: str, source: str, techn
                            technique_desc: str, state: str, state_numbers: dict, slot_us: float,
                            partition_us: float, neighbours: list[tuple[str, str]],
                            examples: list[tuple[str, str]], adapt: Optional[tuple[str, str]],
-                           knowledge_text: str, already_tried: str, best_note: str) -> list[dict]:
+                           knowledge_text: str, already_tried: str, best_note: str,
+                           profile_text: str = "") -> list[dict]:
     slot = problem.slots[sid]
     ref = problem.reference_text(sid)
     parts = [
@@ -289,6 +291,7 @@ def build_codegen_messages(*, problem: SlotProblem, sid: str, source: str, techn
         f"Instances (shape scalars per call):\n{_fmt_instances(slot)}",
         f"Measured: {slot_us:.1f} us for all instances = {100 * slot_us / max(partition_us, 1e-9):.1f}% "
         f"of the partition ({partition_us:.1f} us). State: {state} {json.dumps(state_numbers)}",
+        profile_text,
         best_note,
         f"C reference implementation (semantics oracle, not fast):\n```c\n{ref[:4000]}\n```" if ref else "",
     ]
@@ -367,9 +370,17 @@ class MultiSlotAgent:
                  rollouts: int = 4, steps: int = 6, max_fix_attempts: int = 2, min_share: float = 0.01,
                  confirm_pct: float = 3.0, stall_decay: float = 0.6, bandit: Optional[TechniqueBandit] = None,
                  model_fix: Optional[str] = None, seed: int = 0, logger=None, run_id: Optional[str] = None,
-                 problem_id: Optional[str] = None, propose: bool = True):
+                 problem_id: Optional[str] = None, propose: bool = True, ncu: str = "off"):
         self.p, self.ev, self.model = problem, evaluator, model
         self.propose = propose
+        if ncu not in ("off", "best", "all"):
+            raise ValueError(f"ncu must be off|best|all, not {ncu!r}")
+        # NCU per slot: "best" profiles the baseline and every new slot best,
+        # "all" every verified candidate; disabled on the first failure
+        self.ncu = ncu
+        self.ncu_disabled: Optional[str] = None
+        self.ncu_cache: dict[tuple, dict] = {}         # (slot, code sha1) -> ncu.summarize()
+        self.ncu_runs = 0
         self.model_fix = model_fix or model
         self.out = Path(out_dir)
         self.out.mkdir(parents=True, exist_ok=True)
@@ -425,6 +436,29 @@ class MultiSlotAgent:
         except Exception as e:                                    # knowledge must never block a step
             self.log.warning(f"claims lookup failed: {e}")
             return "", ""
+
+    @staticmethod
+    def _sha(code: str) -> str:
+        import hashlib
+        return hashlib.sha1(code.encode()).hexdigest()
+
+    async def _profile(self, sources: dict, tag: str) -> dict:
+        """NCU every slot of ``sources``; cache per (slot, code). {} if off/unavailable."""
+        if self.ncu == "off" or self.ncu_disabled:
+            return {}
+        self.ncu_runs += 1
+        by, err = await self.ev.profile(self.p, sources, tag)
+        if err:
+            self.ncu_disabled = err
+            self.log.warning(f"[{self.p.name}] NCU disabled for this run: {err} (roofline states instead)")
+            return {}
+        for sid, summ in by.items():
+            if sid in sources:
+                self.ncu_cache[(sid, self._sha(sources[sid]))] = summ
+        return by
+
+    def _ncu_of(self, sid: str, code: str) -> Optional[dict]:
+        return self.ncu_cache.get((sid, self._sha(code)))
 
     def _pitfalls(self, sid: str, technique: str) -> str:
         if self.claims is None:
@@ -518,6 +552,7 @@ class MultiSlotAgent:
                     self.best[sid] = SlotBest(trial[sid], us, rec.id, list(rec.techniques))
             if res.ok and res.partition_us:
                 self.partition_us = min(self.partition_us, res.partition_us)
+        await self._profile(self._sources(), "baseline")
         for sid, b in self.best.items():
             if b.impl_id is None:
                 b.impl_id = self._store(sid, b.source, b.slot_us, None, [], None,
@@ -532,6 +567,9 @@ class MultiSlotAgent:
             self.slot_tries[sid] += 1
         slot = self.p.slots[sid]
         state, nums = slot_state(self.p, sid, cur_us[sid], self.arch)
+        prof_before = self._ncu_of(sid, cur[sid])
+        if prof_before:
+            state = prof_before["state"]                 # measured bound beats the roofline estimate
         techs = techniques_for(slot.op_class)
         key = f"{slot.op_class}|{state}"
         tech = self.bandit.select(key, [t for t, _ in techs], self.rng)
@@ -555,7 +593,8 @@ class MultiSlotAgent:
                                       technique_desc=desc, state=state, state_numbers=nums,
                                       slot_us=cur_us[sid], partition_us=part_us, neighbours=neigh,
                                       examples=examples, adapt=adapt, knowledge_text=ktext,
-                                      already_tried=tried, best_note=best_note)
+                                      already_tried=tried, best_note=best_note,
+                                      profile_text=ncu_mod.render(prof_before) if prof_before else "")
         text = await self._llm(msgs, self.model)
         code = extract_code(text)
         fixes, res, status = 0, None, None
@@ -593,6 +632,11 @@ class MultiSlotAgent:
             status = {"compile": COMPILE_ERROR, "run": RUNTIME_ERROR}.get(res.stage, WRONG_OUTPUT)
             reward = -0.05 if status == COMPILE_ERROR else -0.1
         self.bandit.update(key, tech, reward)
+        prof_after = None
+        if res.ok and (self.ncu == "all" or (self.ncu == "best" and after < self.best[sid].slot_us *
+                                                (1 - self.confirm_pct / 100))):
+            by = await self._profile({**cur, sid: code}, f"r{ridx}_s{step}_{sid}")
+            prof_after = by.get(sid)
         impl_id, parent = None, self.best[sid].impl_id
         dsum = diff_summary(cur[sid], code) if code else None
         if res.ok:
@@ -609,12 +653,15 @@ class MultiSlotAgent:
             else:
                 self.slot_stall[sid] += 1
         self._record_outcome(sid=sid, technique=tech, status=status, state_before=state,
+                             state_after=prof_after["state"] if prof_after else None,
                              metric_before=before, metric_after=after, speedup=speedup,
-                             metrics_delta={}, error=None if res.ok else res.error_text(1500),
+                             metrics_delta=ncu_mod.delta(prof_before, prof_after),
+                             error=None if res.ok else res.error_text(1500),
                              diff_summary=dsum, impl_id=impl_id, parent_impl_id=parent)
         ctx = {"adapt": r["adapt"].id if r["adapt"] is not None else None,
                "examples": [e.id for e in r["examples"]],
-               "claims": ktext.count("\n") + 1 if ktext else 0, "already_tried": bool(tried)}
+               "claims": ktext.count("\n") + 1 if ktext else 0, "already_tried": bool(tried),
+               "ncu": bool(prof_before), "state": state}
         self.steps_log.append(StepLog(ridx, step, sid, tech, status, before, after, reward, fixes,
                                       round(time.time() - t0, 1), ctx))
         self.log.info(f"[{self.p.name}] r{ridx} s{step}: {sid} {tech} -> {status}"
@@ -674,6 +721,9 @@ class MultiSlotAgent:
             "problem": self.p.name, "problem_dir": str(self.p.root), "run_id": self.run_id,
             "arch": f"sm_{self.arch}", "model": self.model, "llm_calls": self.llm_calls,
             "llm_usage": {**self.llm_usage, "cost_usd": round(self.llm_usage["cost_usd"], 4)},
+            "ncu": {"mode": self.ncu, "runs": self.ncu_runs, "disabled": self.ncu_disabled,
+                    "final": {sid: self._ncu_of(sid, b.source) for sid, b in self.best.items()
+                              if self._ncu_of(sid, b.source)}},
             "baseline_partition_us": base.partition_us, "final_ok": final.ok,
             "final_partition_us": final.partition_us,
             "speedup": (base.partition_us / final.partition_us) if final.ok and final.partition_us else None,
