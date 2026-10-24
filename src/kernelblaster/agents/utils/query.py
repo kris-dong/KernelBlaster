@@ -25,6 +25,7 @@ from loguru import logger
 from dataclasses import dataclass, asdict
 
 from ...config import config
+from ...telemetry.llm import backoff as _telemetry_backoff, llm_traced as _llm_traced
 
 __all__ = [
     "generate_code_openai",
@@ -284,6 +285,9 @@ async def generate_code_bedrock(
     outputs: list[str] = []
     total_input = 0
     total_output = 0
+    # telemetry (docs/telemetry.md): cache tokens, stop reasons, Bedrock's own latency, boto3 retries
+    cache_read = cache_write = server_ms = retries = 0
+    stops: list[str] = []
     start = time.time()
     for _ in range(n_tasks):
         # boto3 client is sync; hop off the event loop.
@@ -298,6 +302,11 @@ async def generate_code_bedrock(
         usage = resp.get("usage") or {}
         total_input += int(usage.get("inputTokens") or 0)
         total_output += int(usage.get("outputTokens") or 0)
+        cache_read += int(usage.get("cacheReadInputTokens") or 0)
+        cache_write += int(usage.get("cacheWriteInputTokens") or 0)
+        server_ms += float((resp.get("metrics") or {}).get("latencyMs") or 0)
+        retries += int((resp.get("ResponseMetadata") or {}).get("RetryAttempts") or 0)
+        stops.append(str(resp.get("stopReason") or ""))
     end = time.time()
 
     return LLMResponse(
@@ -307,6 +316,11 @@ async def generate_code_bedrock(
             "input_tokens": total_input,
             "output_tokens": total_output,
             "total_tokens": total_input + total_output,
+            "cache_read_input_tokens": cache_read,
+            "cache_write_input_tokens": cache_write,
+            # non-numeric on purpose: callers sum the numeric usage fields
+            "telemetry": {"input_includes_cache": False, "stop_reasons": stops, "max_tokens": max_tokens,
+                          "server_latency_ms": server_ms, "provider_retries": retries},
         },
         model,
         n_tasks,
@@ -347,10 +361,14 @@ async def generate_code_openai(client, messages, n_tasks, model: str) -> LLMResp
         outputs = [choice.message.content for choice in response.choices]
 
         end = time.time()
+        usage = to_dict_recursive(response.usage) or {}
+        if isinstance(usage, dict):           # telemetry: truncation + the request's cap
+            usage["telemetry"] = {"stop_reasons": [getattr(c, "finish_reason", None) for c in response.choices],
+                                  "max_tokens": args.get("max_tokens")}
         return LLMResponse(
             deepcopy(messages),
             outputs,
-            to_dict_recursive(response.usage),
+            usage,
             model,
             n_tasks,
             end - start,
@@ -359,6 +377,8 @@ async def generate_code_openai(client, messages, n_tasks, model: str) -> LLMResp
         # Handle streaming response
         outputs = [""] * n_tasks
         usage_info = None
+        first_token = None
+        finish = [None] * n_tasks
 
         try:
             stream = await client.chat.completions.create(**args)
@@ -371,6 +391,10 @@ async def generate_code_openai(client, messages, n_tasks, model: str) -> LLMResp
                     if i >= len(outputs):
                         # Just in case more choices are returned than requested
                         continue
+                    if first_token is None:
+                        first_token = time.time()
+                    if getattr(choice, "finish_reason", None):
+                        finish[i] = choice.finish_reason
 
                     if (
                         hasattr(choice, "delta")
@@ -404,6 +428,9 @@ async def generate_code_openai(client, messages, n_tasks, model: str) -> LLMResp
                     usage_info["completion_tokens"] + usage_info["prompt_tokens"]
                 )
 
+            if isinstance(usage_info, dict):  # telemetry: time to first token, truncation
+                usage_info["telemetry"] = {"stop_reasons": finish, "max_tokens": args.get("max_tokens"),
+                                           "ttft_s": (first_token - start) if first_token else None}
             return LLMResponse(
                 deepcopy(messages),
                 outputs,
@@ -417,6 +444,7 @@ async def generate_code_openai(client, messages, n_tasks, model: str) -> LLMResp
             raise
 
 
+@_llm_traced
 async def generate_code(messages, n_tasks=1, model=None) -> LLMResponse:
     """Main function to generate code using either OpenAI REST interface or local models.
 
@@ -631,7 +659,7 @@ async def generate_code_retry(
                 logger.error(
                     f"Failed to generate code due to unknown error. Trying again (attempt {tries}/{max_retries}, error: {e})"
                 )
-            await asyncio.sleep(delay)
+            await _telemetry_backoff(delay, model, reason=type(e).__name__)
             tries += 1
     if not response:
         logger.error("Failed to generate code exceeding max retries.")

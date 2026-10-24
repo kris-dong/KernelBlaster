@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from ...telemetry.core import traced
+
 from ..outcomes import IMPROVED, OutcomeRecord
 from . import discovery as D
 from . import metrics as M
@@ -365,6 +367,7 @@ class KnowledgeV2:
         self.events.append(ev)
         self._log("info", json.dumps(ev, default=str)[:400])
 
+    @traced("upkeep", role="upkeep")       # telemetry span; its LLM calls are role "upkeep"
     async def maybe_upkeep(self, *, force: bool = False) -> list[dict]:
         if self._upkeep_lock.locked():
             return []
@@ -403,6 +406,7 @@ class KnowledgeV2:
                     c.execute("INSERT OR REPLACE INTO stats VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (dst, *key[1:], n, s, ss))
 
     # -- state discovery
+    @traced("upkeep.discovery", role="discovery")
     async def discover_states(self, rows: list[dict], max_calls: int = 1) -> list[dict]:
         seen = self.db.get_meta("discovery_seen", {}) or {}
         trigs = D.find_triggers(rows, self.hierarchy, seen=seen)
@@ -562,6 +566,7 @@ class KnowledgeV2:
                 return True
         return False
 
+    @traced("upkeep.hypothesis", role="hypothesis")
     async def generate_hypotheses(self, rows: list[dict]) -> list[dict]:
         trigs = self.hypothesis_triggers(rows)
         if not trigs:

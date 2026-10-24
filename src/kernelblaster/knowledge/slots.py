@@ -281,6 +281,12 @@ class Evaluator:
         None) or ({}, why not)."""
         return {}, f"{type(self).__name__} does not profile"
 
+    def __init_subclass__(cls, **kw):
+        # telemetry spans on evaluate / profile and the build / run stages (telemetry/evaluator.py)
+        super().__init_subclass__(**kw)
+        from ..telemetry.evaluator import instrument_class
+        instrument_class(cls)
+
 
 def _ncu_result(text: str):
     from .ncu import ncu_error, profile_by_slot

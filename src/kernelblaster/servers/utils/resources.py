@@ -45,6 +45,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence
 
+from ...telemetry.core import traced
+
 log = logging.getLogger(__name__)
 
 GiB = 1024 ** 3
@@ -287,6 +289,7 @@ class AdaptiveLimiter:
         self._cond = loop_local(self._cond, asyncio.Condition)
         return self._cond
 
+    @traced("build.queue")                 # telemetry: time waiting for a compile slot
     async def acquire(self) -> None:
         cond = self._condition()
         async with cond:
@@ -655,6 +658,7 @@ class GPUPool:
             if d.host == host:
                 self._strike(d, now)
 
+    @traced("gpu.queue")                   # telemetry: time waiting for a GPU lease
     async def acquire(self, group=None, avoid: Iterable = (), host=_ANY) -> Device:
         """A free device (waits for one); ``avoid``: device keys to pass over
         while others exist (a retry after an infrastructure failure);

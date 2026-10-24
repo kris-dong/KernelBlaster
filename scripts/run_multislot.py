@@ -22,6 +22,8 @@ model, e.g. ``category,stall:3,share:0.5,explore,fix-escalate``.
 
 Writes OUT/<problem>/result.json and best/slots/*.cu, OUT/summary.json, and
 (with --export-winners) the store's winners for ModelBlaster's kb_ingest.
+OUT/telemetry.jsonl has the span and LLM-call events (docs/telemetry.md;
+``scripts/telemetry_report.py OUT``); KB_TELEMETRY=0 turns telemetry off.
 
 Load balancing (docs/fast_paths.md, "Load balancing"): problems run
 ``--parallel-problems`` at a time (default: the GPUs in the pool) over one
@@ -56,6 +58,7 @@ sys.path.insert(0, str(ROOT))
 
 from loguru import logger  # noqa: E402
 
+from kernelblaster import telemetry as tel  # noqa: E402
 from kernelblaster.agents.model_router import ModelRouter  # noqa: E402
 from kernelblaster.agents.opt_multislot import MultiSlotAgent  # noqa: E402
 from kernelblaster.knowledge.claims import ClaimStore  # noqa: E402
@@ -109,6 +112,17 @@ def _start_servers(gpu_name: str, log_dir: Path):
 
 
 async def _run(args) -> int:
+    out = Path(args.out).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    tel.configure(out / "telemetry.jsonl")
+    with tel.span("kb.run", collect=True, laps=True) as sp:
+        rc = await _run_inner(args, sp)
+    tel.close()
+    return rc
+
+
+async def _run_inner(args, run_span) -> int:
+    tel.lap("setup.knowledge")        # telemetry phases of the run (laps of kb.run)
     for f in args.plugin:             # e.g. registers stub: LLMs for scripted runs
         runpy.run_path(str(f), run_name="kb_plugin")
     out = Path(args.out).resolve()
@@ -178,6 +192,7 @@ async def _run(args) -> int:
         from kernelblaster.agents.multislot_opencl import DEFAULT_ARCH
         return DEFAULT_ARCH if target == "opencl" else "75"
 
+    tel.lap("setup.problems")
     dirs = [d for p in args.problems for d in find_problems(Path(p))]
     problems = [SlotProblem(d) for d in dirs]
     names = [p.name for p in problems]
@@ -186,6 +201,7 @@ async def _run(args) -> int:
     targets = {p.target for p in problems}
     results: list = [None] * len(problems)
     t_all = time.time()
+    tel.lap("problems")
     try:
         n_par = args.parallel_problems or await _default_parallel([evaluator_for(t) for t in sorted(targets)])
         n_par = max(1, min(n_par, len(problems) or 1))
@@ -210,10 +226,15 @@ async def _run(args) -> int:
                 res["seconds"] = round(time.time() - t0, 1)
                 results[i] = {k: res[k] for k in ("problem", "baseline_partition_us", "final_partition_us",
                                                   "speedup", "final_ok", "llm_calls", "llm_usage", "seconds")}
+                if res.get("telemetry"):
+                    results[i]["telemetry"] = {"wall_s": res["telemetry"]["wall_s"],
+                                               "llm": res["telemetry"]["llm"]["total"],
+                                               **res["telemetry"]["derived"]}
                 logger.info(f"{p.name}: {res['baseline_partition_us']:.1f} -> {res['final_partition_us']} us "
                             f"(speedup {res['speedup']}) in {res['seconds']}s, {res['llm_calls']} LLM calls")
 
         await asyncio.gather(*[one(i, p) for i, p in enumerate(problems)])
+        tel.lap("finish")
         if n_par > 1:
             # a problem's final forced pass may have overlapped another's; catch up on the rest
             if updater is not None:
@@ -248,6 +269,14 @@ async def _run(args) -> int:
         summary.append({"knowledge_v2": {"upkeep_model": args.upkeep_model, "upkeep_usage": dict(kv.usage),
                                          **{k: v for k, v in kv.summary().items() if k != "upkeep_usage"}}})
     summary.append({"models": router.describe()})
+    tsum = tel.full_summary(run_span)          # the whole run so far (problems + catch-up passes)
+    if tsum is not None:
+        summary.append({"telemetry": tsum})
+        d = tsum["derived"]
+        logger.info("telemetry: " + ", ".join(f"{k} {v:.0f}s ({d['time_by_category_pct'].get(k, 0):.0f}%)"
+                                              for k, v in d["time_by_category_s"].items() if v >= 0.5)
+                    + f"; tokens in {tsum['llm']['total']['input_tokens']} out {tsum['llm']['total']['output_tokens']}"
+                    + f", truncated {tsum['llm']['total']['truncated']}; events in {out / 'telemetry.jsonl'}")
     (out / "summary.json").write_text(json.dumps(summary, indent=1))
     tot = sum((s.get("llm_usage") or {}).get("cost_usd", 0.0) for s in summary) + float(refl.get("cost_usd", 0.0))
     logger.info(f"LLM cost reported by providers (agent + reflection): ${tot:.4f}")
