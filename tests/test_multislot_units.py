@@ -44,7 +44,8 @@ def test_wrap_and_parse():
     assert w.startswith("#include <cuda_fp16.h>") and "namespace mbslot_relu {" in w
     assert "#undef X" in w and 'extern "C"' not in w
     r = parse_driver_output("MB_CHECK output y max_abs_err=0 bound=1e-05 ok=1\n"
-                            "MB_SLOT_CHECK relu rel_err=0.5 ok=0\nfailed\n")
+                            "MB_SLOT_CHECK relu rel_err=0.5 ok=0\nMB_OP_US conv1.0 3.5\nfailed\n")
+    assert r.op_us == {"conv1.0": 3.5}
     assert not r.ok and r.failing_slots() == ["relu"] and "relu" in r.error_text()
     assert extract_code("x\n```cuda\nint a;\n```\n") == "int a;\n"
 

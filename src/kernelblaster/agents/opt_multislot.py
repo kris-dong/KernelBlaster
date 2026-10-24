@@ -725,7 +725,7 @@ class MultiSlotAgent:
                     "final": {sid: self._ncu_of(sid, b.source) for sid, b in self.best.items()
                               if self._ncu_of(sid, b.source)}},
             "baseline_partition_us": base.partition_us, "final_ok": final.ok,
-            "final_partition_us": final.partition_us,
+            "final_partition_us": final.partition_us, "op_us": final.op_us,
             "speedup": (base.partition_us / final.partition_us) if final.ok and final.partition_us else None,
             "slots": {sid: {"baseline_us": base.slot_us.get(sid), "final_us": final.slot_us.get(sid),
                             "best_us": b.slot_us, "impl_id": b.impl_id, "techniques": b.techniques,

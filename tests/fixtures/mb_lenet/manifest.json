@@ -60,6 +60,9 @@
   {
    "id": "conv2d",
    "op": "conv2d",
+   "ops": [
+    "conv2d"
+   ],
    "op_class": "conv",
    "entry": "kernel_conv2d",
    "signature": "void kernel_conv2d(const float *input, const float *weight, const float *bias, float *output, int N, int IC, int IH, int IW, int OC, int KH, int KW, int SH, int SW, int PH, int PW, int DH, int DW)",
@@ -70,6 +73,7 @@
    "instances": [
     {
      "op_name": "conv1",
+     "op": "conv2d",
      "index": 0,
      "shape": {
       "N": 1,
@@ -91,6 +95,7 @@
     },
     {
      "op_name": "conv2",
+     "op": "conv2d",
      "index": 3,
      "shape": {
       "N": 1,
@@ -115,6 +120,9 @@
   {
    "id": "relu",
    "op": "relu",
+   "ops": [
+    "relu"
+   ],
    "op_class": "elementwise",
    "entry": "kernel_relu",
    "signature": "void kernel_relu(const float *input, float *output, int n)",
@@ -125,6 +133,7 @@
    "instances": [
     {
      "op_name": "relu",
+     "op": "relu",
      "index": 1,
      "shape": {
       "n": 3456
@@ -132,6 +141,7 @@
     },
     {
      "op_name": "relu_1",
+     "op": "relu",
      "index": 4,
      "shape": {
       "n": 1024
@@ -139,6 +149,7 @@
     },
     {
      "op_name": "relu_2",
+     "op": "relu",
      "index": 7,
      "shape": {
       "n": 120
@@ -146,6 +157,7 @@
     },
     {
      "op_name": "relu_3",
+     "op": "relu",
      "index": 9,
      "shape": {
       "n": 84
@@ -156,6 +168,9 @@
   {
    "id": "maxpool2d",
    "op": "maxpool2d",
+   "ops": [
+    "maxpool2d"
+   ],
    "op_class": "reduction",
    "entry": "kernel_maxpool2d",
    "signature": "void kernel_maxpool2d(const float *input, float *output, int N, int C, int IH, int IW, int KH, int KW, int SH, int SW, int PH, int PW, int DH, int DW)",
@@ -166,6 +181,7 @@
    "instances": [
     {
      "op_name": "pool1",
+     "op": "maxpool2d",
      "index": 2,
      "shape": {
       "N": 1,
@@ -186,6 +202,7 @@
     },
     {
      "op_name": "pool2",
+     "op": "maxpool2d",
      "index": 5,
      "shape": {
       "N": 1,
@@ -209,6 +226,9 @@
   {
    "id": "linear",
    "op": "linear",
+   "ops": [
+    "linear"
+   ],
    "op_class": "gemm",
    "entry": "kernel_linear",
    "signature": "void kernel_linear(const float *input, const float *weight, const float *bias, float *output, int M, int K, int N)",
@@ -219,6 +239,7 @@
    "instances": [
     {
      "op_name": "fc1",
+     "op": "linear",
      "index": 6,
      "shape": {
       "M": 1,
@@ -228,6 +249,7 @@
     },
     {
      "op_name": "fc2",
+     "op": "linear",
      "index": 8,
      "shape": {
       "M": 1,
@@ -237,6 +259,7 @@
     },
     {
      "op_name": "fc3",
+     "op": "linear",
      "index": 10,
      "shape": {
       "M": 1,

@@ -85,6 +85,17 @@ int main() {
         if (B_BASE[b] >= 0) dev[b] = (float *)dev[B_BASE[b]] + B_AOFF[b];
     if (mb_num_ops() != NOPS) { printf("MB_ERROR walker has %d ops, driver %d\n", mb_num_ops(), NOPS); printf("failed\n"); return 1; }
 
+    // MB_MODE=profile: every op exactly once on the reference inputs, no checks
+    // or timing reps -- what a profiler (ncu -k regex:mbslot_<slot>::) should see
+    const char *mode = getenv("MB_MODE");
+    if (mode && !strcmp(mode, "profile")) {
+        upload_inputs();
+        for (int i = 0; i < NOPS; ++i) mb_run_op(i, dev);
+        bool ok = ok_cuda("profile");
+        printf(ok ? "MB_PROFILE_DONE\n" : "failed\n");
+        return ok ? 0 : 1;
+    }
+
     // 1. whole partition vs reference
     upload_inputs();
     launch_gpu_implementation(dev);
@@ -142,16 +153,20 @@ int main() {
             cudaEventSynchronize(e1); cudaEventElapsedTime(&ms, e0, e1); total += ms; ++reps;
         }
         printf("MB_PARTITION_US %.3f reps=%d\n", 1000.0 * total / reps, reps);
-        std::vector<double> slot_us(NSLOTS, 0.0);
+        std::vector<double> slot_us(NSLOTS, 0.0), op_us(NOPS, 0.0);
         int oreps = std::max(1, std::min(reps, 20));
         std::vector<cudaEvent_t> ev(2 * NOPS);
         for (auto &e : ev) cudaEventCreate(&e);
         for (int r = 0; r < oreps; ++r) {
             for (int i = 0; i < NOPS; ++i) { cudaEventRecord(ev[2 * i]); mb_run_op(i, dev); cudaEventRecord(ev[2 * i + 1]); }
             cudaEventSynchronize(ev[2 * NOPS - 1]);
-            for (int i = 0; i < NOPS; ++i) { float ms; cudaEventElapsedTime(&ms, ev[2 * i], ev[2 * i + 1]); slot_us[OP_SLOT[i]] += 1000.0 * ms / oreps; }
+            for (int i = 0; i < NOPS; ++i) {
+                float ms; cudaEventElapsedTime(&ms, ev[2 * i], ev[2 * i + 1]);
+                slot_us[OP_SLOT[i]] += 1000.0 * ms / oreps; op_us[i] += 1000.0 * ms / oreps;
+            }
         }
         for (int s = 0; s < NSLOTS; ++s) printf("MB_SLOT_US %s %.3f\n", SLOT_NAME[s], slot_us[s]);
+        for (int i = 0; i < NOPS; ++i) printf("MB_OP_US %s %.3f\n", OP_NAME[i], op_us[i]);
         all_ok &= ok_cuda("timing");
     }
     printf(all_ok ? "passed\n" : "failed\n");
