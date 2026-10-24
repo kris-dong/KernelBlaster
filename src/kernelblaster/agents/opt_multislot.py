@@ -296,8 +296,8 @@ def build_codegen_messages(*, problem: SlotProblem, sid: str, source: str, techn
         parts.append("Neighbouring slots (read-only, for context):\n" + "\n".join(
             f"- `{n}`: {sig}" for n, sig in neighbours))
     if adapt:
-        parts.append(f"A verified fast implementation of this same op for other shapes ({adapt[0]}); "
-                     f"adapt it to these instances:\n```cuda\n{adapt[1][:6000]}\n```")
+        parts.append(f"A verified fast implementation of this same op for overlapping shapes ({adapt[0]}); "
+                     f"adapt it to these instances (re-tune what doesn't fit):\n```cuda\n{adapt[1][:6000]}\n```")
     for label, code in examples:
         parts.append(f"Example: a verified fast kernel of the same class ({label}):\n```cuda\n{code[:5000]}\n```")
     if knowledge_text:
@@ -531,7 +531,10 @@ class MultiSlotAgent:
         r = self._retrieve(sid)
         examples = []
         if self.store is not None:
-            examples = [(f"{e.op}, {e.speedup:.2f}x over its seed", self.store.code(e)) for e in r["examples"]]
+            examples = [(f"{e.op}, {e.speedup_vs_seed or 1:.1f}x over its seed, tuned for shape buckets "
+                         f"{', '.join(e.buckets[:4])}" + ("; same op, different shapes: for ideas only, its "
+                         "blocking may not suit these instances" if e.op == slot.op else ""),
+                         self.store.code(e)) for e in r["examples"]]
         adapt = None
         if r["adapt"] is not None and self.store is not None:
             adapt = (f"{json.dumps(r['adapt'].shapes[:2])}", self.store.code(r["adapt"]))
