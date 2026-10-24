@@ -52,7 +52,18 @@ async def _main(args) -> dict:
     slots = _import(Path(args.kb_root).resolve())
     work = Path(args.out).resolve().parent / (Path(args.out).stem + "_work")
     problems = [slots.SlotProblem(Path(p)) for p in args.problems]
-    if args.evaluator == "local":
+    procs = []
+    if args.evaluator == "server":
+        # KB compile server here (spawned unless COMPILE_SERVER_URL is set) + the exec
+        # server at $GPU_SERVER_URL_<GPU> (e.g. an ssh tunnel to a remote exec server)
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("kb_run_multislot",
+                                                      Path(args.kb_root) / "scripts" / "run_multislot.py")
+        rm = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(rm)
+        gpu, procs = rm._start_servers(args.gpu, work / "servers")
+        ev = slots.ServerEvaluator(gpu, work)
+    elif args.evaluator == "local":
         ev = slots.LocalEvaluator(args.arch, **_kw(slots.LocalEvaluator, work_root=work,
                                                    max_parallel=args.compile_jobs, gpus=args.gpus))
     else:
@@ -66,6 +77,7 @@ async def _main(args) -> dict:
                                 **_kw(slots.SSHEvaluator, ssh_key=args.ssh_key, cuda_visible_devices=cvd,
                                       remote_path=args.remote_cuda_bin, work_root=work,
                                       max_parallel=args.compile_jobs))
+    args._procs.extend(procs)
     # warm-up: every problem's baseline once (driver objects, first-run effects)
     t_warm = time.time()
     for p in problems:
@@ -121,12 +133,13 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("problems", nargs="+")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--evaluator", choices=["local", "ssh"], default="local")
+    ap.add_argument("--evaluator", choices=["local", "ssh", "server"], default="local")
+    ap.add_argument("--gpu", default="titanrtx", help="GPUType for --evaluator server")
     ap.add_argument("--arch", default="75")
     ap.add_argument("--candidates", type=int, default=24)
     ap.add_argument("--concurrency", type=int, default=3)
     ap.add_argument("--compile-jobs", type=int, default=None)
-    ap.add_argument("--gpus", default=None)
+    ap.add_argument("--gpus", default=None, help="local GPUs (auto|all|ids)")
     ap.add_argument("--ssh-host", action="append", default=[])
     ap.add_argument("--ssh-key", default=None)
     ap.add_argument("--cuda-visible-devices", action="append", default=[])
@@ -137,7 +150,12 @@ def main():
     ap.add_argument("--legacy", action="store_true", help="old SSHEvaluator API: one host, one CVD string")
     args = ap.parse_args()
     l0 = os.getloadavg()[0]
-    res = asyncio.run(_main(args))
+    args._procs = []
+    try:
+        res = asyncio.run(_main(args))
+    finally:
+        for p in args._procs:
+            p.terminate()
     res["load1_start_end"] = [round(l0, 1), round(os.getloadavg()[0], 1)]
     Path(args.out).write_text(json.dumps(res, indent=1))
     print(json.dumps({k: v for k, v in res.items() if k != "rows"}, indent=1))

@@ -281,7 +281,7 @@ class LocalEvaluator(Evaluator):
         self._jobs = build_limiter(build_jobs or max_parallel, env="KERNELBLASTER_MULTISLOT_COMPILE_JOBS",
                                    name="multislot nvcc")
         self._sem = self._unit_sem = self._jobs
-        self.gpus, self._pool, self._pool_lock = gpus, pool, asyncio.Lock()
+        self.gpus, self._pool, self._pool_lock = gpus, pool, None
         self.infra_retries = infra_retries
         # one TU per slot, objects + binaries cached by content (see _build_units)
         self.incremental = _incremental_default() if incremental is None else incremental
@@ -296,9 +296,10 @@ class LocalEvaluator(Evaluator):
 
     async def pool(self):
         """The GPU pool (built on first use from ``gpus``)."""
-        from ..servers.utils.resources import GPUPool
+        from ..servers.utils.resources import GPUPool, loop_local
 
         if self._pool is None:
+            self._pool_lock = loop_local(self._pool_lock, asyncio.Lock)
             async with self._pool_lock:
                 if self._pool is None:
                     self._pool = GPUPool(await self._devices(), name=type(self).__name__)
@@ -315,7 +316,7 @@ class LocalEvaluator(Evaluator):
         avoid: set = set()
         for attempt in range(self.infra_retries + 1):
             async with pool.lease(str(problem.root), avoid) as lease:
-                text = await self._run(exe, env, prefix, device=lease.device)
+                text = await self._run(exe, env, prefix, device=lease.device, problem=problem)
                 lease.infra_error = text is not None and is_infra_failure(text) and \
                     not re.search(r"^passed$", text, re.M)
             if not lease.infra_error:
@@ -418,10 +419,15 @@ class LocalEvaluator(Evaluator):
                               log=out.decode()[-4000:])
         return None
 
-    async def _run(self, exe: Path, env: Optional[dict] = None, prefix: str = "", device=None) -> Optional[str]:
-        """Run exe (optionally under a prefix command, e.g. ncu) on ``device``;
-        stdout+stderr, None on timeout."""
+    async def _run(self, exe: Path, env: Optional[dict] = None, prefix: str = "", device=None,
+                   problem=None) -> Optional[str]:
+        """Run exe (optionally under a prefix command, e.g. ncu) on ``device``
+        (holding its cross-process lock); stdout+stderr, None on timeout."""
+        from ..servers.utils.resources import gpu_lock_wrap
+
         cmd = f"{prefix} {shlex.quote(str(exe))}" if prefix else shlex.quote(str(exe))
+        if device is not None:
+            cmd = gpu_lock_wrap(cmd, device.ident, wait_s=self.timeout_s)
         proc = await asyncio.create_subprocess_shell(
             cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
             env={**os.environ, **(device.env() if device is not None else {}), **(env or {})})
@@ -472,11 +478,19 @@ class SSHEvaluator(LocalEvaluator):
     ids) or a ``{host: spec}`` mapping; ``remote_dir`` is one directory used on
     every host, or ``{host: dir}``. Each run leases a free (host, GPU) from the
     pool and is copied to that host's directory. All hosts must run the
-    binary built for ``arch``; a problem's runs stay on one GPU model."""
+    binary built for ``arch``; a problem's runs stay on one GPU model.
+
+    Transport: ssh connections are multiplexed (``ControlMaster``; off with
+    ``KERNELBLASTER_SSH_MUX=0``). Where both ends have rsync
+    (``KERNELBLASTER_SSH_RSYNC=0`` turns it off), a binary is sent as an rsync
+    delta against the problem's previous binary on that host, which stays
+    there as ``.kb_basis_<problem>`` (``close()`` removes them): candidates
+    differ in one slot while the linked data dominates the size, so a 100 MB
+    binary costs a few hundred KB. Otherwise it is scp'd."""
 
     def __init__(self, host, *, arch: str, remote_dir, ssh_key: Optional[str] = None,
                  cuda_visible_devices=None, remote_path: str = "/usr/local/cuda/bin", ssh: str = "ssh",
-                 scp: str = "scp", **kw):
+                 scp: str = "scp", rsync: Optional[str] = "rsync", **kw):
         super().__init__(arch, **kw)
         self.hosts = [host] if isinstance(host, str) else list(host)
         if not self.hosts:
@@ -488,42 +502,100 @@ class SSHEvaluator(LocalEvaluator):
         self.cvd = {h: (cuda_visible_devices.get(h) if isinstance(cuda_visible_devices, Mapping)
                         else cuda_visible_devices) for h in self.hosts}
         self.key, self.remote_path, self.ssh, self.scp = ssh_key, remote_path, ssh, scp
+        use_rsync = os.getenv("KERNELBLASTER_SSH_RSYNC", "1").lower() not in ("0", "false", "no", "off")
+        self.rsync = (shutil.which(rsync) if rsync and use_rsync else None)
+        self._rsync_hosts: set = set()           # hosts with rsync (probed with the inventory)
+        self._mux_dir: Optional[Path] = None
+        if os.getenv("KERNELBLASTER_SSH_MUX", "1").lower() not in ("0", "false", "no", "off"):
+            d = Path(os.getenv("KERNELBLASTER_SSH_CONTROL_DIR") or Path.home() / ".ssh" / "kb_mux")
+            try:
+                d.mkdir(parents=True, exist_ok=True, mode=0o700)
+                self._mux_dir = d
+            except OSError:
+                pass
+        self.transfer = {"rsync": 0, "scp": 0}
 
     def _ssh_base(self) -> list[str]:
-        return ["-o", "BatchMode=yes", "-o", "ConnectTimeout=15"] + (["-i", self.key] if self.key else [])
+        mux = (["-o", "ControlMaster=auto", "-o", f"ControlPath={self._mux_dir}/%C", "-o", "ControlPersist=120"]
+               if self._mux_dir else [])
+        return ["-o", "BatchMode=yes", "-o", "ConnectTimeout=15", *mux] + (["-i", self.key] if self.key else [])
+
+    async def _sh(self, *argv, timeout: float = 600) -> tuple[int, str]:
+        proc = await asyncio.create_subprocess_exec(*argv, stdout=asyncio.subprocess.PIPE,
+                                                    stderr=asyncio.subprocess.STDOUT)
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            return -1, f"timed out after {timeout}s"
+        return proc.returncode, out.decode(errors="replace")
 
     async def _devices(self) -> list:
         from ..servers.utils.resources import NoDevice, remote_devices
 
         devs = []
         for h in self.hosts:
-            proc = await asyncio.create_subprocess_exec(
-                self.ssh, *self._ssh_base(), h, f"mkdir -p {shlex.quote(self.remote_dirs[h])}",
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
-            out, _ = await proc.communicate()
-            if proc.returncode != 0:
-                _log().warning(f"{h}: unreachable or {self.remote_dirs[h]} not writable, skipped: "
-                               f"{out.decode(errors='replace')[-200:]}")
+            rc, out = await self._sh(self.ssh, *self._ssh_base(), h,
+                                     f"mkdir -p {shlex.quote(self.remote_dirs[h])} && "
+                                     "{ command -v rsync >/dev/null && echo KB_HAS_RSYNC; true; }", timeout=60)
+            if rc != 0:
+                _log().warning(f"{h}: unreachable or {self.remote_dirs[h]} not writable, skipped: {out[-200:]}")
                 continue
+            if "KB_HAS_RSYNC" in out and self.rsync:
+                self._rsync_hosts.add(h)
             devs += await remote_devices(h, self.cvd[h], ssh_key=self.key, ssh=self.ssh, logger=_log())
         if not devs:
             raise NoDevice(f"no usable GPU on {', '.join(self.hosts)}")
         return devs
 
-    async def _run(self, exe, env=None, prefix="", device=None):
-        host = device.host if device is not None and device.host else self.host
+    @staticmethod
+    def _basis(problem) -> Optional[str]:
+        if problem is None:
+            return None
+        return ".kb_basis_" + hashlib.sha1(str(problem.root).encode()).hexdigest()[:12]
+
+    async def _send(self, exe: Path, host: str, rdir: str, name: str, basis: Optional[str]) -> Optional[str]:
+        """Copy exe to host:rdir/name; None, or the error text."""
+        q = shlex.quote
+        if basis and host in self._rsync_hosts:
+            # seed the destination with the last binary of this problem: rsync then sends a delta
+            rc, out = await self._sh(self.ssh, *self._ssh_base(), host,
+                                     f"cd {q(rdir)} && {{ cp -f {q(basis)} {q(name)} 2>/dev/null; true; }}", timeout=120)
+            if rc == 0:
+                rc, out = await self._sh(self.rsync, "-I", "-e", shlex.join([self.ssh, *self._ssh_base()]),
+                                         str(exe), f"{host}:{rdir}/{name}", timeout=self.timeout_s)
+                if rc == 0:
+                    self.transfer["rsync"] += 1
+                    return None
+            _log().warning(f"rsync to {host} failed ({out[-200:]!r}); using scp")
+        rc, out = await self._sh(self.scp, "-q", *self._ssh_base(), str(exe), f"{host}:{rdir}/{name}",
+                                 timeout=self.timeout_s)
+        if rc == 0:
+            self.transfer["scp"] += 1
+            return None
+        return out
+
+    async def _stage(self, exe: Path, host: str, problem=None) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        """Copy exe to ``host`` -> (remote name, rsync basis or None, error text or None)."""
         rdir = self.remote_dirs.get(host, self.remote_dir)
-        name = f"{exe.parent.name}_{exe.name}"
-        dst = f"{rdir}/{name}"
-        cp = await asyncio.create_subprocess_exec(self.scp, "-q", *self._ssh_base(), str(exe), f"{host}:{dst}",
-                                                  stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
-        out, _ = await cp.communicate()
-        if cp.returncode != 0:
-            return f"MB_ERROR [infra] scp to {host} failed: {out.decode()[-300:]}\nfailed\n"
+        name = f"{exe.parent.name}_{exe.name}_{uuid.uuid4().hex[:6]}"
+        basis = self._basis(problem) if host in self._rsync_hosts else None
+        err = await self._send(exe, host, rdir, name, basis)
+        return name, basis, err
+
+    async def _exec_staged(self, host: str, name: str, basis: Optional[str], env=None, prefix="",
+                           device=None) -> Optional[str]:
+        from ..servers.utils.resources import gpu_lock_wrap
+
+        rdir = self.remote_dirs.get(host, self.remote_dir)
         envs = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in
                         {**(device.env() if device is not None else {}), **(env or {})}.items())
+        q = shlex.quote(name)
+        keep = f"mv -f ./{q} ./{shlex.quote(basis)} 2>/dev/null || rm -f ./{q}" if basis else f"rm -f ./{q}"
+        run = gpu_lock_wrap(f"env {envs} {prefix} ./{q}", device.ident if device is not None else None,
+                            wait_s=self.timeout_s)
         remote = (f"cd {shlex.quote(rdir)} && export PATH={shlex.quote(self.remote_path)}:$PATH && "
-                  f"env {envs} {prefix} ./{shlex.quote(name)}; rc=$?; rm -f ./{shlex.quote(name)}; exit $rc")
+                  f"{run}; rc=$?; {keep}; exit $rc")
         proc = await asyncio.create_subprocess_exec(self.ssh, *self._ssh_base(), host, remote,
                                                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
         try:
@@ -535,6 +607,48 @@ class SSHEvaluator(LocalEvaluator):
         if proc.returncode == 255 and not re.search(r"^passed$", text, re.M):     # ssh itself failed
             text += f"\nMB_ERROR [infra] ssh to {host} failed (rc 255)\n"
         return text
+
+    async def _run(self, exe, env=None, prefix="", device=None, problem=None):
+        host = device.host if device is not None and device.host else self.host
+        name, basis, err = await self._stage(exe, host, problem)
+        if err is not None:
+            return f"MB_ERROR [infra] copy to {host} failed: {err[-300:]}\nfailed\n"
+        return await self._exec_staged(host, name, basis, env, prefix, device)
+
+    async def _timed_run(self, problem, exe: Path, env: Optional[dict] = None, prefix: str = "") -> Optional[str]:
+        """Copy the binary to the host with the most free GPUs *before* leasing
+        one there, so a GPU is never held while a binary is in flight; an
+        infrastructure failure moves on to another host."""
+        from ..servers.utils.resources import is_infra_failure
+
+        pool = await self.pool()
+        group = str(problem.root)
+        bad_hosts: set = set()
+        text = None
+        for attempt in range(self.infra_retries + 1):
+            host = pool.pick_host(group, avoid_hosts=bad_hosts) or self.host
+            name, basis, err = await self._stage(exe, host, problem)
+            if err is not None:
+                text = f"MB_ERROR [infra] copy to {host} failed: {err[-300:]}\nfailed\n"
+                pool.unreserve(host)
+                pool.host_failure(host)
+            else:
+                async with pool.lease(group, host=host) as lease:
+                    text = await self._exec_staged(host, name, basis, env, prefix, device=lease.device)
+                    lease.infra_error = text is not None and is_infra_failure(text) and \
+                        not re.search(r"^passed$", text, re.M)
+                if not lease.infra_error:
+                    return text
+            _log().warning(f"{problem.name}: infrastructure failure on {host} (attempt {attempt + 1}): "
+                           f"{(text or '')[-300:]!r}")
+            bad_hosts.add(host)
+        return text
+
+    async def close(self):
+        """Remove the rsync basis binaries from every host."""
+        for h in self._rsync_hosts:
+            await self._sh(self.ssh, *self._ssh_base(), h,
+                           f"rm -f {shlex.quote(self.remote_dirs[h])}/.kb_basis_*", timeout=60)
 
     async def _build(self, problem, sources, work):
         if "MB_DATA_PATH" in problem.driver_path.read_text():

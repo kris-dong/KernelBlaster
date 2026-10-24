@@ -77,8 +77,12 @@ transfer and driver-output parsing without a GPU.
 with the driver in `MB_MODE=profile`, rows attributed by the demangled namespace. The measured
 bound and metrics replace the roofline state in prompts and the bandit key; outcome records get
 `metrics_delta`. Needs counter access; otherwise NCU is disabled after the first failure.
-`--evaluator ssh --ssh-host user@host --remote-dir DIR --cuda-visible-devices N` builds here and
-runs the self-contained binary on a remote GPU (e.g. an L40S with counter access).
+`--evaluator ssh --ssh-host user@host --remote-dir DIR [--cuda-visible-devices auto|2,3]` builds
+here and runs the self-contained binary on remote GPUs (e.g. L40S with counter access);
+`--ssh-host` repeats for several hosts, and by default each host's idle GPUs are used.
+Problems run `--parallel-problems` at a time (default: the number of GPUs in the pool) over one
+shared implementation store, outcome log and claims; every timed run and NCU pass leases its
+own GPU. See *Load balancing* in `docs/fast_paths.md`.
 
 ## OpenCL / Qualcomm Adreno
 

@@ -3,7 +3,8 @@
     python scripts/run_multislot.py PROBLEM_DIR_OR_ROOT [...] --out OUT \
         --model claude-code:sonnet [--reflect-model claude-code:haiku] \
         [--knowledge-dir DIR] [--arch 75] [--rollouts 4 --steps 6] \
-        [--evaluator local|server|ssh|board ...] [--ncu off|best|all]
+        [--evaluator local|server|ssh|board ...] [--ncu off|best|all] \
+        [--parallel-problems N] [--gpus auto] [--ssh-host H1 --ssh-host H2 --cuda-visible-devices auto]
 
 PROBLEM_DIR_OR_ROOT: a directory with manifest.json, or a root searched for
 them (``pipeline/kb_export.py`` output). The knowledge directory holds the
@@ -21,6 +22,14 @@ model, e.g. ``category,stall:3,share:0.5,explore,fix-escalate``.
 
 Writes OUT/<problem>/result.json and best/slots/*.cu, OUT/summary.json, and
 (with --export-winners) the store's winners for ModelBlaster's kb_ingest.
+
+Load balancing (docs/fast_paths.md, "Load balancing"): problems run
+``--parallel-problems`` at a time (default: the GPUs in the pool) over one
+shared store / outcome log / claims; every timed run and NCU pass leases one
+GPU. ``--gpus auto|all|0,2`` picks local GPUs (auto: the idle ones);
+``--evaluator ssh`` takes ``--ssh-host`` repeatedly, with ``--cuda-visible-devices
+auto|ids`` once for all hosts or once per host; ``--compile-jobs`` defaults to
+an adaptive limit from the free CPUs and memory.
 
 OpenCL problems (manifest target "opencl", Qualcomm Adreno): ``--evaluator
 board`` builds and runs on the board over ssh (``--board-host``, default
