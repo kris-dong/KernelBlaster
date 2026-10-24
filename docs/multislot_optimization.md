@@ -54,6 +54,15 @@ ModelBlaster.
 float4 improvement, no-op rewrites, and a broken candidate repaired by the fix loop; and reuse
 of a stored winner by a second problem. Needs nvcc and a GPU (skipped otherwise).
 
+## NCU
+
+`--ncu best|all` profiles slots with NCU (`knowledge/ncu.py`): one run over `regex:mbslot_`
+with the driver in `MB_MODE=profile`, rows attributed by the demangled namespace. The measured
+bound and metrics replace the roofline state in prompts and the bandit key; outcome records get
+`metrics_delta`. Needs counter access; otherwise NCU is disabled after the first failure.
+`--evaluator ssh --ssh-host user@host --remote-dir DIR --cuda-visible-devices N` builds here and
+runs the self-contained binary on a remote GPU (e.g. an L40S with counter access).
+
 ## Notes
 
 - `KERNELBLASTER_ALLOW_SHARED_GPU=1` lets the exec server start when other processes use the
