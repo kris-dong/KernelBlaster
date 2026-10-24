@@ -103,6 +103,7 @@ def test_agent_end_to_end(tmp_path):
     assert (tmp_path / "out" / "best" / "slots" / "relu.cu").exists()
     saved = json.loads((tmp_path / "out" / "result.json").read_text())
     assert saved["llm_calls"] == agent.llm_calls >= 8
+    assert set(saved["llm_usage"]) == {"prompt_tokens", "completion_tokens", "cost_usd"}
 
 
 @needs_gpu
