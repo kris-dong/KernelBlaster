@@ -15,6 +15,8 @@ output tokens, stop reason and truncation (stop reason ``max_tokens`` /
 to the full response; ``ttft_s`` when the provider streams), the provider's
 own latency (Bedrock ``metrics.latencyMs``), provider-side retries (boto3
 ``RetryAttempts``), the provider-reported cost and a price-table estimate.
+A call relayed through the LLM server also gets ``relay_queue_s`` and
+``relay_network_s``.
 ``generate_code_retry``'s back-off sleeps are recorded by :func:`backoff`.
 """
 from __future__ import annotations
@@ -120,6 +122,16 @@ def normalize_usage(usage: Any, model: Optional[str], n: int = 1) -> dict:
         rec["server_latency_s"] = float(u["server_latency_ms"]) / 1000.0
     if u.get("ttft_s"):
         rec["ttft_s"] = float(u["ttft_s"])
+    # relayed call (agents/utils/llm_relay.py): the server's queue wait, the network round trip,
+    # and the server's throttling back-off (counted like generate_code_retry's back-off)
+    for k in ("relay_queue_s", "relay_network_s"):
+        if u.get(k) is not None:
+            rec[k] = float(u[k])
+    if u.get("relay_backoff_s"):
+        rec["backoff_s"] = float(u["relay_backoff_s"])
+        rec["backoffs"] = _int(u.get("relay_backoffs"))
+    if u.get("relay_replayed"):
+        rec["relay_replayed"] = True
     return rec
 
 
