@@ -137,6 +137,106 @@ def test_split_without_torch_for_plain_drivers(tmp_path):
     assert header.replace("#include <cstdint>\n", "").strip().startswith("void launch_gpu_implementation")
 
 
+# ---------------------------------------------------------------- multi-slot units
+
+
+def test_units_cover_every_slot_and_declare_entries():
+    p = SlotProblem(FIX)
+    units = dict(p.units(p.seed_sources()))
+    assert set(units) == {f"slot_{s}.cu" for s in p.order} | {"walker_tail.cu"}
+    tail = units["walker_tail.cu"]
+    for sid, slot in p.slots.items():
+        assert f"namespace mbslot_{sid} {{ {slot.signature}; }}" in tail
+        assert f"namespace mbslot_{sid} {{" in units[f"slot_{sid}.cu"]
+    # the assembled TU is unchanged (ModelBlaster's kb_export.assemble contract)
+    assert len(re.findall(r"^namespace mbslot_\w+ \{", p.assemble(p.seed_sources()), re.M)) == len(p.order)
+
+
+def _evaluate(ev, p, sources, tag="t"):
+    return asyncio.run(ev.evaluate(p, sources, tag))
+
+
+@needs_gpu
+def test_incremental_build_matches_assembled(tmp_path):
+    p = SlotProblem(FIX)
+    mono = _evaluate(LocalEvaluator(ARCH, work_root=tmp_path / "m", incremental=False, keep=True), p,
+                     p.seed_sources())
+    inc_ev = LocalEvaluator(ARCH, work_root=tmp_path / "i", incremental=True, keep=True)
+    inc = _evaluate(inc_ev, p, p.seed_sources())
+    assert mono.ok and inc.ok
+    assert _stable(mono.log) == _stable(inc.log)
+    assert not list((tmp_path / "i").glob("*/kernels.cu"))          # built from units
+
+
+def _own_fixture(tmp_path) -> SlotProblem:
+    """A copy of the LeNet fixture whose driver links its own data.bin."""
+    d = tmp_path / "lenet"
+    shutil.copytree(FIX, d)
+    drv = d / "driver.cpp"
+    drv.write_text(re.sub(r'(\.incbin \\")[^"\\]+', lambda m: m.group(1) + str(d / "data.bin"),
+                          drv.read_text()))
+    p = SlotProblem(d)
+    assert str(d / "data.bin") in p.driver_path.read_text()
+    return p
+
+
+@needs_gpu
+def test_incremental_cache_invalidation(tmp_path):
+    p = _own_fixture(tmp_path)
+    ev = LocalEvaluator(ARCH, work_root=tmp_path / "w", incremental=True)
+    seeds = p.seed_sources()
+    assert _evaluate(ev, p, seeds).ok
+    n_units = len(p.order) + 2                       # slots + tail + driver
+    assert (ev._cache.misses, ev._cache.hits) == (n_units + 1, 0)
+    assert _evaluate(ev, p, seeds).ok                # same candidate: link cached too
+    assert ev._cache.misses == n_units + 1
+    changed = {**seeds, "relu": seeds["relu"] + "\n// candidate 2\n"}
+    assert _evaluate(ev, p, changed).ok
+    assert ev._cache.misses == n_units + 3           # one slot object + one link
+    # the driver's linked-in data changed -> driver object rebuilt
+    data = p.root / "data.bin"
+    st = data.stat()
+    os.utime(data, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+    assert _evaluate(ev, p, changed).ok
+    assert ev._cache.misses == n_units + 5
+
+
+@needs_gpu
+def test_incremental_falls_back_to_assembled_tu(tmp_path):
+    """A slot that leans on another slot's include only builds as one TU."""
+    p = SlotProblem(FIX)
+    hdr = tmp_path / "zero.h"
+    hdr.write_text("#pragma once\n#define TEST_ZERO 0.0f\n")
+    src = p.seed_sources()
+    assert "fmaxf(x[i], 0.0f)" in src["relu"]
+    src = {**src, "conv2d": f'#include "{hdr}"\n' + src["conv2d"],
+           "relu": src["relu"].replace("fmaxf(x[i], 0.0f)", "fmaxf(x[i], TEST_ZERO)")}
+    ev = LocalEvaluator(ARCH, work_root=tmp_path / "w", incremental=True, keep=True)
+    r = _evaluate(ev, p, src)
+    assert r.ok
+    assert list((tmp_path / "w").glob("*/kernels.cu"))              # assembled build ran
+    bad = {**src, "linear": "void kernel_linear(const float *input) { this is not valid }"}
+    r = _evaluate(ev, p, bad)
+    assert not r.ok and r.stage == "compile" and "error" in r.errors[0]
+
+
+@needs_gpu
+def test_concurrent_incremental_builds_share_cache(tmp_path):
+    p = SlotProblem(FIX)
+    ev = LocalEvaluator(ARCH, work_root=tmp_path / "w", incremental=True, max_parallel=4)
+    seeds = p.seed_sources()
+    cands = [{**seeds, sid: seeds[sid] + f"\n// c{i}\n"} for i, sid in enumerate(p.order)]
+
+    async def main():
+        return await asyncio.gather(*[ev.evaluate(p, c, f"c{i}") for i, c in enumerate(cands)])
+
+    res = asyncio.run(main())
+    assert all(r.ok for r in res)
+    # driver + tail compiled once; each candidate adds its own slot object
+    objs = list(ev._cache.root.rglob("*.o"))
+    assert len(objs) == 2 + len(p.order) + len(p.order)
+
+
 # ---------------------------------------------------------------- compile server fast path
 
 

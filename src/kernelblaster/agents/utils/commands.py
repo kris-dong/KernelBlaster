@@ -28,6 +28,7 @@ from ...resources import TCPClient
 __all__ = [
     "run_gpu_executable",
     "compile_cu",
+    "compile_cu_units",
     "compile_and_run_cu_file",
     "compile_opencl",
     "run_adreno_executable",
@@ -432,6 +433,52 @@ async def compile_cu(
         job_name,
         persistent_artifacts,
     )
+
+
+async def compile_cu_units(
+    main_filepath: Path,
+    unit_filepaths: list[Path],
+    gpu: GPUType,
+    timeout: float = 120,
+    job_name: str = "",
+) -> str:
+    """Compile a driver plus several CUDA TUs via ``/compile_units``.
+
+    Unlike :func:`compile_cu` the driver is compiled as is (no launch-header
+    split) and every TU is its own object, cached by content on the server.
+    Raises :class:`FeedbackError` on a compile error and
+    :class:`UnitsUnsupported` when the server predates the endpoint.
+    """
+    url = config.COMPILE_SERVER_URL
+    client_timeout = aiohttp.ClientTimeout(total=timeout + 3600)
+    body = {
+        "job_name": job_name,
+        "main_file": str(Path(main_filepath).resolve()),
+        "units": [str(Path(u).resolve()) for u in unit_filepaths],
+        "backend_version": gpu.sm,
+    }
+    try:
+        async with TCPClient.get_session().post(
+            f"{url}/compile_units", json=body, timeout=client_timeout
+        ) as response:
+            if response.status in (404, 405):
+                raise UnitsUnsupported(f"{url} has no /compile_units")
+            if response.status != 200:
+                raise FeedbackError(
+                    f"Failed to compile {job_name}: {await response.text()}"
+                )
+            result = await response.json()
+    except aiohttp.ClientError as e:
+        raise FeedbackError(f"Error connecting to compilation server: {e}")
+    except asyncio.TimeoutError:
+        raise FeedbackError(f"Timeout: failed to compile {job_name} after {timeout} seconds")
+    if not result["success"]:
+        raise FeedbackError(f"Failed to compile {job_name}: {result['message']}")
+    return result["output_path"]
+
+
+class UnitsUnsupported(Exception):
+    """The compile server has no ``/compile_units`` endpoint."""
 
 
 async def compile_and_run_cu_file(
