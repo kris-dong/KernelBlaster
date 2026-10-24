@@ -57,8 +57,9 @@ PARAMETER = "parameter"
 REVISE_DESCRIPTION = "revise_description"
 STATE_SPLIT = "state_split"
 IMPL_NOTE = "impl_note"
+MECHANISM = "mechanism"          # v2: a technique's predicted vs observed metric effects
 CLAIM_KINDS = (APPLICABILITY, PITFALL, INTERACTION, PARAMETER, REVISE_DESCRIPTION,
-               STATE_SPLIT, IMPL_NOTE)
+               STATE_SPLIT, IMPL_NOTE, MECHANISM)
 
 ACTIVE = "active"
 RETIRED = "retired"
@@ -129,6 +130,12 @@ class Claim:
     problem_id: Optional[str] = None
     slot: Optional[str] = None
     impl_id: Optional[str] = None
+    #: knowledge v2 (docs/knowledge_architecture.md section 8): abstraction level
+    #: (target | family | universal), the family for family-level claims, and the
+    #: hypothesis a claim is about. v1 claims are all target-level.
+    level: str = "target"
+    family: Optional[str] = None
+    hypothesis_id: Optional[str] = None
     #: kind-specific structured payload (see ``reflect.EDIT_SCHEMA``):
     #: applicability {effect}, pitfall {symptom, fix}, interaction {other, relation},
     #: parameter {params}, state_split {proposed_state, criterion}, impl_note {note_type}
@@ -175,9 +182,11 @@ class Claim:
             pol = (d.get("proposed_state"),)
         elif self.kind == IMPL_NOTE:
             pol = (d.get("note_type"),)
+        elif self.kind == MECHANISM:
+            pol = (d.get("metric"), d.get("verdict"))
         else:
             pol = ()
-        return (self.kind,) + self.scope() + pol
+        return (self.kind, self.level, self.family) + self.scope() + pol
 
     # -- evidence ---------------------------------------------------------
     def add_support(self, ids: Iterable[str]) -> int:

@@ -496,6 +496,10 @@ class SemanticUpdater:
         out = sorted(seen.values(), key=lambda c: -c.rank(self.claims.epoch))
         return out[: self.max_prompt_claims]
 
+    def build_messages(self, records: list[OutcomeRecord], existing: list[Claim]) -> list:
+        return build_reflect_messages(records, existing, max_edits=self.max_edits,
+                                      known_techniques=self.known_techniques)
+
     def validate_and_apply(self, raw_edits: Any, *, index: dict) -> tuple[list[dict], list[dict]]:
         if isinstance(raw_edits, dict):
             raw_edits = raw_edits.get("edits", [])
@@ -552,8 +556,7 @@ class SemanticUpdater:
         for r in records:   # records passed in directly must be citable too
             index.setdefault(r.id, r)
         existing = self._context_claims(records)
-        messages = build_reflect_messages(records, existing, max_edits=self.max_edits,
-                                          known_techniques=self.known_techniques)
+        messages = self.build_messages(records, existing)
         raw_text, parsed, err = "", None, None
         try:
             raw_text = await self._llm(messages)
