@@ -135,6 +135,13 @@ the class defines itself:
   `evaluate` / `profile` with no glue. It gets the finer stages by using these method names or by declaring
   `TELEMETRY_STAGES = {"_method": "span name"}` on the class. If its output carries `MB_PHASE_MS` lines through a
   `run.exec` method, the driver phases follow.
+- **Persistent driver host** (`knowledge/runtime_host.py`). `LocalEvaluator` / `SSHEvaluator` declare
+  `_build_so` and `_host_exe` (`build`), `_host_request` (`run`: lease and infra retries) and `_stage_file`
+  (`run.stage`). The host client records:
+  - `driver.host_start`, with `restart=` and the counters `host.start` / `host.restart`;
+  - each request as `run.exec` (GPU busy), with the driver's phases as children: `driver.load`, the checks,
+    `driver.graph_build` (graph capture) and `driver.time_partition` (graph and eager replay), attribution;
+  - the failures as `host.crash` / `host.timeout` / `host.poisoned`.
 
 ## Categories and derived metrics
 

@@ -48,7 +48,9 @@ def test_lenet_step_breakdown_sums_to_step_wall_time(tmp_path):
         assert abs(t["wall_s"] - s["seconds"]) <= 0.1 + 0.02 * s["seconds"], s
         assert sum(t["time_s"].values()) == pytest.approx(t["wall_s"], abs=0.05 + 0.01 * t["wall_s"]), t
         assert t["llm"]["calls"] >= 1 and t["evals"].get("candidate") == 1
-        assert {"build", "run.exec"} & set(t["time_s"])
+        # evaluation work is in the breakdown: a build or a driver run (with the persistent
+        # host a cached build and the request's own overhead can both be under 5 ms)
+        assert {"build", "run.exec"} & set(t["time_s"]) or any(k.startswith("driver.") for k in t["time_s"])
     tm = json.loads((tmp_path / "tel_e2e_out" / "result.json").read_text())["telemetry"]
     assert sum(tm["time_s"].values()) == pytest.approx(tm["wall_s"], abs=0.05)
     # the agent's own LLM calls, no double counting against llm_usage

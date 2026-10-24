@@ -159,6 +159,38 @@ the rest. The cache contents and the prompts are unchanged. The baseline still p
 slot, and each later best only profiles its own slot: 25 s becomes 7–13 s on ResNet18.
 `Evaluator.profile` gained an optional `slots` argument.
 
+### 6. Multi-slot: the persistent driver host (`knowledge/runtime_host.py`, `knowledge/slots.py`)
+
+**What it changes.**
+
+- **Before**, each multi-slot evaluation paid the following, all per run:
+  - a relink of the driver binary with its linked reference data (110–480 MB);
+  - the binary's transfer (rsync delta) to the GPU host;
+  - about 185 ms of CUDA context creation and about 80 ms of process start.
+- **Now**, `LocalEvaluator` and `SSHEvaluator` keep a driver host per (problem, GPU): the
+  problem's `driver.cpp` built `-DMB_HOST`, once, cached by content.
+- **Each candidate** is a shared object of its slot units + tail: `-shared -fPIC`, per-thread
+  default stream, units and link cached by content. The host dlopens it for one request.
+- **The GPU flock** is taken per request by the host itself.
+
+**Per candidate on an idle L40S** (builds on the dev box, `--evaluator ssh`), step runs:
+
+| problem | before | after |
+|---|---|---|
+| L2 gemm winner | 3.55 s | **1.62 s** |
+| ResNet18 winner | 4.03 s | **1.61 s** |
+| MiniGPT winner | 6.25 s | **1.73 s** |
+| LSTM seeds (220 ms per forward pass) | 13.1 s | **6.2 s** |
+
+- **Same numbers as one process.** The host replays the partition as a CUDA graph and its
+  times agree with a one-process graph build within 0.3 %.
+- **A crash or hang** restarts the host. A sticky CUDA error makes the host report itself
+  poisoned and exit.
+- **Fallback.** A host that does not build or start falls back to one process per run.
+- **Server path.** `ServerEvaluator` keeps one process per run.
+- **Details:** ModelBlaster `docs/gpu_harness_perf.md` ("Persistent runtime and the
+  end-to-end reward"). Bench: `scripts/bench_runtime.py`.
+
 ## Design decisions
 
 | decision | alternatives | why |
@@ -328,6 +360,8 @@ run at a time either way.
 
 ## Remaining bottlenecks
 
+- **Per-run CUDA init and process start** of the multi-slot driver: removed by the persistent
+  host (section 6). A step is now about 1 s of slot compile, a small link and the request.
 - **Multi-slot driver runtime** on whole-model partitions (addressed; ModelBlaster
   `docs/gpu_harness_perf.md`): SwinV2 took 21–26 s per run on an L40S with naive seed kernels,
   17 s of it in the isolated-op checks (every weight re-uploaded per op). The new driver takes

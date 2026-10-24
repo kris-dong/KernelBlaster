@@ -781,6 +781,18 @@ async def remote_devices(host: str, spec=None, *, ssh_key: Optional[str] = None,
     return [Device.from_info(g) for g in chosen]
 
 
+def gpu_lock_file(ident: Optional[str]) -> Optional[str]:
+    """The GPU's lock file (``$KERNELBLASTER_GPU_LOCK_DIR``, default ``/dev/shm``,
+    ``/kernelblaster_gpu_<ident>.lock``); None when locking is off
+    (``KERNELBLASTER_GPU_FLOCK=0``) or there is no ident. The persistent driver
+    host takes the same flock itself, per request."""
+    if not ident or os.getenv("KERNELBLASTER_GPU_FLOCK", "1").lower() in ("0", "false", "no", "off"):
+        return None
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", ident)
+    d = os.getenv("KERNELBLASTER_GPU_LOCK_DIR", "/dev/shm")
+    return f"{d}/kernelblaster_gpu_{safe}.lock"
+
+
 def gpu_lock_wrap(argv: str, ident: Optional[str], *, wait_s: float = 3600) -> str:
     """Shell text that runs ``argv`` (a shell word list) holding an flock on the
     GPU ``ident``: one timed run per GPU across every KernelBlaster process on
@@ -790,11 +802,10 @@ def gpu_lock_wrap(argv: str, ident: Optional[str], *, wait_s: float = 3600) -> s
     ``/kernelblaster_gpu_<uuid>.lock``. Without flock, or when the lock file
     cannot be opened (another user's file), the command runs unlocked.
     ``KERNELBLASTER_GPU_FLOCK=0`` (read here, on the client) turns it off."""
-    if not ident or os.getenv("KERNELBLASTER_GPU_FLOCK", "1").lower() in ("0", "false", "no", "off"):
+    path = gpu_lock_file(ident)
+    if path is None:
         return argv
-    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", ident)
-    d = os.getenv("KERNELBLASTER_GPU_LOCK_DIR", "/dev/shm")
-    lock = shlex.quote(f"{d}/kernelblaster_gpu_{safe}.lock")
+    lock = shlex.quote(path)
     return (f"if command -v flock >/dev/null 2>&1 && {{ : >> {lock}; }} 2>/dev/null; "
             f"then flock -w {int(wait_s)} {lock} {argv}; else {argv}; fi")
 

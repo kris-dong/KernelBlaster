@@ -223,7 +223,7 @@ class SQLiteOutcomeLog:
 
     def __iter__(self) -> Iterator[OutcomeRecord]:
         for (rec,) in self.db.query("SELECT rec FROM outcomes ORDER BY seq"):
-            yield OutcomeRecord(**json.loads(rec))
+            yield OutcomeRecord.from_json(json.loads(rec))
 
     def rows(self, where: str = "", args=()) -> list[dict]:
         """Outcome dicts with ``v2`` extras and ``seq`` (``where`` is an SQL condition)."""

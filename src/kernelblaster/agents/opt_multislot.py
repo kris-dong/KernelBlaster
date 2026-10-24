@@ -31,6 +31,7 @@ import asyncio
 import difflib
 import json
 import math
+import os
 import random
 import re
 import time
@@ -44,8 +45,8 @@ from loguru import logger as _default_logger
 from .. import telemetry as tel
 from ..knowledge import ncu as ncu_mod
 from ..knowledge.impl_store import ImplStore, shape_bucket
-from ..knowledge.outcomes import (COMPILE_ERROR, RUNTIME_ERROR, WRONG_OUTPUT, OutcomeLog,
-                                  OutcomeRecord, classify_speedup)
+from ..knowledge.outcomes import (COMPILE_ERROR, IMPROVED, NEUTRAL, REGRESSED, RUNTIME_ERROR, WRONG_OUTPUT,
+                                  OutcomeLog, OutcomeRecord, classify_speedup)
 from ..knowledge.slots import EvalResult, Evaluator, SlotProblem, step_eval_options
 from .cost_tracker import lookup_pricing
 from .model_router import ModelRouter, technique_tier
@@ -97,9 +98,22 @@ TECHNIQUES: dict[str, list[tuple[str, str]]] = {
 }
 
 
-def techniques_for(op_class: str, techniques: Optional[dict] = None) -> list[tuple[str, str]]:
+# Offered (v1 bandit) when the slot or its partition is launch-bound: the end-to-end
+# reward credits fewer launches, which the slot's own kernel time does not show.
+LAUNCH_TECHNIQUES: list[tuple[str, str]] = [
+    ("kernel_fusion_in_slot", "Fuse the kernels this slot launches per call into one (fold the separate init / bias / "
+                              "activation / second pass into the main kernel): fewer launches and no intermediate "
+                              "DRAM round trip."),
+    ("persistent_kernel", "Replace a host loop of many small launches (timesteps, layers, chunks) with one persistent "
+                          "kernel or a few large launches (grid-stride work loop, in-kernel synchronisation)."),
+]
+
+
+def techniques_for(op_class: str, techniques: Optional[dict] = None,
+                   launch_bound: bool = False) -> list[tuple[str, str]]:
     techniques = techniques or TECHNIQUES
-    return techniques.get(op_class, []) + techniques["*"]
+    extra = LAUNCH_TECHNIQUES if launch_bound and techniques is TECHNIQUES else []
+    return techniques.get(op_class, []) + techniques["*"] + extra
 
 
 # ---------------------------------------------------------------- roofline
@@ -185,8 +199,11 @@ def propose_fusions(problem: SlotProblem, result: EvalResult, arch: str, min_gai
     """
     ops = {o["name"]: o for o in problem.manifest["ops"]}
     bufs = problem.manifest["buffers"]
-    part_us = result.partition_us or sum(result.slot_us.values()) or 1.0
-    per_inst = {sid: result.slot_us.get(sid, 0.0) / max(len(s.instances), 1) for sid, s in problem.slots.items()}
+    part_us = result.deployed_us or sum(result.slot_us.values()) or 1.0
+    # a consumer instance's share of the deployed time: its kernels' GPU time
+    # (attributed where the driver measured it) plus its launches' overhead
+    w = slot_weights(result)
+    per_inst = {sid: w.get(sid, 0.0) / max(len(s.instances), 1) for sid, s in problem.slots.items()}
     cands = []
     for a, b, t in problem.adjacent_pairs():
         sa, sb = problem.slots[ops[a]["slot"]], problem.slots[ops[b]["slot"]]
@@ -212,7 +229,9 @@ def propose_fusions(problem: SlotProblem, result: EvalResult, arch: str, min_gai
             "kind": "fuse", "pattern": [ka, kb], "pairs": g["pairs"],
             "evidence": {"est_gain_us": round(g["gain_us"], 2), "est_gain_pct": round(pct, 2),
                          "intermediate_bytes": g["bytes"], "partition_us": part_us,
-                         "consumer_slot_us": result.slot_us.get(problem.slots[ops[g["pairs"][0][1]]["slot"]].id)},
+                         "consumer_slot_us": result.slot_us.get(problem.slots[ops[g["pairs"][0][1]]["slot"]].id),
+                         **({"e2e_basis": result.e2e_basis, "overhead_us_per_launch": round(overhead_per_launch(result), 3),
+                             "launch_bound": partition_runtime(result)["launch_bound"]} if result.attr_slot_us else {})},
             "rationale": (f"{kb} only reads the {ka} output it follows; fusing it into the {ka} epilogue "
                           f"removes {len(g['pairs'])} kernel launch(es) and {g['bytes'] / 1e6:.1f} MB of DRAM "
                           f"round trip, ~{pct:.1f}% of the partition on {arch_label or 'sm_' + arch}."),
@@ -424,7 +443,7 @@ def build_codegen_messages(*, problem: SlotProblem, sid: str, source: str, techn
                            partition_us: float, neighbours: list[tuple[str, str]],
                            examples: list[tuple[str, str]], adapt: Optional[tuple[str, str]],
                            knowledge_text: str, already_tried: str, best_note: str,
-                           profile_text: str = "") -> list[dict]:
+                           profile_text: str = "", runtime_text: str = "") -> list[dict]:
     slot = problem.slots[sid]
     tp = target_profile(problem.target)
     ref = problem.reference_text(sid)
@@ -435,6 +454,7 @@ def build_codegen_messages(*, problem: SlotProblem, sid: str, source: str, techn
         f"Instances (shape scalars per call):\n{_fmt_instances(slot)}",
         f"Measured: {slot_us:.1f} us for all instances = {100 * slot_us / max(partition_us, 1e-9):.1f}% "
         f"of the partition ({partition_us:.1f} us). State: {state} {json.dumps(state_numbers)}",
+        runtime_text,
         profile_text,
         best_note,
         f"C reference implementation (semantics oracle, not fast):\n```c\n{ref[:4000]}\n```" if ref else "",
@@ -490,14 +510,105 @@ def diff_summary(a: str, b: str) -> str:
     return f"+{add}/-{rm} lines"
 
 
+# ---------------------------------------------------------------- end-to-end reward
+
+REWARDS = ("e2e", "slot")
+LAUNCH_BOUND_FRAC = 0.15        # eager partition time not spent in kernels
+TINY_KERNEL_US = 5.0
+
+
+def e2e_gain(res: EvalResult, before_us: Optional[float]) -> tuple[Optional[float], str]:
+    """Fraction of the deployed partition time a candidate saves (> 0: faster).
+
+    Paired: ``1 - median(candidate / incumbent)`` over reps timed alternately in
+    one process (the persistent host's ``ref=``). Else against ``before_us``,
+    the incumbent's time from an earlier run."""
+    r = res.e2e_ratio
+    if r and r.get("n") and r.get("med"):
+        return 1.0 - r["med"], "paired"
+    after = res.deployed_us
+    if after and before_us:
+        return (before_us - after) / before_us, "unpaired"
+    return None, "none"
+
+
+def overhead_per_launch(res: EvalResult) -> float:
+    """Deployed time not spent in kernels, per launch (0 without attribution)."""
+    if not res.attr_sum_us or not res.attr_launches or not res.deployed_us:
+        return 0.0
+    return max(0.0, res.deployed_us - res.attr_sum_us) / max(res.attr_launches, 1.0)
+
+
+def slot_weights(res: EvalResult) -> dict:
+    """Each slot's share of the deployed time: its kernels' GPU time plus its
+    launches' share of the launch/idle overhead (the slot's attributed time
+    alone where there is no attribution)."""
+    per = overhead_per_launch(res)
+    return {s: (res.slot_time(s) or 0.0) + per * res.attr_slot_launches.get(s, 0.0) for s in res.slot_times()}
+
+
+def partition_runtime(res: EvalResult) -> dict:
+    """The deployed-runtime numbers of a run (result.json, prompts, outcome records)."""
+    eager = res.partition_us
+    out = {"runtime": res.runtime, "e2e_us": res.deployed_us, "e2e_basis": res.e2e_basis or "eager",
+           "eager_us": eager, "graph_us": res.partition_graph_us, "graph_skip": res.graph_skip,
+           "kernel_us": res.attr_sum_us, "launches": res.attr_launches, "graph_nodes": res.graph_nodes,
+           "launch_overhead_us": res.launch_overhead_us, "launch_overhead_frac": res.launch_overhead_frac,
+           "attribution": "cupti" if res.attr_slot_us else ("events" if res.slot_us else None),
+           "attr_skip": res.attr_skip}
+    if eager and res.partition_graph_us:
+        out["graph_saving_frac"] = round(1.0 - res.partition_graph_us / eager, 4)
+    out["launch_bound"] = bool((res.launch_overhead_frac or 0.0) >= LAUNCH_BOUND_FRAC
+                               or (out.get("graph_saving_frac") or 0.0) >= 0.05)
+    return out
+
+
+def slot_launch_bound(res: Optional[EvalResult], sid: str, problem: SlotProblem) -> bool:
+    """The slot launches more than once per call, or its kernels are tiny."""
+    if res is None or sid not in res.attr_slot_launches:
+        return False
+    n = res.attr_slot_launches[sid]
+    calls = max(len(problem.slots[sid].instances), 1)
+    t = res.attr_slot_us.get(sid, 0.0)
+    return n > 1.5 * calls or (n > 0 and t / n < TINY_KERNEL_US)
+
+
+def runtime_text(res: Optional[EvalResult], sid: str, problem: SlotProblem) -> str:
+    """Prompt lines: how the partition runs end to end and what this slot's launches cost."""
+    if res is None or not res.deployed_us:
+        return ""
+    rt = partition_runtime(res)
+    how = "CUDA-graph replay of the whole partition" if rt["e2e_basis"] == "graph" else "eager launches"
+    lines = [f"Reward: the END-TO-END partition time as deployed ({how}): {rt['e2e_us']:.1f} us per forward pass."]
+    if rt["kernel_us"] is not None and rt["launches"]:
+        lines.append(f"Of that, kernels take {rt['kernel_us']:.1f} us in {rt['launches']:.0f} launches; launch and idle "
+                     f"overhead is {rt['e2e_us'] - rt['kernel_us']:.1f} us as deployed and "
+                     f"{rt['launch_overhead_us'] or 0.0:.1f} us ({100 * (rt['launch_overhead_frac'] or 0.0):.0f}%) "
+                     f"when launched eagerly.")
+    n = res.attr_slot_launches.get(sid)
+    if n is not None:
+        calls = max(len(problem.slots[sid].instances), 1)
+        lines.append(f"This slot: {res.attr_slot_us.get(sid, 0.0):.1f} us of GPU time in {n:.0f} launches "
+                     f"({n / calls:.1f} per call).")
+    if rt["launch_bound"] or slot_launch_bound(res, sid, problem):
+        lines.append("Launch-bound: fewer launches count as much as faster kernels here. Fuse what this slot "
+                     "launches per call into one kernel, replace host loops of small launches with a persistent "
+                     "kernel, and keep the launch configuration small-problem friendly.")
+    if rt["e2e_basis"] == "graph":
+        lines.append("Keep the slot capturable in a CUDA graph (no host sync, allocation or host copy per call): a "
+                     "slot that breaks capture makes the whole partition fall back to eager launches.")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------- agent
 
 @dataclass
 class SlotBest:
     source: str
-    slot_us: float
+    slot_us: float                      # the slot's time: attributed GPU time (e2e reward) or MB_SLOT_US (slot reward)
     impl_id: Optional[str] = None
     techniques: list = field(default_factory=list)
+    event_us: Optional[float] = None    # MB_SLOT_US (events around each op), for the per-slot comparison
 
 
 @dataclass
@@ -513,6 +624,9 @@ class StepLog:
     fix_attempts: int
     seconds: float
     context: dict = field(default_factory=dict)      # what the prompt was given (store tiers, claims)
+    reward_basis: str = "slot"                       # "e2e": end-to-end partition time; "slot": slot time
+    e2e_before: Optional[float] = None               # deployed partition time of the state the step started from
+    e2e_after: Optional[float] = None                # ... with the candidate (paired: before x ratio)
 
 
 class MultiSlotAgent:
@@ -523,8 +637,22 @@ class MultiSlotAgent:
                  confirm_pct: float = 3.0, stall_decay: float = 0.6, bandit: Optional[TechniqueBandit] = None,
                  model_fix: Optional[str] = None, seed: int = 0, logger=None, run_id: Optional[str] = None,
                  problem_id: Optional[str] = None, propose: bool = True, ncu: str = "off",
-                 knowledge_v2: Any = None, router: Optional[ModelRouter] = None):
+                 knowledge_v2: Any = None, router: Optional[ModelRouter] = None, reward: Optional[str] = None,
+                 e2e_accept_pct: Optional[float] = None):
         self.p, self.ev, self.model = problem, evaluator, model
+        # what a step is rewarded and accepted on: "e2e" (default; KERNELBLASTER_MULTISLOT_REWARD):
+        # the deployed partition time (CUDA graph where capturable), paired with the incumbent
+        # where the evaluator can; "slot": the changed slot's own time, as before
+        self.reward = (reward or os.getenv("KERNELBLASTER_MULTISLOT_REWARD", "e2e")).lower()
+        if self.reward not in REWARDS:
+            raise ValueError(f"reward must be one of {REWARDS}, not {self.reward!r}")
+        # an end-to-end gain counts from this percentage of the partition (and is re-measured
+        # in full against the composite before it joins it); smaller moves are neutral
+        self.e2e_accept_pct = float(os.getenv("KERNELBLASTER_MULTISLOT_E2E_ACCEPT_PCT", "1.0")) \
+            if e2e_accept_pct is None else e2e_accept_pct
+        self.e2e_us: Optional[float] = None             # deployed time of the composite best
+        self.runtime_info: dict = {}                    # partition_runtime() of the latest composite run
+        self.last_full: Optional[EvalResult] = None     # latest full run of the composite (attribution)
         # which model runs which call (model_router.py); default: `model` everywhere, `model_fix` for fixes
         self.router = router or ModelRouter({"codegen_simple": model, "codegen_hard": model,
                                              "fix": model_fix or model}, policy=[])
@@ -575,8 +703,31 @@ class MultiSlotAgent:
         return {s: b.source for s, b in self.best.items()}
 
     def _share(self, sid: str) -> float:
+        """The slot's share of the partition: of the deployed time (kernels plus its
+        launches' overhead) with the end-to-end reward, of the slot times otherwise."""
+        if self.reward == "e2e" and self.last_full is not None and self.last_full.attr_slot_us:
+            w = slot_weights(self.last_full)
+            tot = sum(w.values()) or 1.0
+            return w.get(sid, 0.0) / tot
         tot = sum(b.slot_us for b in self.best.values()) or 1.0
         return self.best[sid].slot_us / tot
+
+    def _slot_us(self, res: EvalResult, sid: str) -> Optional[float]:
+        """The slot time the agent tracks: attributed (e2e reward) or event-timed (slot reward)."""
+        return res.slot_time(sid) if self.reward == "e2e" else res.slot_us.get(sid)
+
+    def _eval_kw(self, incumbent: dict) -> dict:
+        """Pair the run with the incumbent where the evaluator can (end-to-end reward)."""
+        pairs = getattr(self.ev, "pairs_incumbent", None)
+        if self.reward != "e2e" or pairs is None or not pairs(self.p):
+            return {}
+        if not hasattr(self, "_takes_incumbent"):       # evaluators written before the parameter existed
+            import inspect
+            try:
+                self._takes_incumbent = "incumbent" in inspect.signature(self.ev.evaluate).parameters
+            except (TypeError, ValueError):
+                self._takes_incumbent = False
+        return {"incumbent": incumbent} if self._takes_incumbent else {}
 
     def _pick_slot(self) -> Optional[str]:
         """Sample a slot ~ time share x stall decay x (1 + exploration bonus).
@@ -698,8 +849,10 @@ class MultiSlotAgent:
         """knowledge-v2 metric adapter for this target's profiler module (ncu | opencl_profile)."""
         return self.tp.profiler.__name__.rsplit(".", 1)[-1]
 
-    def _roofline_input(self, sid: str, slot_us: float):
-        """Manifest bytes/flops of the slot's instances + measured time (knowledge v2 estimate)."""
+    def _roofline_input(self, sid: str, slot_us: float, res: Optional[EvalResult] = None):
+        """Manifest bytes/flops of the slot's instances + measured time (knowledge v2
+        estimate); with a run's attribution (``res``), its measured launches and
+        launch-overhead share."""
         from ..knowledge.v2.metrics import RooflineInput
         byt = fl = 0.0
         work = 0.0
@@ -712,7 +865,13 @@ class MultiSlotAgent:
                 fl += f
                 n += 1
                 work = max(work, float(sum(bufs[x]["numel"] for x in op["outputs"])))
-        return RooflineInput(bytes=byt, flops=fl, time_us=slot_us, work_items=work or None, launches=max(n, 1))
+        launches, lfrac = max(n, 1), None
+        if res is not None and sid in res.attr_slot_launches:
+            launches = max(int(round(res.attr_slot_launches[sid])), 1)
+            ovh = overhead_per_launch(res) * res.attr_slot_launches[sid]
+            lfrac = ovh / max(slot_us + ovh, 1e-9)
+        return RooflineInput(bytes=byt, flops=fl, time_us=slot_us, work_items=work or None, launches=launches,
+                             launch_frac=lfrac)
 
     def _record_outcome(self, **kw) -> Optional[OutcomeRecord]:
         if self.olog is None:
@@ -748,10 +907,14 @@ class MultiSlotAgent:
             raise RuntimeError(f"baseline failed ({base.stage}): {base.error_text()}")
         self.baseline = base
         self.partition_us = base.partition_us
+        self._set_composite(base)
         for sid, code in seeds.items():
-            self.best[sid] = SlotBest(code, base.slot_us.get(sid, 0.0), techniques=[])
-        self.log.info(f"[{self.p.name}] baseline {base.partition_us:.1f} us; slots "
-                      + ", ".join(f"{s}={u:.1f}" for s, u in sorted(base.slot_us.items(), key=lambda kv: -kv[1])))
+            self.best[sid] = SlotBest(code, self._slot_us(base, sid) or 0.0, techniques=[],
+                                      event_us=base.slot_us.get(sid))
+        self.log.info(f"[{self.p.name}] baseline {base.partition_us:.1f} us"
+                      + (f", end to end {base.deployed_us:.1f} us ({base.e2e_basis or 'eager'}, {base.runtime})"
+                         if self.reward == "e2e" else "") + "; slots "
+                      + ", ".join(f"{s}={b.slot_us:.1f}" for s, b in sorted(self.best.items(), key=lambda kv: -kv[1].slot_us)))
         # seed from the implementation store where it has this op+shapes on this arch
         trial = dict(seeds)
         from_store = {}
@@ -762,16 +925,33 @@ class MultiSlotAgent:
                 from_store[sid] = r["seed"]
         if from_store:
             self.log.info(f"[{self.p.name}] store seeds for {sorted(from_store)}")
-            res = await self.ev.evaluate(self.p, trial, "store_seeds")
+            res = await self.ev.evaluate(self.p, trial, "store_seeds", **self._eval_kw(seeds))
+            taken = []
             for sid, rec in from_store.items():
                 ok = res.ok or res.slot_checks.get(sid, {}).get("ok", False)
-                us = res.slot_us.get(sid)
+                us = self._slot_us(res, sid)
                 if ok and us is not None and us < self.best[sid].slot_us:
                     self.log.info(f"[{self.p.name}] {sid}: store seed {rec.id} {us:.1f} us "
                                   f"(hand {self.best[sid].slot_us:.1f})")
-                    self.best[sid] = SlotBest(trial[sid], us, rec.id, list(rec.techniques))
+                    self.best[sid] = SlotBest(trial[sid], us, rec.id, list(rec.techniques),
+                                              event_us=res.slot_us.get(sid))
+                    taken.append(sid)
             if res.ok and res.partition_us:
                 self.partition_us = min(self.partition_us, res.partition_us)
+            if self.reward == "e2e" and taken:
+                # the seeded composite must not be slower end to end than the hand seeds
+                comp = res if res.ok and len(taken) == len(from_store) else \
+                    await self.ev.evaluate(self.p, self._sources(), "store_composite", **self._eval_kw(seeds))
+                gain, _ = e2e_gain(comp, base.deployed_us)
+                if comp.ok and gain is not None and gain >= 0:
+                    self._set_composite(comp)
+                    for sid in taken:
+                        self.best[sid].slot_us = self._slot_us(comp, sid) or self.best[sid].slot_us
+                else:
+                    self.log.info(f"[{self.p.name}] store seeds not faster end to end ({gain}); hand seeds kept")
+                    for sid in taken:
+                        self.best[sid] = SlotBest(seeds[sid], self._slot_us(base, sid) or 0.0, techniques=[],
+                                                  event_us=base.slot_us.get(sid))
         await self._profile(self._sources(), "baseline")
         for sid, b in self.best.items():
             if b.impl_id is None:
@@ -779,14 +959,22 @@ class MultiSlotAgent:
                                         base.slot_checks.get(sid, {}).get("rel_err"))
         return base
 
+    def _set_composite(self, res: EvalResult) -> None:
+        """A full run of the composite best: its deployed time and attribution."""
+        self.e2e_us = res.deployed_us
+        self.last_full = res
+        self.runtime_info = partition_runtime(res)
+        self.composite_version = getattr(self, "composite_version", 0) + 1
+
     # ---- one step
-    async def _step(self, ridx: int, step: int, cur: dict[str, str], cur_us: dict[str, float]) -> None:
+    async def _step(self, ridx: int, step: int, cur: dict[str, str], cur_us: dict[str, float],
+                    meta: Optional[dict] = None) -> None:
         """One step inside a telemetry ``step`` span; its breakdown goes into the step's context."""
         n = len(self.steps_log)
         with tel.span("step", collect=True, laps=True, rollout=ridx, step=step) as sp:
             tel.count("step")
             try:
-                await self._step_body(ridx, step, cur, cur_us)
+                await self._step_body(ridx, step, cur, cur_us, meta)
             finally:
                 tel.end_laps(sp)
         summ = tel.ctx_summary(sp)
@@ -796,8 +984,15 @@ class MultiSlotAgent:
                     s.context["telemetry"] = summ
                     break
 
-    async def _step_body(self, ridx: int, step: int, cur: dict[str, str], cur_us: dict[str, float]) -> None:
+    async def _step_body(self, ridx: int, step: int, cur: dict[str, str], cur_us: dict[str, float],
+                         meta: Optional[dict] = None) -> None:
+        """One step on rollout state ``cur`` (sources), ``cur_us`` (slot times) and
+        ``meta`` (``e2e``: its deployed time; ``ev``: its event-timed slot times)."""
         t0 = time.time()
+        if meta is None:
+            meta = {"e2e": self.e2e_us, "ev": {s: b.event_us for s, b in self.best.items()}}
+        e2e = self.reward == "e2e"
+        info = self.last_full if e2e else None
         tel.lap("knowledge.select")
         async with self._lock:
             sid = self._pick_slot()
@@ -809,7 +1004,7 @@ class MultiSlotAgent:
             state = prof_before.get("state") or state    # measured bound beats the roofline estimate
         choice = cls = vec_before = None
         if self.kv is not None:
-            vec_before = self.kv.vector(self._tkey, estimate=self._roofline_input(sid, cur_us[sid]),
+            vec_before = self.kv.vector(self._tkey, estimate=self._roofline_input(sid, cur_us[sid], info),
                                         profile=prof_before, profile_kind=self._profile_kind)
             cls = self.kv.classify(vec_before, target_key=self._tkey, op_class=slot.op_class, dtype=self.p.dtype)
             choice = self.kv.select(target_key=self._tkey, op_class=slot.op_class, dtype=self.p.dtype, cls=cls,
@@ -817,7 +1012,8 @@ class MultiSlotAgent:
             tech, desc, state = choice.item_id, choice.desc, cls.label()
             nums = {**nums, **cls.decided_by}
         else:
-            techs = techniques_for(slot.op_class, self.tp.techniques)
+            lb = e2e and (self.runtime_info.get("launch_bound") or slot_launch_bound(info, sid, self.p))
+            techs = techniques_for(slot.op_class, self.tp.techniques, launch_bound=bool(lb))
             # fp16 arms are their own keys (half2 / tensor-core techniques pay off
             # differently); fp32 keys keep their names, and the cross-key prior
             # still seeds an untried fp16 arm from its fp32 record
@@ -843,7 +1039,7 @@ class MultiSlotAgent:
         else:
             ktext, tried = self._knowledge(sid, state, tech)
         tel.lap("prompt.build")
-        part_us = sum(cur_us.values())
+        part_us = (meta.get("e2e") if e2e else None) or sum(cur_us.values())
         neigh = [(n, self.p.slots[n].signature) for n in self.p.neighbours(sid)]
         best_note = (f"Best verified so far for this slot: {self.best[sid].slot_us:.1f} us."
                      if self.best[sid].slot_us < cur_us[sid] else "")
@@ -852,7 +1048,8 @@ class MultiSlotAgent:
                                       slot_us=cur_us[sid], partition_us=part_us, neighbours=neigh,
                                       examples=examples, adapt=adapt, knowledge_text=ktext,
                                       already_tried=tried, best_note=best_note,
-                                      profile_text=self.tp.profiler.render(prof_before) if prof_before else "")
+                                      profile_text=self.tp.profiler.render(prof_before) if prof_before else "",
+                                      runtime_text=runtime_text(info, sid, self.p) if e2e else "")
         tdef = self.kv.ontology.techniques.get(tech) if self.kv is not None else None
         model, role, why = self.router.codegen(technique=tech, tier=technique_tier(tech, tdef),
                                                share=self._share(sid), stall=self.slot_stall[sid],
@@ -860,7 +1057,7 @@ class MultiSlotAgent:
         text = await self._llm(msgs, model, role)
         tel.lap("candidate", technique=tech)
         code = extract_code(text)
-        fix_models = []
+        fix_models, capture_defects = [], []
         fixes, res, status = 0, None, None
         before = cur_us[sid]
         while True:
@@ -870,8 +1067,11 @@ class MultiSlotAgent:
                 # only `sid` changed: isolated checks of its ops (the partition outputs are
                 # always checked), screening budgets; a win is re-measured below in full
                 res = await self.ev.evaluate(self.p, {**cur, sid: code}, f"r{ridx}_s{step}_{sid}_{tech}_f{fixes}",
-                                             **step_eval_options(sid))
-            if res.ok or fixes >= self.max_fix or code is None:
+                                             **step_eval_options(sid), **self._eval_kw(cur))
+            # a verified candidate that breaks CUDA-graph capture of a partition that was
+            # capturable is a fixable defect (it costs the graph replay end to end)
+            capture = self._capture_defect(res)
+            if (res.ok and not capture) or fixes >= self.max_fix or code is None:
                 break
             other_bad = [s for s in res.failing_slots() if s != sid]
             if other_bad:                                         # shouldn't happen: only `sid` changed
@@ -879,24 +1079,31 @@ class MultiSlotAgent:
             fixes += 1
             fmodel, frole = self.router.fix(attempt=fixes, max_attempts=self.max_fix)
             fix_models.append(fmodel)
+            if capture:
+                capture_defects.append(res.graph_skip)
             text = await self._llm(build_fix_messages(problem=self.p, sid=sid, source=code,
-                                                      error=res.error_text(),
+                                                      error=capture or res.error_text(),
                                                       pitfalls=self._pitfalls(sid, tech)), fmodel, frole)
             new = extract_code(text)
             if not new or new == code:
                 break
             code = new
-        after = res.slot_us.get(sid) if res.ok else None
-        if res.ok and after is not None and after < before * (1 - self.confirm_pct / 100):
-            # confirm a win with a second, full measurement (every check; timing noise on shared GPUs)
-            res2 = await self.ev.evaluate(self.p, {**cur, sid: code}, f"r{ridx}_s{step}_{sid}_confirm")
-            if res2.ok and sid in res2.slot_us:
-                after = max(after, res2.slot_us[sid])
-        if res.ok:
-            speedup = before / after if after else None
-            status = classify_speedup(speedup)
-            reward = max(-1.0, min(1.0, (before - after) / max(part_us, 1e-9)))
+        if e2e:
+            d = await self._decide_e2e(ridx, step, sid, tech, code, res, before, cur, meta)
+            after, speedup, status, reward = d["after"], d["speedup"], d["status"], d["reward"]
         else:
+            d = None
+            after = res.slot_us.get(sid) if res.ok else None
+            if res.ok and after is not None and after < before * (1 - self.confirm_pct / 100):
+                # confirm a win with a second, full measurement (every check; timing noise on shared GPUs)
+                res2 = await self.ev.evaluate(self.p, {**cur, sid: code}, f"r{ridx}_s{step}_{sid}_confirm")
+                if res2.ok and sid in res2.slot_us:
+                    after = max(after, res2.slot_us[sid])
+            if res.ok:
+                speedup = before / after if after else None
+                status = classify_speedup(speedup)
+                reward = max(-1.0, min(1.0, (before - after) / max(part_us, 1e-9)))
+        if not res.ok:
             speedup = None
             status = {"compile": COMPILE_ERROR, "run": RUNTIME_ERROR}.get(res.stage, WRONG_OUTPUT)
             reward = -0.05 if status == COMPILE_ERROR else -0.1
@@ -904,8 +1111,8 @@ class MultiSlotAgent:
         if self.kv is None:
             self.bandit.update(key, tech, reward)
         prof_after = None
-        if res.ok and (self.ncu == "all" or (self.ncu == "best" and after < self.best[sid].slot_us *
-                                                (1 - self.confirm_pct / 100))):
+        if res.ok and (self.ncu == "all" or (self.ncu == "best" and (
+                d["merged"] if d is not None else after < self.best[sid].slot_us * (1 - self.confirm_pct / 100)))):
             by = await self._profile({**cur, sid: code}, f"r{ridx}_s{step}_{sid}")
             prof_after = by.get(sid)
         impl_id, parent = None, self.best[sid].impl_id
@@ -913,15 +1120,25 @@ class MultiSlotAgent:
         if res.ok:
             impl_id = self._store(sid, code, after, before, self.best[sid].techniques + [tech], parent,
                                   res.slot_checks.get(sid, {}).get("rel_err"))
-            if after <= before * 1.05:              # keep improving/neutral moves; revert regressions
+            keep = d["keep"] if d is not None else after <= before * 1.05   # keep improving/neutral moves
+            if keep:
                 cur[sid], cur_us[sid] = code, after
+                meta["ev"][sid] = res.slot_us.get(sid)
+                if d is not None and d["e2e_after"]:
+                    meta["e2e"] = d["e2e_after"]
         async with self._lock:
-            if res.ok and after < self.best[sid].slot_us * (1 - self.confirm_pct / 100):
-                self.best[sid] = SlotBest(code, after, impl_id, self.best[sid].techniques + [tech])
+            if d is not None:
+                merged = d["merged"] and self._merge(sid, code, d, impl_id, tech)
+            else:
+                merged = res.ok and after < self.best[sid].slot_us * (1 - self.confirm_pct / 100)
+                if merged:
+                    self.best[sid] = SlotBest(code, after, impl_id, self.best[sid].techniques + [tech],
+                                              event_us=res.slot_us.get(sid))
+            if merged:
                 self.slot_stall[sid] = 0
                 tel.count("win")
                 self.log.info(f"[{self.p.name}] r{ridx} s{step}: {sid} {before:.1f} -> {after:.1f} us "
-                              f"via {tech} (new slot best)")
+                              f"via {tech} (new slot best" + (f", end to end -{100 * d['reward']:.1f}%)" if d else ")"))
             else:
                 self.slot_stall[sid] += 1
         okw = dict(sid=sid, technique=tech, status=status, state_before=state,
@@ -929,17 +1146,20 @@ class MultiSlotAgent:
                    metric_before=before, metric_after=after, speedup=speedup,
                    metrics_delta=self.tp.profiler.delta(prof_before, prof_after),
                    error=None if res.ok else res.error_text(1500),
-                   diff_summary=dsum, impl_id=impl_id, parent_impl_id=parent)
+                   diff_summary=dsum, impl_id=impl_id, parent_impl_id=parent,
+                   **(d["outcome"] if d is not None else {"timing_basis": "slot_events"}))
         v2 = None
         if self.kv is not None:
-            vec_after = (self.kv.vector(self._tkey, estimate=self._roofline_input(sid, after), profile=prof_after,
-                                        profile_kind=self._profile_kind) if res.ok and after else None)
+            vec_after = (self.kv.vector(self._tkey, estimate=self._roofline_input(sid, after, res if e2e else None),
+                                        profile=prof_after, profile_kind=self._profile_kind)
+                         if res.ok and after else None)
             try:
                 v2 = self.kv.record(self._outcome(**okw), choice=choice, reward=reward, cls=cls, before=vec_before,
                                     after=vec_after, op_class=slot.op_class, dtype=self.p.dtype,
                                     extra={"lineage": list(self.best[sid].techniques),
                                            "ncu_rules": (prof_before or {}).get("rules", []),
-                                           "diff_excerpt": diff_excerpt(cur[sid], code) if code else ""})
+                                           "diff_excerpt": diff_excerpt(cur[sid], code) if code else "",
+                                           **({"e2e": d["ctx"]} if d is not None else {})})
             except Exception as e:                                # knowledge must never break a step
                 self.log.warning(f"knowledge-v2 record failed: {e!r}")
         else:
@@ -951,21 +1171,113 @@ class MultiSlotAgent:
                "model_why": why}
         if fix_models:
             ctx["fix_models"] = fix_models
+        if capture_defects or (res is not None and self._capture_defect(res)):
+            ctx["graph_capture"] = {"defects": capture_defects, "final_skip": res.graph_skip if res else None}
+        if d is not None:
+            ctx["e2e"] = d["ctx"]
         if v2 is not None:
             ctx.update(kind=choice.kind, est=round(choice.est, 4), evidence=choice.evidence,
                        explore=choice.explore, mechanism=v2["mechanism"]["label"], chain=cls.chain)
         self.steps_log.append(StepLog(ridx, step, sid, tech, status, before, after, reward, fixes,
-                                      round(time.time() - t0, 1), ctx))
+                                      round(time.time() - t0, 1), ctx, reward_basis=self.reward,
+                                      e2e_before=d["ctx"]["before_us"] if d else None,
+                                      e2e_after=d["e2e_after"] if d else None))
         self.log.info(f"[{self.p.name}] r{ridx} s{step}: {sid} {tech} -> {status}"
                       + (f" {before:.1f}->{after:.1f} us" if after else "") + f" (fixes={fixes})")
+
+    def _capture_defect(self, res: Optional[EvalResult]) -> Optional[str]:
+        """The fix-loop error text when a verified candidate made the partition fall back
+        from a CUDA graph to eager launches (the composite best is capturable), else None."""
+        if self.reward != "e2e" or res is None or not res.ok or not res.graph_skip:
+            return None
+        if self.runtime_info.get("e2e_basis") != "graph":
+            return None
+        return ("The rewritten slot is correct, but the partition can no longer be captured into a CUDA graph: "
+                f"{res.graph_skip}. The deployed runtime replays the whole partition as a graph, so this costs the "
+                "graph replay end to end. Make every call capturable: no cudaDeviceSynchronize/cudaStreamSynchronize, "
+                "no cudaMalloc/cudaFree or host copies per call (allocate scratch once, lazily, outside the timed "
+                "path), launch on the default stream only.")
+
+    async def _decide_e2e(self, ridx: int, step: int, sid: str, tech: str, code: Optional[str], res: EvalResult,
+                          before: float, cur: dict, meta: dict) -> dict:
+        """End-to-end decision for a verified candidate: reward = fraction of the
+        deployed partition time saved (paired with the rollout's state where the
+        evaluator can). A gain of ``e2e_accept_pct`` or more is re-measured with
+        every check against the composite best, and joins it if it holds there
+        too. Also records what the per-slot rule (slot time vs ``confirm_pct``)
+        would have decided on the same runs (``ctx["slot_rule"]``)."""
+        acc = self.e2e_accept_pct / 100.0
+        out = {"after": None, "speedup": None, "status": None, "reward": 0.0, "keep": False, "merged": False,
+               "e2e_after": None, "outcome": {}, "ctx": {}}
+        ev_before = meta["ev"].get(sid)
+        ctx = out["ctx"] = {"before_us": meta.get("e2e"), "basis": res.e2e_basis, "runtime": res.runtime,
+                            "slot_attr_before": before}
+        if not res.ok:
+            return out
+        after = self._slot_us(res, sid)
+        gain, how = e2e_gain(res, meta.get("e2e"))
+        ctx.update(gain=None if gain is None else round(gain, 5), pairing=how, after_us=res.deployed_us,
+                   ratio=res.e2e_ratio, slot_attr_after=after, graph_skip=res.graph_skip,
+                   launches=res.attr_slot_launches.get(sid))
+        g = gain if gain is not None else 0.0
+        res2, gain_c = None, None
+        if gain is not None and gain >= acc:
+            comp = self._sources()
+            out["base_src"] = comp[sid]
+            res2 = await self.ev.evaluate(self.p, {**comp, sid: code}, f"r{ridx}_s{step}_{sid}_confirm",
+                                          **self._eval_kw(comp))
+            if res2.ok:
+                gain_c, _ = e2e_gain(res2, self.e2e_us)
+                if gain_c is not None:
+                    g = min(g, gain_c)
+                    after = max(after or 0.0, self._slot_us(res2, sid) or 0.0) or after
+            ctx.update(confirm_ok=res2.ok, confirm_gain=None if gain_c is None else round(gain_c, 5),
+                       confirm_us=res2.deployed_us if res2.ok else None)
+        reward = max(-1.0, min(1.0, g))
+        status = IMPROVED if g >= acc else REGRESSED if g <= -acc else NEUTRAL
+        e2e_after = res.deployed_us
+        if how == "paired" and meta.get("e2e"):
+            e2e_after = meta["e2e"] * (1.0 - (gain or 0.0))     # on the scale of the state's own time
+        out.update(after=after, speedup=(before / after) if after else None, status=status, reward=reward,
+                   keep=g > -acc / 2, e2e_after=e2e_after,
+                   merged=bool(res2 is not None and res2.ok and gain_c is not None and gain_c >= acc and g >= acc),
+                   res2=res2)
+        # the per-slot rule on the same runs (what the previous reward would have done)
+        ev_after = res.slot_us.get(sid)
+        if res2 is not None and res2.ok and sid in res2.slot_us and ev_after is not None:
+            ev_after = max(ev_after, res2.slot_us[sid])
+        part = sum(v for v in meta["ev"].values() if v) or 1.0
+        ctx["slot_rule"] = None if ev_before is None or ev_after is None else {
+            "before_us": ev_before, "after_us": ev_after,
+            "reward": round(max(-1.0, min(1.0, (ev_before - ev_after) / part)), 5),
+            "accept": ev_after < ev_before * (1 - self.confirm_pct / 100)}
+        ctx["accept"] = out["merged"]
+        out["outcome"] = {"timing_basis": f"e2e_{res.e2e_basis or 'eager'}", "e2e_before": meta.get("e2e"),
+                          "e2e_after": e2e_after, "partition_effect": round(g, 6)}
+        return out
+
+    def _merge(self, sid: str, code: str, d: dict, impl_id: Optional[str], tech: str) -> bool:
+        """Join a confirmed end-to-end win to the composite (under the lock). A
+        change of the same slot by another rollout since the confirm run started
+        wins (it was measured against a composite this one never saw)."""
+        res2 = d.get("res2")
+        if res2 is None:
+            return False
+        if self.best[sid].source != d.get("base_src"):
+            return False
+        self.best[sid] = SlotBest(code, self._slot_us(res2, sid) or d["after"], impl_id,
+                                  self.best[sid].techniques + [tech], event_us=res2.slot_us.get(sid))
+        self._set_composite(res2)
+        return True
 
     async def _rollout(self, ridx: int):
         async with self._lock:
             cur = {s: b.source for s, b in self.best.items()}
             cur_us = {s: b.slot_us for s, b in self.best.items()}
+            meta = {"e2e": self.e2e_us, "ev": {s: b.event_us for s, b in self.best.items()}}
         for step in range(self.steps):
             try:
-                await self._step(ridx, step, cur, cur_us)
+                await self._step(ridx, step, cur, cur_us, meta)
             except Exception as e:
                 self.log.error(f"[{self.p.name}] rollout {ridx} step {step} failed: {e!r}")
             if self.semantic is not None:
@@ -994,14 +1306,16 @@ class MultiSlotAgent:
         if self.baseline is None:
             await self.initialize()
         await asyncio.gather(*[self._rollout(i) for i in range(self.rollouts)])
-        final = await self.ev.evaluate(self.p, self._sources(), "final_composite")
+        final = await self.ev.evaluate(self.p, self._sources(), "final_composite",
+                                       **self._eval_kw(self.p.seed_sources()))
         if not final.ok:
             # a composition broke something: fall back slot by slot to the baseline seed
             self.log.warning(f"[{self.p.name}] composite failed ({final.error_text(300)}); repairing")
             seeds = self.p.seed_sources()
             for sid in final.failing_slots() or list(self.best):
-                self.best[sid] = SlotBest(seeds[sid], self.baseline.slot_us.get(sid, 0.0))
-            final = await self.ev.evaluate(self.p, self._sources(), "final_repaired")
+                self.best[sid] = SlotBest(seeds[sid], self._slot_us(self.baseline, sid) or 0.0,
+                                          event_us=self.baseline.slot_us.get(sid))
+            final = await self.ev.evaluate(self.p, self._sources(), "final_repaired", **self._eval_kw(seeds))
         result = self._write_result(final)
         if final.ok and self.propose:
             props = propose_fusions(self.p, final, self.arch, arch_label=self.arch_label)
@@ -1049,9 +1363,20 @@ class MultiSlotAgent:
             "baseline_partition_us": base.partition_us, "final_ok": final.ok,
             "final_partition_us": final.partition_us, "op_us": final.op_us,
             "speedup": (base.partition_us / final.partition_us) if final.ok and final.partition_us else None,
+            # end to end as deployed (CUDA graph where capturable): the reward's basis
+            "reward": self.reward,
+            "baseline_e2e_us": base.deployed_us, "final_e2e_us": final.deployed_us if final.ok else None,
+            "e2e_speedup": (base.deployed_us / final.deployed_us) if final.ok and final.deployed_us and
+            base.deployed_us else None,
+            "final_e2e_ratio": final.e2e_ratio,           # final vs the seeds, paired (persistent host)
+            "runtime": {"baseline": partition_runtime(base), "final": partition_runtime(final),
+                        **({"evaluator": self.ev.host_stats()} if hasattr(self.ev, "host_stats") else {})},
+            "attr_op_us": final.attr_op_us,
             "slots": {sid: {"baseline_us": base.slot_us.get(sid), "final_us": final.slot_us.get(sid),
                             "best_us": b.slot_us, "impl_id": b.impl_id, "techniques": b.techniques,
-                            "rel_err": final.slot_checks.get(sid, {}).get("rel_err")}
+                            "rel_err": final.slot_checks.get(sid, {}).get("rel_err"),
+                            "baseline_attr_us": base.attr_slot_us.get(sid), "final_attr_us": final.attr_slot_us.get(sid),
+                            "launches": final.attr_slot_launches.get(sid)}
                       for sid, b in self.best.items()},
             "steps": [asdict(s) for s in self.steps_log],
             "bandit": self.bandit.to_json(),

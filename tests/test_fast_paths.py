@@ -42,7 +42,8 @@ needs_cmake = pytest.mark.skipif(ARCH is None or shutil.which("cmake") is None,
 
 def _stable(text: str) -> list[str]:
     """Driver output without the timing lines."""
-    return [l for l in text.splitlines() if not re.match(r"MB_(SLOT|OP|PARTITION)_US|MB_PARTITION_DIST|MB_PHASE_MS", l)]
+    return [l for l in text.splitlines()
+            if not re.match(r"MB_(SLOT|OP|PARTITION|E2E|ATTR_SLOT|ATTR_OP|ATTR_SUM|LAUNCH_OVERHEAD)_US|MB_PARTITION_DIST|MB_PHASE_MS", l)]
 
 
 # ---------------------------------------------------------------- cache
@@ -187,9 +188,9 @@ def _evaluate(ev, p, sources, tag="t"):
 @needs_gpu
 def test_incremental_build_matches_assembled(tmp_path):
     p = SlotProblem(FIX)
-    mono = _evaluate(LocalEvaluator(ARCH, work_root=tmp_path / "m", incremental=False, keep=True), p,
+    mono = _evaluate(LocalEvaluator(ARCH, work_root=tmp_path / "m", runtime="process", incremental=False, keep=True), p,
                      p.seed_sources())
-    inc_ev = LocalEvaluator(ARCH, work_root=tmp_path / "i", incremental=True, keep=True)
+    inc_ev = LocalEvaluator(ARCH, work_root=tmp_path / "i", runtime="process", incremental=True, keep=True)
     inc = _evaluate(inc_ev, p, p.seed_sources())
     assert mono.ok and inc.ok
     assert _stable(mono.log) == _stable(inc.log)
@@ -211,7 +212,7 @@ def _own_fixture(tmp_path) -> SlotProblem:
 @needs_gpu
 def test_incremental_cache_invalidation(tmp_path):
     p = _own_fixture(tmp_path)
-    ev = LocalEvaluator(ARCH, work_root=tmp_path / "w", incremental=True)
+    ev = LocalEvaluator(ARCH, work_root=tmp_path / "w", runtime="process", incremental=True)
     seeds = p.seed_sources()
     assert _evaluate(ev, p, seeds).ok
     n_units = len(p.order) + 2                       # slots + tail + driver
@@ -239,7 +240,7 @@ def test_incremental_falls_back_to_assembled_tu(tmp_path):
     assert "fmaxf(x[i], 0.0f)" in src["relu"]
     src = {**src, "conv2d": f'#include "{hdr}"\n' + src["conv2d"],
            "relu": src["relu"].replace("fmaxf(x[i], 0.0f)", "fmaxf(x[i], TEST_ZERO)")}
-    ev = LocalEvaluator(ARCH, work_root=tmp_path / "w", incremental=True, keep=True)
+    ev = LocalEvaluator(ARCH, work_root=tmp_path / "w", runtime="process", incremental=True, keep=True)
     r = _evaluate(ev, p, src)
     assert r.ok
     assert list((tmp_path / "w").glob("*/kernels.cu"))              # assembled build ran
@@ -251,7 +252,7 @@ def test_incremental_falls_back_to_assembled_tu(tmp_path):
 @needs_gpu
 def test_concurrent_incremental_builds_share_cache(tmp_path):
     p = SlotProblem(FIX)
-    ev = LocalEvaluator(ARCH, work_root=tmp_path / "w", incremental=True, max_parallel=4)
+    ev = LocalEvaluator(ARCH, work_root=tmp_path / "w", runtime="process", incremental=True, max_parallel=4)
     seeds = p.seed_sources()
     cands = [{**seeds, sid: seeds[sid] + f"\n// c{i}\n"} for i, sid in enumerate(p.order)]
 
