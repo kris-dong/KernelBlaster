@@ -45,7 +45,7 @@ from ..knowledge import ncu as ncu_mod
 from ..knowledge.impl_store import ImplStore, shape_bucket
 from ..knowledge.outcomes import (COMPILE_ERROR, RUNTIME_ERROR, WRONG_OUTPUT, OutcomeLog,
                                   OutcomeRecord, classify_speedup)
-from ..knowledge.slots import EvalResult, Evaluator, SlotProblem
+from ..knowledge.slots import EvalResult, Evaluator, SlotProblem, step_eval_options
 from .cost_tracker import lookup_pricing
 from .model_router import ModelRouter, technique_tier
 from .utils import generate_code_retry
@@ -841,7 +841,10 @@ class MultiSlotAgent:
             if code is None:
                 res = EvalResult(ok=False, stage="compile", errors=[f"no ```{self.tp.fence} block in the response"])
             else:
-                res = await self.ev.evaluate(self.p, {**cur, sid: code}, f"r{ridx}_s{step}_{sid}_{tech}_f{fixes}")
+                # only `sid` changed: isolated checks of its ops (the partition outputs are
+                # always checked), screening budgets; a win is re-measured below in full
+                res = await self.ev.evaluate(self.p, {**cur, sid: code}, f"r{ridx}_s{step}_{sid}_{tech}_f{fixes}",
+                                             **step_eval_options(sid))
             if res.ok or fixes >= self.max_fix or code is None:
                 break
             other_bad = [s for s in res.failing_slots() if s != sid]
@@ -859,7 +862,7 @@ class MultiSlotAgent:
             code = new
         after = res.slot_us.get(sid) if res.ok else None
         if res.ok and after is not None and after < before * (1 - self.confirm_pct / 100):
-            # confirm a win with a second measurement (timing noise on shared GPUs)
+            # confirm a win with a second, full measurement (every check; timing noise on shared GPUs)
             res2 = await self.ev.evaluate(self.p, {**cur, sid: code}, f"r{ridx}_s{step}_{sid}_confirm")
             if res2.ok and sid in res2.slot_us:
                 after = max(after, res2.slot_us[sid])
