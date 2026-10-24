@@ -2,8 +2,8 @@
 import random
 from pathlib import Path
 
-from kernelblaster.agents.opt_multislot import (TechniqueBandit, extract_code, propose_fusions,
-                                                slot_state)
+from kernelblaster.agents.opt_multislot import (TechniqueBandit, _efficiency, extract_code, propose_fusions,
+                                                propose_splits, slot_state)
 from kernelblaster.knowledge.impl_store import ImplStore, shape_bucket
 from kernelblaster.knowledge.slots import EvalResult, SlotProblem, parse_driver_output, wrap_slot
 
@@ -83,3 +83,30 @@ def test_store_retrieval_tiers(tmp_path):
     out = s.export_winners(tmp_path / "w")
     import json
     assert {w["op"] for w in json.loads(out.read_text())["winners"]} == {"linear", "bmm"}
+
+
+def test_split_proposals_from_per_op_times():
+    p = SlotProblem(FIX)
+    # conv1 and conv2 fall in different shape buckets; conv2 runs far below conv1's efficiency
+    r = EvalResult(ok=True, stage="ok", partition_us=100.0, slot_us={"conv2d": 60.0},
+                   op_us={"conv1": 10.0, "conv2": 50.0})
+    props = propose_splits(p, r, "75")
+    assert [x["slot"] for x in props] == ["conv2d"]
+    g = {x["bucket"]: x for x in props[0]["groups"]}
+    assert len(g) == 2 and sorted(o for x in g.values() for o in x["ops"]) == ["conv1", "conv2"]
+    lo = min(g.values(), key=lambda x: x["eff_pct"])
+    assert lo["ops"] == ["conv2"] and props[0]["evidence"]["est_gain_pct"] > 2.0
+    # no per-op times (an older driver): no split proposals
+    assert propose_splits(p, EvalResult(ok=True, stage="ok", partition_us=100.0, slot_us={"conv2d": 60.0}), "75") == []
+    # times that match each group's work: nothing to gain
+    ops = {o["name"]: o for o in p.manifest["ops"]}
+    c1, c2 = (_efficiency(p, [ops[n]], 1.0, "75") for n in ("conv1", "conv2"))   # efficiency ~ 1 / time
+    eff = {"conv1": 10.0, "conv2": 10.0 * c2 / c1}
+    assert propose_splits(p, EvalResult(ok=True, stage="ok", partition_us=100.0, op_us=eff), "75") == []
+
+
+def test_op_us_lines_and_fused_shapes():
+    r = parse_driver_output("MB_PARTITION_US 5.0 reps=3\nMB_SLOT_US relu 2.0\nMB_OP_US relu#1 1.5\npassed\n")
+    assert r.ok and r.op_us == {"relu#1": 1.5}
+    fused = {"a": {"N": 1, "IC": 64, "OC": 64}, "b": {"N": 1, "C": 64, "H": 8, "W": 8}}
+    assert shape_bucket("conv", fused) == shape_bucket("conv", fused["a"])
