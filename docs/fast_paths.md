@@ -328,11 +328,12 @@ run at a time either way.
 
 ## Remaining bottlenecks
 
-- **Multi-slot driver runtime** on whole-model partitions: SwinV2 takes 22–52 s per run with
-  naive seed kernels, made up of partition timing reps, per-op timing and the isolated-op
-  checks with CPU `max_finite` scans. This lives in ModelBlaster's generated driver. Next
-  steps: let the driver check and time only the changed slot's ops plus the partition (an env
-  var from `ServerEvaluator`/`LocalEvaluator`), and lower `MB_TIME_MS` for screening runs.
+- **Multi-slot driver runtime** on whole-model partitions (addressed; ModelBlaster
+  `docs/gpu_harness_perf.md`): SwinV2 took 21–26 s per run on an L40S with naive seed kernels,
+  17 s of it in the isolated-op checks (every weight re-uploaded per op). The new driver takes
+  3.8 s for a full run. An agent step now evaluates with `MB_ONLY_SLOTS=<slot>` and
+  `MB_SCREEN=1` (`knowledge/slots.py` `step_eval_options`), 1.2–1.7 s; confirm and final runs
+  stay full.
 - **nvcc fixed cost** of about 0.7 s per TU with plain flags, or 1.2–1.4 s with the
   CMake-derived flags (LibTorch include paths, `-Xcudafe` options). This is now the floor of a
   native or multi-slot compile.

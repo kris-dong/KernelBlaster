@@ -179,6 +179,7 @@ class EvalResult:
     ok: bool                                   # compiled, ran, every check passed
     stage: str                                 # "compile" | "run" | "check" | "ok"
     partition_us: Optional[float] = None
+    partition_graph_us: Optional[float] = None         # CUDA-graph replay (driver MB_GRAPH=1), else None
     slot_us: dict = field(default_factory=dict)
     op_us: dict = field(default_factory=dict)          # op name -> us (driver MB_OP_US)
     slot_checks: dict = field(default_factory=dict)    # sid -> {"rel_err", "ok"}
@@ -220,6 +221,9 @@ def parse_driver_output(text: str) -> EvalResult:
     m = re.search(r"^MB_PARTITION_US (\S+)", text, re.M)
     if m:
         r.partition_us = float(m.group(1))
+    m = re.search(r"^MB_PARTITION_GRAPH_US (\S+)", text, re.M)
+    if m:
+        r.partition_graph_us = float(m.group(1))
     for m in re.finditer(r"^MB_KERNEL_US (\S+) (\S+) (\S+)", text, re.M):
         r.kernel_us[f"{m.group(1)}/{m.group(2)}"] = float(m.group(3))
     m = re.search(r"^MB_DEVICE (.*)$", text, re.M)
@@ -230,12 +234,46 @@ def parse_driver_output(text: str) -> EvalResult:
     return r
 
 
+# ---------------------------------------------------------------- driver run options
+
+def _env_on(name: str, default: str) -> bool:
+    return os.getenv(name, default).lower() not in ("0", "false", "no", "off", "")
+
+
+def driver_env(only_slots=None, screen: bool = False) -> dict:
+    """Environment for one run of a ModelBlaster CUDA driver (MB docs/gpu_harness_perf.md):
+    ``only_slots`` -> ``MB_ONLY_SLOTS`` (isolated-op checks for those slots'
+    ops only; the partition outputs are still checked, the partition and every
+    op still timed), ``screen`` -> ``MB_SCREEN=1`` (short timing budgets).
+    Drivers that predate these variables ignore them and run in full."""
+    env = {}
+    if only_slots:
+        env["MB_ONLY_SLOTS"] = ",".join(only_slots)
+    if screen:
+        env["MB_SCREEN"] = "1"
+    return env
+
+
+def step_eval_options(sid: str) -> dict:
+    """``evaluate()`` options for a candidate that changes only slot ``sid``
+    (the agent's step; confirm runs and the final composite run in full):
+    isolated checks of its ops only (``KERNELBLASTER_MULTISLOT_ONLY_SLOTS``,
+    default on) and screening budgets (``KERNELBLASTER_MULTISLOT_SCREEN``,
+    default on)."""
+    return {"only_slots": [sid] if _env_on("KERNELBLASTER_MULTISLOT_ONLY_SLOTS", "1") else None,
+            "screen": _env_on("KERNELBLASTER_MULTISLOT_SCREEN", "1")}
+
+
 # ---------------------------------------------------------------- evaluators
 
 class Evaluator:
-    """Compile an assembled candidate with the problem's driver and run it."""
+    """Compile an assembled candidate with the problem's driver and run it.
 
-    async def evaluate(self, problem: SlotProblem, sources: Mapping[str, str], tag: str) -> EvalResult:
+    ``only_slots`` / ``screen``: see :func:`driver_env` (ignored where the
+    driver has no such modes)."""
+
+    async def evaluate(self, problem: SlotProblem, sources: Mapping[str, str], tag: str, *,
+                       only_slots=None, screen: bool = False) -> EvalResult:
         raise NotImplementedError
 
     async def profile(self, problem: SlotProblem, sources: Mapping[str, str], tag: str, slots=None):
@@ -272,10 +310,14 @@ class LocalEvaluator(Evaluator):
     def __init__(self, arch: str = "75", work_root: Optional[Path] = None, nvcc: str = "nvcc",
                  max_parallel: Optional[int] = None, timeout_s: int = 900, keep: bool = False,
                  incremental: Optional[bool] = None, cache_dir: Optional[Path] = None,
-                 build_jobs: Optional[int] = None, gpus=None, pool=None, infra_retries: int = 2):
+                 build_jobs: Optional[int] = None, gpus=None, pool=None, infra_retries: int = 2,
+                 graph: Optional[bool] = None):
         from ..servers.utils.resources import build_limiter
 
         self.arch, self.nvcc, self.timeout_s, self.keep = arch, nvcc, timeout_s, keep
+        # also time the partition as a CUDA graph (MB_PARTITION_GRAPH_US): every
+        # launch on the per-thread default stream so the driver can capture it
+        self.graph = _env_on("KERNELBLASTER_MULTISLOT_GRAPH", "0") if graph is None else graph
         self.work_root = Path(work_root) if work_root else None
         # compiler processes (unit objects, links, assembled builds)
         self._jobs = build_limiter(build_jobs or max_parallel, env="KERNELBLASTER_MULTISLOT_COMPILE_JOBS",
@@ -336,7 +378,11 @@ class LocalEvaluator(Evaluator):
         return work
 
     def _flags(self) -> list[str]:
-        return ["-O3", f"-arch=sm_{self.arch}", "-std=c++17", "-lineinfo"]
+        return ["-O3", f"-arch=sm_{self.arch}", "-std=c++17", "-lineinfo",
+                *(["--default-stream", "per-thread"] if getattr(self, "graph", False) else [])]
+
+    def _run_env(self, only_slots=None, screen: bool = False) -> dict:
+        return {**driver_env(only_slots, screen), **({"MB_GRAPH": "1"} if getattr(self, "graph", False) else {})}
 
     def _build_cache(self, problem):
         from ..servers.utils.build_cache import BuildCache
@@ -410,7 +456,7 @@ class LocalEvaluator(Evaluator):
         (work / "kernels.cu").write_text(problem.assemble(sources))
         async with self._sem:
             proc = await asyncio.create_subprocess_exec(
-                self.nvcc, "-O3", f"-arch=sm_{self.arch}", "-std=c++17", "-lineinfo", "-o", str(work / "problem"),
+                self.nvcc, *self._flags(), "-o", str(work / "problem"),
                 str(work / "kernels.cu"), str(problem.driver_path),
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
             out, _ = await asyncio.wait_for(proc.communicate(), self.timeout_s)
@@ -438,13 +484,13 @@ class LocalEvaluator(Evaluator):
             return None
         return out.decode(errors="replace")
 
-    async def evaluate(self, problem, sources, tag):
+    async def evaluate(self, problem, sources, tag, *, only_slots=None, screen=False):
         work = self._workdir(problem, tag)
         try:
             bad = await self._build(problem, sources, work)
             if bad is not None:
                 return bad
-            text = await self._timed_run(problem, work / "problem")
+            text = await self._timed_run(problem, work / "problem", self._run_env(only_slots, screen))
             if text is None:
                 return EvalResult(ok=False, stage="run", errors=[f"timeout after {self.timeout_s}s"])
             return parse_driver_output(text)
@@ -709,15 +755,18 @@ class ServerEvaluator(Evaluator):
             return cu, None, EvalResult(ok=False, stage="compile", errors=[_compile_errors(str(e))],
                                         log=str(e)[-4000:])
 
-    async def evaluate(self, problem, sources, tag):
+    async def evaluate(self, problem, sources, tag, *, only_slots=None, screen=False):
         from ..agents.utils.commands import run_gpu_executable
         from ..agents.utils import FeedbackError
 
         cu, exe, bad = await self._compile(problem, sources, tag)
         if bad is not None:
             return bad
+        env = driver_env(only_slots, screen)
+        prefix = "".join(f"{k}={shlex.quote(v)} " for k, v in env.items()) or None
         try:
-            stdout, stderr = await run_gpu_executable(exe, self.gpu, self.timeout_s, job_name=str(cu))
+            stdout, stderr = await run_gpu_executable(exe, self.gpu, self.timeout_s, job_name=str(cu),
+                                                      prefix_command=prefix)
         except FeedbackError as e:
             return EvalResult(ok=False, stage="run", errors=[str(e)[-2000:]], log=str(e)[-4000:])
         return parse_driver_output(stdout + "\n" + stderr)
@@ -850,7 +899,7 @@ class OpenCLLocalEvaluator(LocalEvaluator):
             if not self.keep:
                 shutil.rmtree(work, ignore_errors=True)
 
-    async def evaluate(self, problem, sources, tag):
+    async def evaluate(self, problem, sources, tag, *, only_slots=None, screen=False):  # full run (OpenCL driver)
         bad, text = await self._exec(problem, sources, tag, {})
         if bad is not None:
             return bad
@@ -952,7 +1001,7 @@ class AdrenoEvaluator(Evaluator):
             return EvalResult(ok=False, stage="compile", errors=[_compile_errors(log)], log=log[-4000:]), None
         return None, out
 
-    async def evaluate(self, problem, sources, tag):
+    async def evaluate(self, problem, sources, tag, *, only_slots=None, screen=False):  # full run (OpenCL driver)
         bad, text = await self._exec(problem, sources, tag, {})
         if bad is not None:
             return bad
@@ -1017,7 +1066,7 @@ class OpenCLServerEvaluator(Evaluator):
             return EvalResult(ok=False, stage="run", errors=[str(e)[-2000:]], log=str(e)[-4000:]), None
         return None, stdout + "\n" + stderr
 
-    async def evaluate(self, problem, sources, tag):
+    async def evaluate(self, problem, sources, tag, *, only_slots=None, screen=False):  # full run (OpenCL driver)
         bad, text = await self._exec(problem, sources, tag, False)
         return bad if bad is not None else parse_driver_output(text)
 
