@@ -7,6 +7,10 @@ checks is stored (code content-addressed, one JSONL index line per record)
 with what it implements (target, arch, op, signature, shapes, op class), how
 fast it was, which techniques produced it and what it was derived from.
 
+Every tier (and the winners) is restricted to the asking slot's storage
+dtype: an fp16 kernel is a different implementation of the same op, and its
+code and timings say nothing reliable about the fp32 one (or vice versa).
+
 Retrieval for a slot (see :meth:`ImplStore.retrieve`):
   seed     same op + signature + shape bucket on this arch: start from it
   adapt    same op + signature, other shapes: start from it, say what changed
@@ -85,6 +89,7 @@ class ImplRecord:
     slot: Optional[str] = None
     max_rel_err: Optional[float] = None
     notes: str = ""
+    dtype: str = "fp32"                          # storage dtype; records never cross dtypes
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     ts: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds"))
 
@@ -127,7 +132,7 @@ class ImplStore:
 
     def retrieve(self, *, target: str, arch: str, op: str, op_class: str, signature: str,
                  shapes: list, n_examples: int = 2, exclude_problem: Optional[str] = None,
-                 far_same_op: bool = False) -> dict:
+                 far_same_op: bool = False, dtype: str = "fp32") -> dict:
         """-> {"seed": rec|None, "adapt": rec|None, "examples": [rec, ...]}
 
         ``exclude_problem`` drops the asking problem's own records: during a
@@ -135,7 +140,7 @@ class ImplStore:
         otherwise always win the exact tier and hide other problems' work."""
         sig = signature_sha(signature)
         want = {shape_bucket(op_class, s) for s in shapes}
-        recs = [r for r in self.records() if r.target == target
+        recs = [r for r in self.records() if r.target == target and r.dtype == dtype
                 and (exclude_problem is None or r.problem_id != exclude_problem)]
         same_op = [r for r in recs if r.op == op and r.signature_sha == sig]
         exact = [r for r in same_op if r.arch == arch and want <= set(r.buckets)]
@@ -158,12 +163,12 @@ class ImplStore:
                 "examples": (far + list(best_per_op.values()))[:n_examples]}
 
     def winners(self, *, target: str = "cuda", arch: Optional[str] = None) -> list[ImplRecord]:
-        """Fastest verified record per (op, signature, arch, shape set)."""
+        """Fastest verified record per (op, signature, arch, dtype, shape set)."""
         best: dict = {}
         for r in self.records():
             if r.target != target or (arch and r.arch != arch):
                 continue
-            k = (r.op, r.signature_sha, r.arch, json.dumps(r.shapes, sort_keys=True))
+            k = (r.op, r.signature_sha, r.arch, r.dtype, json.dumps(r.shapes, sort_keys=True))
             if k not in best or r.slot_us < best[k].slot_us:
                 best[k] = r
         return list(best.values())

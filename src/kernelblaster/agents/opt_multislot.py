@@ -100,10 +100,18 @@ def techniques_for(op_class: str) -> list[tuple[str, str]]:
 
 # ---------------------------------------------------------------- roofline
 
+# element bytes per manifest buffer dtype (fp16 problems move half the bytes)
+BUFFER_BYTES = {"f32": 4, "f16": 2, "i32": 4}
+
+
+def _nbytes(buf: dict) -> float:
+    return float(BUFFER_BYTES.get(buf.get("dtype", "f32"), 4) * buf["numel"])
+
+
 def _op_cost(problem: SlotProblem, op: dict) -> tuple[float, float]:
     """(bytes, flops) estimate for one op instance from the manifest."""
     bufs = problem.manifest["buffers"]
-    byt = 4.0 * sum(bufs[b]["numel"] for b in op["inputs"] + op["outputs"])
+    byt = sum(_nbytes(bufs[b]) for b in op["inputs"] + op["outputs"])
     slot = problem.slots[op["slot"]]
     inst = next((i for i in slot.instances if i["index"] == op["index"]), {})
     sh = inst.get("shape", {})
@@ -172,7 +180,7 @@ def propose_fusions(problem: SlotProblem, result: EvalResult, arch: str, min_gai
         sa, sb = problem.slots[ops[a]["slot"]], problem.slots[ops[b]["slot"]]
         if sb.op_class not in FUSABLE_CONSUMERS:
             continue
-        nbytes = 4 * next(x["numel"] for x in bufs if x["name"] == t)
+        nbytes = _nbytes(next(x for x in bufs if x["name"] == t))
         cands.append((per_inst[sb.id], a, b, t, sa.op, sb.op, nbytes))
     used, by_pattern = set(), {}
     for gain, a, b, t, ka, kb, nb in sorted(cands, reverse=True):
@@ -252,7 +260,7 @@ class TechniqueBandit:
 
 # ---------------------------------------------------------------- prompts
 
-SYSTEM_PROMPT = """You optimise one CUDA kernel *slot* inside a larger graph partition that ModelBlaster \
+SYSTEM_PROMPT_TEMPLATE = """You optimise one CUDA kernel *slot* inside a larger graph partition that ModelBlaster \
 compiled. The partition calls this slot's entry function once per op instance listed below; other slots \
 are separate kernels you cannot change. Rewrite the slot to be faster while staying correct.
 
@@ -265,9 +273,32 @@ to/from the host, do not call cudaDeviceSynchronize, do not define main() or lau
 - The source is placed inside a C++ namespace: any helper kernels/functions are fine. #include lines \
 are hoisted out. Macros MB_THREADS (256), MB_GRID(n) and MB_TID are predefined; #undef anything you \
 #define.
-- fp32 in/out. Each op is checked alone against the reference: max error <= 1e-3 relative to the \
-largest input/output magnitude. Accumulate dot products in fp32 or better.
+{dtype_rules}
 - Return the COMPLETE slot source in a single ```cuda code block, nothing after it."""
+
+# Per storage dtype (the manifest's `dtype`); {slot_rel} is the manifest's isolated-op bound.
+DTYPE_RULES = {
+    "fp32": "- fp32 in/out. Each op is checked alone against the reference: max error <= {slot_rel} "
+            "relative to the largest input/output magnitude. Accumulate dot products in fp32 or better.",
+    "fp16": "- fp16 storage, fp32 math: every float pointer is `__half` (IEEE binary16; <cuda_fp16.h> is "
+            "included), integer pointers stay int. Widen on load (`__half2float`, or `__half22float2` on "
+            "aligned `half2` pairs), compute and accumulate in fp32, round once on store "
+            "(`__float2half_rn`); never accumulate or chain arithmetic in `__half`. Tensor cores "
+            "(`wmma` / `mma.sync` with fp16 inputs and fp32 accumulators) are allowed.\n"
+            "- Each op is checked alone against a reference that rounds the exact fp32 result to fp16 "
+            "once: max error <= {slot_rel} relative to the largest input/output magnitude (about two fp16 "
+            "ulps).",
+}
+
+
+def system_prompt(dtype: str = "fp32", tolerance: Optional[dict] = None) -> str:
+    rel = (tolerance or {}).get("slot_rel", 1e-3)
+    rel_s = f"{rel:.0e}".replace("e-0", "e-")                    # 1e-3, 2e-3
+    rules = DTYPE_RULES.get(dtype, DTYPE_RULES["fp32"]).format(slot_rel=rel_s)
+    return SYSTEM_PROMPT_TEMPLATE.format(dtype_rules=rules)
+
+
+SYSTEM_PROMPT = system_prompt("fp32")
 
 
 def _fmt_instances(slot) -> str:
@@ -309,7 +340,7 @@ def build_codegen_messages(*, problem: SlotProblem, sid: str, source: str, techn
         parts.append("Already tried on this slot (avoid repeating dead ends):\n" + already_tried)
     parts.append(f"## Technique to apply: {technique}\n{technique_desc}")
     parts.append(f"Current slot source:\n```cuda\n{source}\n```")
-    return [{"role": "system", "content": SYSTEM_PROMPT},
+    return [{"role": "system", "content": system_prompt(problem.dtype, problem.tolerance)},
             {"role": "user", "content": "\n\n".join(p for p in parts if p)}]
 
 
@@ -317,7 +348,7 @@ def build_fix_messages(*, problem: SlotProblem, sid: str, source: str, error: st
                        pitfalls: str = "") -> list[dict]:
     slot = problem.slots[sid]
     known = f"Known pitfalls from earlier runs:\n{pitfalls}\n\n" if pitfalls else ""
-    return [{"role": "system", "content": SYSTEM_PROMPT},
+    return [{"role": "system", "content": system_prompt(problem.dtype, problem.tolerance)},
             {"role": "user", "content":
              f"The slot `{sid}` (op `{slot.op}`, signature `{slot.signature}`) failed:\n```\n{error}\n```\n\n"
              f"Instances:\n{_fmt_instances(slot)}\n\n{known}Fix it (keep the optimisation if you can). "
@@ -476,7 +507,8 @@ class MultiSlotAgent:
             return {"seed": None, "adapt": None, "examples": []}
         s = self.p.slots[sid]
         return self.store.retrieve(target="cuda", arch=f"sm_{self.arch}", op=s.op, op_class=s.op_class,
-                                   signature=s.signature, shapes=s.shapes(), exclude_problem=self.problem_id)
+                                   signature=s.signature, shapes=s.shapes(), exclude_problem=self.problem_id,
+                                   dtype=self.p.dtype)
 
     async def _llm(self, messages, model) -> str:
         self.llm_calls += 1
@@ -498,7 +530,7 @@ class MultiSlotAgent:
         rec = OutcomeRecord(target="cuda", arch=f"sm_{self.arch}", problem_id=self.problem_id,
                             run_id=self.run_id, slot=sid, op_kind=s.op, op_class=s.op_class,
                             shape_bucket=shape_bucket(s.op_class, s.shapes()[0] if s.instances else {}),
-                            dtype="fp32", **kw)
+                            dtype=self.p.dtype, **kw)
         self.olog.append(rec)
         if self.claims is not None and hasattr(self.claims, "observe"):
             self.claims.observe(rec)          # "already tried" visible to parallel rollouts now
@@ -517,7 +549,7 @@ class MultiSlotAgent:
                              speedup=(baseline_us / slot_us) if baseline_us and slot_us else None,
                              seed_us=seed_us, speedup_vs_seed=(seed_us / slot_us) if seed_us and slot_us else None,
                              techniques=techniques, parent_id=parent, problem_id=self.problem_id,
-                             run_id=self.run_id, slot=sid, max_rel_err=rel_err)
+                             run_id=self.run_id, slot=sid, max_rel_err=rel_err, dtype=self.p.dtype)
         return rec.id
 
     # ---- initialise: baseline + store seeds
@@ -571,7 +603,10 @@ class MultiSlotAgent:
         if prof_before:
             state = prof_before["state"]                 # measured bound beats the roofline estimate
         techs = techniques_for(slot.op_class)
-        key = f"{slot.op_class}|{state}"
+        # fp16 arms are their own keys (half2 / tensor-core techniques pay off
+        # differently); fp32 keys keep their names, and the cross-key prior
+        # still seeds an untried fp16 arm from its fp32 record
+        key = f"{slot.op_class}|{state}" + ("" if self.p.dtype == "fp32" else f"|{self.p.dtype}")
         tech = self.bandit.select(key, [t for t, _ in techs], self.rng)
         desc = dict(techs)[tech]
         r = self._retrieve(sid)
