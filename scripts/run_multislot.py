@@ -10,7 +10,8 @@ them (``pipeline/kb_export.py`` output). The knowledge directory holds the
 implementation store (``impl/``), the outcome log and the semantic claims;
 share it across runs so later problems start from earlier winners and
 lessons. ``--model`` is any name ``generate_code`` routes: ``claude-code:<m>``
-(Claude Code CLI, no key), ``stub:<name>``, or an API model.
+(Claude Code CLI, no key), ``stub:<name>`` (registered by a ``--plugin``
+file), or an API model.
 
 Writes OUT/<problem>/result.json and best/slots/*.cu, OUT/summary.json, and
 (with --export-winners) the store's winners for ModelBlaster's kb_ingest.
@@ -21,6 +22,7 @@ import argparse
 import asyncio
 import json
 import os
+import runpy
 import sys
 import time
 from pathlib import Path
@@ -82,6 +84,8 @@ def _start_servers(gpu_name: str, log_dir: Path):
 
 
 async def _run(args) -> int:
+    for f in args.plugin:             # e.g. registers stub: LLMs for scripted runs
+        runpy.run_path(str(f), run_name="kb_plugin")
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
     kdir = Path(args.knowledge_dir or out / "knowledge").resolve()
@@ -153,6 +157,8 @@ def main():
     ap.add_argument("--evaluator", choices=["local", "server"], default="local")
     ap.add_argument("--gpu", default="titanrtx", help="GPUType for --evaluator server")
     ap.add_argument("--export-winners", default=None, help="dir for winners.json (ModelBlaster ingest)")
+    ap.add_argument("--plugin", action="append", default=[],
+                    help="python file run before the problems (e.g. it registers stub: models); repeatable")
     sys.exit(asyncio.run(_run(ap.parse_args())))
 
 
