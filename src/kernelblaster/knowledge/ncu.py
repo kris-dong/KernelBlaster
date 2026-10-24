@@ -15,11 +15,26 @@ from __future__ import annotations
 
 import csv
 import io
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Optional
 
 SECTIONS = ("SpeedOfLight", "Occupancy", "LaunchStats", "MemoryWorkloadAnalysis")
+
+#: raw counters added with ``--metrics`` (no extra section): shared-memory bank
+#: conflicts vs wavefronts, and global sectors moved vs bytes the instructions
+#: asked for (ideal sectors = bytes / 32), loads and stores. They feed the
+#: canonical ``bank_conflicts`` / ``uncoalesced`` metrics. Off with
+#: ``KB_NCU_ACCESS_METRICS=0``.
+ACCESS_METRICS = (
+    "l1tex__data_bank_conflicts_pipe_lsu_mem_shared.sum",
+    "l1tex__data_pipe_lsu_wavefronts_mem_shared.sum",
+    "l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum",
+    "l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum",
+    "smsp__sass_data_bytes_mem_global_op_ld.sum",
+    "smsp__sass_data_bytes_mem_global_op_st.sum",
+)
 
 # summary key -> (section, metric) in ncu's --csv --page details output
 _PCT = {
@@ -51,6 +66,8 @@ def ncu_command(*, prefix: str = "mbslot_", slot: Optional[str] = None, slots=No
     else:
         rx = prefix
     secs = " ".join(f"--section={s}" for s in SECTIONS)
+    if os.getenv("KB_NCU_ACCESS_METRICS", "1").lower() not in ("0", "false", "no", "off"):
+        secs += " --metrics " + ",".join(ACCESS_METRICS)
     return (f"ncu --kernel-name-base demangled --print-kernel-base demangled -k regex:'{rx}' "
             f"--launch-count {launch_count} --page details {secs} --csv")
 
@@ -84,6 +101,13 @@ class KernelProfile:
     def value(self, key) -> Optional[float]:
         mv = self.metrics.get(key)
         return mv[1] if mv else None
+
+    def raw(self, name: str) -> Optional[float]:
+        """A ``--metrics`` counter by name (whatever section ncu files it under)."""
+        for (_, m), (_, v) in self.metrics.items():
+            if m == name:
+                return v
+        return None
 
     @property
     def duration_us(self) -> float:
@@ -132,6 +156,7 @@ def summarize(kernels: list[KernelProfile]) -> dict:
     sm = [k.value(_SMEM) for k in kernels if k.value(_SMEM) is not None]
     if sm:
         s["static_smem_per_block_max"] = int(max(sm))
+    s.update(access_pct(kernels))
     heavy = max(kernels, key=lambda k: k.duration_us)
     waves = heavy.value(_WAVES)
     if waves is not None:
@@ -145,6 +170,22 @@ def summarize(kernels: list[KernelProfile]) -> dict:
     s["rules"] = [{"rule": n, "est_speedup_pct": sp, "hint": d[:300]} for n, (d, sp) in ranked[:3]]
     s["state"] = ncu_state(s)
     return s
+
+
+def access_pct(kernels: list[KernelProfile]) -> dict:
+    """Bank-conflict and uncoalesced-access excess over the slot's kernels (counters summed)."""
+    def tot(name):
+        vals = [k.raw(name) for k in kernels if k.raw(name) is not None]
+        return sum(vals) if vals else None
+    out = {}
+    conf, wav = tot(ACCESS_METRICS[0]), tot(ACCESS_METRICS[1])
+    if conf is not None and wav:
+        out["smem_bank_conflict_pct"] = round(100.0 * conf / max(wav - conf, 1.0), 2)
+    sect = [tot(ACCESS_METRICS[2]), tot(ACCESS_METRICS[3])]
+    byts = [tot(ACCESS_METRICS[4]), tot(ACCESS_METRICS[5])]
+    if all(x is not None for x in sect + byts) and sum(byts) > 0:
+        out["global_excess_sector_pct"] = round(max(0.0, 100.0 * (32.0 * sum(sect) / sum(byts) - 1.0)), 2)
+    return out
 
 
 def ncu_state(s: dict) -> str:
@@ -170,7 +211,8 @@ def delta(before: Optional[dict], after: Optional[dict]) -> dict:
     """after - before for the numeric summary metrics both have."""
     if not before or not after:
         return {}
-    keys = [k for k in list(_PCT) + ["registers_per_thread_max", "duration_us"] if k in before and k in after]
+    keys = [k for k in list(_PCT) + ["registers_per_thread_max", "duration_us", "smem_bank_conflict_pct",
+                                     "global_excess_sector_pct"] if k in before and k in after]
     return {k: round(after[k] - before[k], 3) for k in keys}
 
 
@@ -179,7 +221,8 @@ def render(s: dict) -> str:
         return ""
     keys = ["duration_us", "compute_throughput", "memory_throughput", "dram_throughput", "achieved_occupancy",
             "theoretical_occupancy", "l1_hit_rate", "l2_hit_rate", "registers_per_thread_max",
-            "static_smem_per_block_max", "waves_per_sm_heaviest"]
+            "static_smem_per_block_max", "waves_per_sm_heaviest", "smem_bank_conflict_pct",
+            "global_excess_sector_pct"]
     nums = ", ".join(f"{k}={s[k]}" for k in keys if k in s)
     lines = [f"NCU (measured, {s.get('n_kernels', 0)} kernel launches; throughputs and occupancy in % of peak): {nums}"]
     for r in s.get("rules", []):

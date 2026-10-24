@@ -127,6 +127,8 @@ async def _run(args) -> int:
         from kernelblaster.knowledge.v2.reflect_v2 import SemanticUpdaterV2
         kv = KnowledgeV2(kdir, upkeep_model=args.upkeep_model, logger=logger, upkeep_every=args.upkeep_every,
                          explore_frac=args.explore_frac)
+        for gh in args.graph_hints or [x for x in os.getenv("KB_GRAPH_HINTS", "").split(os.pathsep) if x]:
+            kv.sync_graph_hints(gh, target_key=f"cuda:sm_{args.arch or '75'}")   # MB decisions so far
         olog, claims = kv.outcomes, kv.claims
         updater = (SemanticUpdaterV2(kv, model=args.reflect_model, every_n=args.reflect_every, logger=logger,
                                      trace_dir=kdir / "reflect_traces") if args.reflect_model else None)
@@ -343,6 +345,9 @@ def main():
                     help="v2: model for hypothesis generation + state discovery (unset: deterministic upkeep only)")
     ap.add_argument("--upkeep-every", type=int, default=8, help="v2: new outcomes between upkeep passes")
     ap.add_argument("--explore-frac", type=float, default=0.15, help="v2: share of steps for hypotheses")
+    ap.add_argument("--graph-hints", action="append", default=[],
+                    help="v2: ModelBlaster graph_hints.json whose accepted/rejected decisions are synced into the "
+                         "graph hypotheses at the start of the run (repeatable; env KB_GRAPH_HINTS, ':'-separated)")
     ap.add_argument("--export-winners", default=None, help="dir for winners.json (ModelBlaster ingest)")
     ap.add_argument("--plugin", action="append", default=[],
                     help="python file run before the problems (e.g. it registers stub: models); repeatable")
