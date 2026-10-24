@@ -174,21 +174,25 @@ def find_kernel_name(filename: Path) -> str:
 
 
 def get_elapsed_cycles_ncu_log(ncu_log: str) -> int:
-    """Get the elapsed cycles from a given ncu log.
+    """Get the total elapsed cycles from a given ncu log.
     
     Parses the "Elapsed Cycles" metric from the "GPU Speed Of Light Throughput" section.
-    Supports both table format and CSV format.
+    Supports both table format and CSV format. NCU prints one section per
+    kernel launch, so multi-launch / multi-kernel logs are summed over every
+    launch (same as the opt_ncu_rl / opt_ncu_minimal totals).
 
     Args:
         ncu_log: The ncu log.
 
     Returns:
-        The elapsed cycles.
+        The elapsed cycles, summed over all profiled kernel launches.
     """
-    # Try multiple patterns to match different NCU output formats
+    # Try multiple patterns to match different NCU output formats; the
+    # first pattern that matches at all is summed over all its matches.
     patterns = [
         # Table format: "Elapsed Cycles                cycle        12675"
-        r"Elapsed Cycles\s+\w+\s+(\d[\d,]*)",
+        # (anchored to the line so NCU rule prose can't match)
+        r"^[ \t]*Elapsed Cycles[ \t]+\w+[ \t]+(\d[\d,]*)",
         # CSV format or other formats: "Elapsed Cycles,cycle,12675" or "Elapsed Cycles: 12675"
         r"Elapsed Cycles[,\s:]+(?:cycle[,\s]+)?(\d[\d,]*)",
         # Fallback: any format with "Elapsed Cycles" followed by digits
@@ -196,12 +200,15 @@ def get_elapsed_cycles_ncu_log(ncu_log: str) -> int:
     ]
     
     for pattern in patterns:
-        elapsed_cycles = re.search(pattern, ncu_log, re.IGNORECASE | re.MULTILINE)
-        if elapsed_cycles:
+        matches = re.findall(pattern, ncu_log, re.IGNORECASE | re.MULTILINE)
+        values = []
+        for m in matches:
             try:
-                return int(elapsed_cycles.group(1).replace(",", ""))
+                values.append(int(m.replace(",", "")))
             except ValueError:
                 continue
+        if values:
+            return sum(values)
     
     raise RuntimeError(f"Failed to find elapsed cycles in NCU log. Patterns tried: {len(patterns)}")
 
