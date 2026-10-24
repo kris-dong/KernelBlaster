@@ -117,6 +117,9 @@ def validate_spec(raw: dict, *, ontology, existing: list, target_key: str, known
     pre = raw.get("preconditions") or None
     if pre is not None:
         P.validate(pre)
+        bad = P.unit_problems(pre)
+        if bad:
+            raise ValueError("preconditions in the wrong unit: " + "; ".join(bad))
     pred = raw.get("predicts") or {}
     validate_predicts(pred)
     states = [s for s in (raw.get("states") or []) if s in known_states]
@@ -253,6 +256,11 @@ class HypothesisBook:
         for h in list(self.open()):
             if h.kind != "slot":
                 continue
+            bad = P.unit_problems(h.preconditions)
+            if bad:                          # untestable as written (stored before the unit check)
+                self.retire(h, "preconditions in the wrong unit: " + "; ".join(bad), mirror)
+                events.append({"event": "retired", "id": h.id, "reason": h.reason})
+                continue
             ok, why = self.verdict(h)
             if ok:
                 t = self.promote(h, why, mirror)
@@ -314,7 +322,9 @@ predicted metric directions, and how to realise it on the given target.
 
 Do not restate a known technique under a new name; build on it (based_on) instead.
 Predicate DSL: {"all": [...]}, {"any": [...]}, {"not": p}, {"<metric>": "<|<=|>|>=", "v": number},
-{"op_class": "in", "v": ["gemm", ...]}. Canonical metrics: {metrics}.
+{"op_class": "in", "v": ["gemm", ...]}. Canonical metrics (with units): {metrics}.
+Utilisations, hit rates, occupancy and reg_pressure are PERCENT (0-100, e.g. {"bw_util": "<", "v": 60});
+parallel_fill and launch_frac are fractions (0-1); arith_intensity is FLOP/byte.
 predicts: {"<metric>": "up|down|flat|up_or_flat|down_or_flat"}.
 
 Return ONLY JSON: {"hypotheses": [{"trigger": <trigger index>, "source": "gap|port|combine|profiler|code_mining",

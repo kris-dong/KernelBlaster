@@ -118,6 +118,28 @@ def metrics_used(p: Any) -> set[str]:
     return out | ({ref} if ref else set())
 
 
+def unit_problems(p: Any) -> list[str]:
+    """Thresholds that look like the wrong unit: percent metrics compared with a value in (0, 1]
+    (a fraction written for a percent), fraction metrics with a value > 1. LLM-written
+    predicates get this wrong; data-validated ones (state discovery) don't need it."""
+    if p is True or p is None or not isinstance(p, dict):
+        return []
+    for k in ("all", "any"):
+        if k in p:
+            return [x for q in p[k] for x in unit_problems(q)]
+    if "not" in p:
+        return unit_problems(p["not"])
+    name, op, v, ref = _leaf(p)
+    if name not in CANONICAL or ref is not None or not isinstance(v, (int, float)):
+        return []
+    unit = CANONICAL[name][1]
+    if unit == "%" and 0 < v <= 1:
+        return [f"{name} is in percent (0-100) but compared with {v}"]
+    if unit == "frac" and v > 1:
+        return [f"{name} is a fraction (0-1) but compared with {v}"]
+    return []
+
+
 def canonical(p: Any) -> str:
     """Stable text form (store / diff / dedupe)."""
     return json.dumps(p, sort_keys=True, separators=(",", ":"))

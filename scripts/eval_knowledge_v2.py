@@ -169,7 +169,8 @@ def main():
     for r in rows:
         xt[r.get("state_before") or "-"][r["chain"][0] if r["chain"] else r["cls"]] += 1
     rep["v1_state_vs_v2_root"] = {k: dict(v) for k, v in xt.items()}
-    lab = {"v1_state": lambda r: r.get("state_before"),
+    # for v2 databases state_before IS the v2 leaf; v1_state is meaningful for v1 logs only
+    lab = {"v1_state": lambda r: r.get("state_before") if not r.get("v2") else None,
            "v2_root": lambda r: r["chain"][0] if r["chain"] else None,
            "v2_leaf": lambda r: r["chain"][-1] if r["chain"] else None,
            "op_class_only": lambda r: r.get("op_class")}
@@ -196,11 +197,23 @@ def main():
                               "chance_agreement": round(chance, 4) if chance is not None else None,
                               "p_improved_given_confirmed": _rate([w for l, w in dec if l == "confirmed"]),
                               "p_improved_given_contradicted": _rate([w for l, w in dec if l == "contradicted"]),
+                              "fisher_p_one_sided": round(fisher_one_sided(
+                                  sum(1 for l, w in dec if l == "confirmed" and w),
+                                  sum(1 for l, w in dec if l == "confirmed" and not w),
+                                  sum(1 for l, w in dec if l == "contradicted" and w),
+                                  sum(1 for l, w in dec if l == "contradicted" and not w)), 4) if dec else None,
                               "rows": [{"id": i, "item": it, "label": l, "improved": w} for l, w, i, it in mech][:60]}
     js = json.dumps(rep, indent=1, default=str)
     if a.out:
         Path(a.out).write_text(js)
     print(js)
+
+
+def fisher_one_sided(a: int, b: int, c: int, d: int) -> float:
+    """P(X >= a) for the 2x2 table [[a, b], [c, d]] with fixed margins (hypergeometric)."""
+    n1, n2, k = a + b, c + d, a + c
+    tot = math.comb(n1 + n2, k)
+    return sum(math.comb(n1, x) * math.comb(n2, k - x) for x in range(a, min(n1, k) + 1)) / tot if tot else 1.0
 
 
 def _rate(xs):
