@@ -505,6 +505,13 @@ def test_reflection_v2_lift_through_updater(tmp_path):
     assert any(r["kind"] == "claim_lifted" for r in kv.db.review_items())
     msgs = up.build_messages(recs, [])
     assert "lift" in msgs[0]["content"] and "mechanism" in msgs[0]["content"]
+    # an sm_75 claim is shown for an sm_89 batch, with the agreeing records as lift candidates
+    c2, _ = kv.claims.add(Claim(kind=APPLICABILITY, text="coalescing helps conv on sm_75 again",
+                                technique="memory_coalescing", op_class="conv", arch="sm_75",
+                                data={"effect": "helps"}), ["r0"])
+    assert c2.id in {c.id for c in up._context_claims([recs[2]])}
+    msgs = up.build_messages([recs[2]], [c2])
+    assert f"claim {c2.id} (cuda:sm_75) is supported by ['r2']" in msgs[1]["content"]
 
 
 def test_legacy_single_file_adapter_path(tmp_path, monkeypatch):
@@ -563,3 +570,10 @@ def test_agent_end_to_end_v2(tmp_path):
     assert any(h.kind == "graph" for h in kv.hypotheses.items.values()) or "proposals" in res
     # the stats DB has per-target nodes for every recorded item
     assert any(k[1] == "target" and k[2] == f"cuda:sm_{ARCH}" for k in kv.db.all_stats())
+
+
+def test_parse_json_response_with_backticks_inside_strings():
+    from kernelblaster.knowledge.reflect import parse_json_response
+    raw = '{"edits": [{"kind": "pitfall", "text": "the response lacked a ```cuda code block, so nothing ran"}]}'
+    assert parse_json_response(raw)["edits"][0]["kind"] == "pitfall"
+    assert parse_json_response('ok:\n```json\n{"a": 1}\n```\n') == {"a": 1}

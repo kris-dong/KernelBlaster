@@ -21,7 +21,7 @@ import json
 from collections import Counter
 from typing import Any, Optional
 
-from ..claims import (ACTIVE, APPLICABILITY, INTERACTION, MECHANISM, PARAMETER, PITFALL, Claim)
+from ..claims import ACTIVE, APPLICABILITY, MAX_TEXT_CHARS, MECHANISM, PARAMETER, PITFALL, Claim
 from ..outcomes import COMPILE_ERROR, IMPROVED, NEUTRAL, REGRESSED, RUNTIME_ERROR, WRONG_OUTPUT
 from ..reflect import EditError, SemanticUpdater, apply_edit, validate_edit
 from .metrics import CANONICAL, flat_band
@@ -38,8 +38,8 @@ Knowledge v2 additions:
 - Claims have a level: target (one GPU/arch), family (e.g. every SIMT GPU), universal. New claims
   start at target level. States are hierarchical (e.g. memory_bound > cache_thrashing); scope a claim
   to the most general state it holds for.
-- lift: {"kind": "lift", "claim_id": "...", "to": "family|universal", "evidence": [ids]} when a claim
-  holds on SEVERAL targets: family needs consistent support on >= 2 targets of one family (e.g.
+- lift: {"kind": "lift", "claim_id": "...", "to": "family|universal", "evidence": [ids], "text": "the
+  lesson reworded without target specifics (optional)"} when a claim holds on SEVERAL targets: family needs consistent support on >= 2 targets of one family (e.g.
   cuda:sm_75 and cuda:sm_89), universal on >= 2 families. Checked against the cited records' targets.
 - mechanism: {"kind": "mechanism", "text": "...", "evidence": [ids], "scope": {"technique": "..."},
   "data": {"metric": "<canonical metric>", "observed": "up|down|flat", "verdict":
@@ -100,11 +100,17 @@ def validate_lift(edit: dict, *, index: dict, claims, registry) -> dict:
             raise EditError(f"lift to family {home} needs consistent support on >= 2 of its targets, "
                             f"has {sorted(good_home) or 'none'} (support {dict(supp)}, contradict {dict(contra)})")
         return {"kind": LIFT, "claim_id": c.id, "to": FAMILY, "family": home, "evidence": used,
-                "targets": sorted(good_home)}
+                "targets": sorted(good_home), "text": _lift_text(edit)}
     fams = sorted(set(fam_of.values()))
     if len(fams) < 2:
         raise EditError(f"lift to universal needs support on >= 2 families, has {fams or 'none'}")
-    return {"kind": LIFT, "claim_id": c.id, "to": UNIVERSAL, "family": None, "evidence": used, "families": fams}
+    return {"kind": LIFT, "claim_id": c.id, "to": UNIVERSAL, "family": None, "evidence": used, "families": fams,
+            "text": _lift_text(edit)}
+
+
+def _lift_text(edit: dict) -> Optional[str]:
+    t = edit.get("text")
+    return t.strip()[:MAX_TEXT_CHARS] if isinstance(t, str) and t.strip() else None
 
 
 def apply_lift(e: dict, claims) -> dict:
@@ -114,6 +120,8 @@ def apply_lift(e: dict, claims) -> dict:
         frm = c.level
         c.level, c.family = e["to"], e["family"]
         c.arch = None
+        if e.get("text"):                       # the general wording (no target specifics)
+            c.text = e["text"]
         claims._touch(c)
     return {"kind": LIFT, "claim_id": c.id, "result": f"lifted {frm}->{e['to']}", "support": c.support,
             "contradict": c.contradict, "evidence": e["evidence"],
@@ -204,15 +212,49 @@ class SemanticUpdaterV2(SemanticUpdater):
             applied.append(apply_edit(e, self.claims))
         return applied, rejected
 
+    def _context_claims(self, records):
+        """v1 context + target-level claims of *other* targets of the same family on the
+        batch's techniques / op classes (what a lift would generalise)."""
+        out = {c.id: c for c in super()._context_claims(records)}
+        reg = self.kv.registry
+        fams = {reg.family_of(target_key(r.target, r.arch)) for r in records}
+        keys = {(r.technique, r.op_class) for r in records}
+        for c in self.claims.active():
+            if (getattr(c, "level", TARGET) == TARGET and (c.technique, c.op_class) in keys
+                    and reg.family_of(target_key(c.target, c.arch or "unknown")) in fams):
+                out.setdefault(c.id, c)
+        return sorted(out.values(), key=lambda c: -c.rank(self.claims.epoch))[: self.max_prompt_claims + 10]
+
+    def lift_candidates(self, records, existing) -> list[str]:
+        """Deterministic hints: a target-level claim and batch records from another target of
+        its family that agree with it (the model still decides; validate_lift checks)."""
+        lines = []
+        for c in existing:
+            if getattr(c, "level", TARGET) != TARGET or c.kind not in (APPLICABILITY, PITFALL, PARAMETER, MECHANISM):
+                continue
+            home = target_key(c.target, c.arch or "unknown")
+            ev = [r.id for r in records if r.technique == c.technique and (not c.op_class or r.op_class == c.op_class)
+                  and target_key(r.target, r.arch) != home and consistent(c, r.status)
+                  and self.kv.registry.family_of(target_key(r.target, r.arch)) == self.kv.registry.family_of(home)]
+            if ev:
+                lines.append(f"- claim {c.id} ({home}) is supported by {ev[:6]} on other targets of its family")
+        return lines[:8]
+
     def build_messages(self, records, existing) -> list:
-        """v1 prompt + the v2 instructions + the mechanism checks of these records."""
+        """v1 prompt + the v2 instructions + mechanism checks + lift candidates."""
         msgs = super().build_messages(records, existing)
         msgs[0]["content"] += V2_INSTRUCTIONS
+        extra = ""
         checks = self.kv.mechanism_lines([r.id for r in records])
         if checks:
-            msgs[1]["content"] = msgs[1]["content"].replace(
-                'Return {"edits": [...]} now.', "MECHANISM CHECKS (measured deltas vs predicts):\n"
-                + "\n".join(checks) + '\n\nReturn {"edits": [...]} now.')
+            extra += "MECHANISM CHECKS (measured deltas vs predicts):\n" + "\n".join(checks) + "\n\n"
+        lifts = self.lift_candidates(records, existing)
+        if lifts:
+            extra += ("LIFT CANDIDATES (lift only if the lesson really holds on both targets; evidence must "
+                      "include these ids):\n" + "\n".join(lifts) + "\n\n")
+        if extra:
+            msgs[1]["content"] = msgs[1]["content"].replace('Return {"edits": [...]} now.',
+                                                            extra + 'Return {"edits": [...]} now.')
         return msgs
 
     async def maybe_reflect(self, *, force: bool = False) -> list[dict]:
