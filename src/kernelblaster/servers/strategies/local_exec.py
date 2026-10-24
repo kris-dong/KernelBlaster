@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shlex
 from typing import Optional
 
 from ..utils.exec_strategy import ExecStrategy
@@ -53,7 +54,10 @@ class LocalExecStrategy(ExecStrategy):
         timeout: float = 3600,
         kernel_files: Optional[list[str]] = None,  # ignored
         profile: bool = False,                     # ignored
+        binary_path: Optional[str] = None,
     ):
+        """``binary_path`` (a binary already on this host) is run in place;
+        otherwise ``binary_data`` goes to a private temp file first."""
         # Lazy import — avoid pulling the FastAPI ``APP`` object at
         # strategies-package import time.
         from ..gpu import save_binary_to_temp, cleanup_temp_file, exec_binary
@@ -67,7 +71,9 @@ class LocalExecStrategy(ExecStrategy):
             eff_env_vars["CUDA_VISIBLE_DEVICES"] = gpu_id
         eff_env_vars.setdefault("NVIDIA_TF32_OVERRIDE", "0")
 
-        binary_path = save_binary_to_temp(binary_data, filename or "gpu_executable")
+        in_place = binary_path is not None
+        if not in_place:
+            binary_path = save_binary_to_temp(binary_data, filename or "gpu_executable")
         try:
             self._logger.info(
                 f"[Worker {worker_id}]: local exec binary={binary_path} "
@@ -75,7 +81,7 @@ class LocalExecStrategy(ExecStrategy):
                 f"CUDA_VISIBLE_DEVICES={eff_env_vars['CUDA_VISIBLE_DEVICES']}"
             )
             stdout, stderr = await exec_binary(
-                binary_path,
+                shlex.quote(binary_path) if in_place else binary_path,
                 args,
                 timeout=timeout,
                 env_vars=eff_env_vars,
@@ -84,4 +90,5 @@ class LocalExecStrategy(ExecStrategy):
             )
             return stdout, stderr
         finally:
-            cleanup_temp_file(binary_path)
+            if not in_place:
+                cleanup_temp_file(binary_path)

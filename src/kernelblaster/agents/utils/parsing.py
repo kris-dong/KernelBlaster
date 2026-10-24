@@ -24,6 +24,8 @@ from ...config import GPUType
 
 __all__ = [
     "find_kernel_names_ncu",
+    "find_kernel_names_trace",
+    "kernel_base_name",
     "find_kernel_names",
     "find_kernel_name",
     "get_elapsed_cycles_ncu_log",
@@ -124,6 +126,39 @@ async def find_kernel_names_ncu(
         )
 
     return kernel_names
+
+
+def kernel_base_name(demangled: str) -> str:
+    """``void ns::k<(int)4>(float *, int)`` -> ``k``: the name NCU lists under
+    "Available Kernels" (its default ``--kernel-name-base function``)."""
+    name = demangled.strip().strip('"')
+    for anon in ("<unnamed>::", "(anonymous namespace)::"):
+        name = name.replace(anon, "")
+    if name.startswith("void "):
+        name = name[len("void "):]
+    name = re.split(r"[<(]", name, maxsplit=1)[0]
+    return name.rsplit("::", 1)[-1].strip()
+
+
+def find_kernel_names_trace(trace_text: str, source_path: Path) -> list[str]:
+    """Source-declared kernels that ran, from an nsys kernel trace.
+
+    ``trace_text`` holds ``start,duration,demangled_name`` rows after a
+    ``__GPUTRACE_CSV_START__`` marker (what the CUDA agent's nsys pass
+    prints). Same result as :func:`find_kernel_names_ncu` -- launched kernels
+    by base name, intersected with the source's kernels -- without the extra
+    NCU run. Returns ``[]`` when the trace has no rows.
+    """
+    kernels_in_source = find_kernel_names(source_path)
+    marker = "__GPUTRACE_CSV_START__"
+    if marker not in trace_text:
+        return []
+    launched = set()
+    for line in trace_text.split(marker, 1)[1].splitlines():
+        parts = line.strip().split(",", 2)
+        if len(parts) == 3 and parts[0].strip().isdigit():
+            launched.add(kernel_base_name(parts[2]))
+    return list(launched & set(kernels_in_source))
 
 
 def find_kernel_names(filename: Path) -> str:

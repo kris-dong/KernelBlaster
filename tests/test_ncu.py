@@ -56,7 +56,7 @@ def test_agent_uses_ncu_or_falls_back(tmp_path, fail):
     class Replay(LocalEvaluator):                      # real builds/runs, replayed L40S profile
         calls = 0
 
-        async def profile(self, problem, sources, tag):
+        async def profile(self, problem, sources, tag, slots=None):
             Replay.calls += 1
             if fail:
                 return {}, "no GPU performance-counter permission (ERR_NVGPUCTRPERM)"

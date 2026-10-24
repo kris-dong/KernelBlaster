@@ -4,7 +4,7 @@
 
     universal  >  family (simt_gpu, vector_cpu, systolic)  >  target (cuda:sm_75, ...)
 
-A *target key* is ``<backend>:<arch>`` (``cuda:sm_89``, ``opencl:adreno_740``).
+A *target key* is ``<backend>:<arch>`` (``cuda:sm_89``, ``opencl:adreno740``).
 Unknown targets are accepted: their family comes from the backend name and
 they have no peaks (the roofline adapter then leaves utilisations absent).
 """
@@ -84,6 +84,13 @@ class TargetRegistry:
         if t is None:
             fam = BACKEND_FAMILY.get(key.split(":", 1)[0], "unknown")
             t = self.targets[key] = Target(key=key, family=fam)
+        return t
+
+    def ensure(self, key: str, *, peaks: Optional[tuple] = None) -> Target:
+        """The target for ``key``; fill missing (GFLOP/s, GB/s) peaks, e.g. from the agent's TargetProfile."""
+        t = self.get(key)
+        if peaks and not (t.peak_gflops and t.peak_gbps):
+            t.peak_gflops, t.peak_gbps = float(peaks[0]), float(peaks[1])
         return t
 
     def family_of(self, key: str) -> str:

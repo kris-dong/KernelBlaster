@@ -66,6 +66,7 @@ from .utils import (
     UTILIZATION_METRICS,
     compile_and_run_cu_file,
     find_kernel_names_ncu,
+    find_kernel_names_trace,
     generate_code_retry,
     run_gpu_executable,
 )
@@ -329,6 +330,18 @@ class OptimizedRLNCUAgent(RLOptimizedAgentBase):
         the source-declared kernel names (matched as substrings against the
         possibly-mangled trace names).
         """
+        combined = await self._nsys_trace(executable)
+        return self._nsys_timing_from_trace(combined, solution_kernel_names)
+
+    async def _nsys_trace(self, executable: Path) -> str:
+        """Run ``executable`` under nsys; the output holds every kernel launch
+        as ``start,duration,demangled_name`` after ``__GPUTRACE_CSV_START__``.
+
+        Only the CUDA kernel table is read, so only CUDA is traced and CPU
+        sampling / context-switch / backtrace collection is off (~2 s of the
+        ~5 s nsys pass; GPU timestamps are unaffected).
+        ``KERNELBLASTER_NSYS_ARGS`` overrides these options.
+        """
         report_file = f"/tmp/kbrl_nsys_{uuid.uuid4().hex[:10]}"
         # Inline Python that queries the .sqlite for per-kernel start/dur/name
         # — same shape as reprofile_nsys.py but without the cross-run cache.
@@ -344,9 +357,13 @@ class OptimizedRLNCUAgent(RLOptimizedAgentBase):
             "    print(f'{r[0]},{r[1]},{r[2]}')\n"
         )
         query_b64 = base64.b64encode(query_py.encode()).decode()
+        nsys_args = os.getenv(
+            "KERNELBLASTER_NSYS_ARGS",
+            "--trace=cuda --sample=none --cpuctxsw=none --backtrace=none",
+        )
         nsys_prefix = (
             f"bash -c '"
-            f"nsys profile --force-overwrite=true --export=sqlite "
+            f"nsys profile {nsys_args} --force-overwrite=true --export=sqlite "
             f"--output={report_file} \"$1\" >/dev/null && "
             f"echo __GPUTRACE_CSV_START__ && "
             f"python3 -c \"import base64,sys;exec(base64.b64decode(sys.argv[1]))\" "
@@ -361,8 +378,12 @@ class OptimizedRLNCUAgent(RLOptimizedAgentBase):
             job_name=f"{executable} (nsys timing)",
             prefix_command=nsys_prefix,
         )
-        combined = nsys_stdout + "\n" + nsys_stderr
+        return nsys_stdout + "\n" + nsys_stderr
 
+    @staticmethod
+    def _nsys_timing_from_trace(
+        combined: str, solution_kernel_names: set
+    ) -> Tuple[int, Dict[str, int]]:
         span_ns, _, _, _ = _parse_nsys_gpu_trace(combined, solution_kernel_names)
 
         # Build {source_kernel: total_ns} from the same CSV — sum over all
@@ -396,7 +417,8 @@ class OptimizedRLNCUAgent(RLOptimizedAgentBase):
 
         Three-step redesign:
           1. Compile + run with the verification harness.
-          2. ``nsys`` profile pass: gives wall-clock GPU time (ns) from first
+          2. ``nsys`` profile pass (also the source of the launched kernel
+             names, formerly a separate ``ncu`` listing run): gives wall-clock GPU time (ns) from first
              solution-kernel start to last solution-kernel end. This is the
              reward signal — fast (single profile pass), and pre-filtered by
              source-declared kernel names so LibTorch noise is excluded.
@@ -431,16 +453,31 @@ class OptimizedRLNCUAgent(RLOptimizedAgentBase):
         if not success:
             FeedbackAgent.raise_numerics_verification_error(stdout_list, stderr_list)
 
-        # ── (1) discover source-declared kernel names ──────────────────
+        # ── (1) nsys pass: the launched kernels and the reward ─────────
+        # The trace lists every kernel that ran, so the source-declared
+        # kernel names come from it too; the separate ``ncu -k <invalid>``
+        # listing run is only needed if the trace has no kernel rows.
+        try:
+            with perf_span(
+                phase="nsys_timing",
+                problem_id=self.problem_id,
+                agent="opt_ncu_rl_optimized",
+            ):
+                trace = await self._nsys_trace(path)
+            nsys_error = None
+        except Exception as e:
+            trace, nsys_error = "", e
         try:
             with perf_span(
                 phase="find_kernel_names",
                 problem_id=self.problem_id,
                 agent="opt_ncu_rl_optimized",
             ):
-                kernel_names = await find_kernel_names_ncu(
-                    path, filepath, self.gpu, self.ncu_timeout_s
-                )
+                kernel_names = find_kernel_names_trace(trace, filepath) if trace else []
+                if not kernel_names:
+                    kernel_names = await find_kernel_names_ncu(
+                        path, filepath, self.gpu, self.ncu_timeout_s
+                    )
         except Exception as e:
             self.agent_logger.warning(f"find_kernel_names_ncu failed: {e}")
             kernel_names = []
@@ -456,20 +493,22 @@ class OptimizedRLNCUAgent(RLOptimizedAgentBase):
             )
         solution_kernels = set(kernel_names)
 
-        # ── (2) nsys timing pass — the reward ──────────────────────────
-        try:
-            with perf_span(
-                phase="nsys_timing",
-                problem_id=self.problem_id,
-                agent="opt_ncu_rl_optimized",
-            ) as span:
-                gpu_time_ns, per_kernel_ns = await self._nsys_timing(path, solution_kernels)
-                span.set_extra(gpu_time_ns=gpu_time_ns)
-        except Exception as e:
+        # ── (2) reward from the same trace ─────────────────────────────
+        if nsys_error is not None:
             # Don't silently set the reward to 0 — that masks profile failures
             # as fake "successful 0-cycle measurements" and lets the comparator
             # crown bogus rollouts as winners.
-            raise FeedbackError(f"nsys timing pass failed for {filepath}: {e}") from e
+            raise FeedbackError(
+                f"nsys timing pass failed for {filepath}: {nsys_error}"
+            ) from nsys_error
+        gpu_time_ns, per_kernel_ns = self._nsys_timing_from_trace(trace, solution_kernels)
+        perf_record(
+            phase="nsys_reward",
+            duration_s=0.0,
+            problem_id=self.problem_id,
+            agent="opt_ncu_rl_optimized",
+            extra={"gpu_time_ns": gpu_time_ns},
+        )
 
         if gpu_time_ns <= 0:
             # The nsys call ran but returned a 0-span: the solution kernels

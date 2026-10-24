@@ -83,10 +83,10 @@ def test_seed_classification_chains():
 def test_unexplained_and_target_level_states():
     h = StateHierarchy([State("hot", None, {"bw_util": ">", "v": 90})], REG)
     assert h.classify(vec(bw_util=10), target="cuda:sm_75").status == "unexplained"
-    h.add(State("adreno_tex", "hot", {"l1_hit": "<", "v": 50}, level="target", scope="opencl:adreno_740"))
+    h.add(State("adreno_tex", "hot", {"l1_hit": "<", "v": 50}, level="target", scope="opencl:adreno740"))
     v = vec(bw_util=95, l1_hit=10)
     assert h.classify(v, target="cuda:sm_75").chain == ["hot"]
-    assert h.classify(v, target="opencl:adreno_740").chain == ["hot", "adreno_tex"]
+    assert h.classify(v, target="opencl:adreno740").chain == ["hot", "adreno_tex"]
 
 
 # ---------------------------------------------------------------- adapters
@@ -111,7 +111,14 @@ def test_adapters_ncu_summary_text_roofline():
     est = M.roofline_vector(REG.get("cuda:sm_75"), M.RooflineInput(bytes=672e3, flops=0, time_us=1.0))
     assert est["bw_util"]["v"] == 100.0 and all(x["src"] == "estimated" for x in est.values())
     # OpenCL / RVV stubs share the interface
-    assert M.adapter_for(REG.get("opencl:adreno_740")).from_profile({"alu_util": 40})["compute_util"]["v"] == 40
+    ocl = M.adapter_for(REG.get("opencl:adreno650"))                       # knowledge.opencl_profile summaries
+    ov = ocl.vector(profile={"duration_us": 60.0, "launches": 4, "kernel_wg_max_min": 512, "device_max_wg": 1024},
+                    estimate=M.RooflineInput(bytes=4e6, flops=1e6, time_us=100.0))
+    assert ov["launch_frac"]["src"] == "measured" and round(ov["launch_frac"]["v"], 2) == 0.4
+    assert ov["reg_pressure"]["v"] == 50.0 and ov["bw_util"]["src"] == "estimated"
+    assert M.adapter_for(REG.get("opencl:adreno740"), "opencl_profile").from_profile({"alu_util": 40})["compute_util"]["v"] == 40
+    t_new = TargetRegistry().ensure("opencl:adreno999", peaks=(100.0, 10.0))  # peaks from the TargetProfile
+    assert t_new.family == "simt_gpu" and t_new.peak_gbps == 10.0
     assert "compute_util" in M.adapter_for(REG.get("rvv:vlen256")).from_profile({"vector_util": 10})
     assert M.canonical_ncu_delta({"dram_throughput": -3.0, "registers_per_thread_max": 51}) == \
         {"bw_util": -3.0, "reg_pressure": 20.0}
@@ -129,7 +136,7 @@ def test_ontology_seed_aliases_realizations_candidates():
     t = o.get("shared_memory_tiling")
     assert "cp.async" in o.realization(t, "cuda:sm_89")["how"]
     assert "__shared__" in o.realization(t, "cuda:sm_75")["how"]
-    assert "__local" in o.realization(t, "opencl:adreno_740")["how"]
+    assert "__local" in o.realization(t, "opencl:adreno740")["how"]
     assert "VLEN" in o.realization(t, "rvv:vlen256")["how"]
     assert o.realization(o.get("warp_shuffle_reduction"), "rvv:vlen256") is None
     ctx = {"op_class": "gemm", "dtype": "fp32"}
@@ -262,7 +269,7 @@ def test_claim_levels_retrieval_and_lift(tmp_path):
     apply_lift(e, cs)
     assert c.level == "family" and c.family == "simt_gpu" and c.support == 4
     assert cs.relevant(**q89) == [c]
-    assert cs.relevant(target="opencl", arch="adreno_740", op_class="conv", technique="tiling") == [c]
+    assert cs.relevant(target="opencl", arch="adreno740", op_class="conv", technique="tiling") == [c]
     assert "simt_gpu family" in cs.render([c])
     with pytest.raises(EditError, match="2 families"):
         validate_lift({"kind": "lift", "claim_id": c.id, "to": "universal", "evidence": []}, index=idx, claims=cs,
@@ -577,3 +584,37 @@ def test_parse_json_response_with_backticks_inside_strings():
     raw = '{"edits": [{"kind": "pitfall", "text": "the response lacked a ```cuda code block, so nothing ran"}]}'
     assert parse_json_response(raw)["edits"][0]["kind"] == "pitfall"
     assert parse_json_response('ok:\n```json\n{"a": 1}\n```\n') == {"a": 1}
+
+
+def test_agent_end_to_end_v2_opencl(tmp_path):
+    """OpenCL target through the same v2 path: opencl_profile -> OpenCLProfileAdapter, target opencl:<arch>."""
+    import test_multislot_opencl as T
+    if not T._opencl_gpu():
+        pytest.skip("needs an OpenCL device")
+    from kernelblaster.agents.opt_multislot import MultiSlotAgent
+    from kernelblaster.knowledge.impl_store import ImplStore
+    from kernelblaster.knowledge.slots import OpenCLLocalEvaluator, SlotProblem
+    p = SlotProblem(shutil.copytree(T.FIX, tmp_path / "lenet"))
+    state = {"broke": False, "fix_calls": 0, "linear_ok": None, "prompts": []}
+    agentic_llm.register_stub("scripted_cl_v2", T.scripted(state))
+    kv = KnowledgeV2(tmp_path / "k")
+    try:
+        agent = MultiSlotAgent(p, OpenCLLocalEvaluator(work_root=tmp_path / "work"), model="stub:scripted_cl_v2",
+                               out_dir=tmp_path / "out", arch=T.ARCH, impl_store=ImplStore(tmp_path / "impl"),
+                               outcome_log=kv.outcomes, claims=kv.claims, rollouts=2, steps=3, min_share=0.0,
+                               seed=1, ncu="best", knowledge_v2=kv)
+        res = asyncio.run(agent.run())
+    except Exception as e:                       # no OpenCL runtime on this host
+        if "OpenCL" in repr(e) or "CL_" in repr(e):
+            pytest.skip(f"OpenCL unavailable: {e!r}")
+        raise
+    finally:
+        agentic_llm.unregister_stub("scripted_cl_v2")
+    assert res["final_ok"], res
+    rows = kv.outcomes.rows()
+    assert len(rows) == 6 and all(r["target"] == "opencl" for r in rows)
+    assert all(r["v2"]["chain"] for r in rows)
+    measured = [r for r in rows if any(m["src"] == "measured" for m in r["v2"]["metrics_before"].values())]
+    assert measured and all("launch_frac" in r["v2"]["metrics_before"] for r in measured)
+    # CUDA spellings never reach an OpenCL prompt via the realizations
+    assert not any("__shfl_down_sync" in u or "__shared__" in u for u in state["prompts"] if "Technique to apply" in u)

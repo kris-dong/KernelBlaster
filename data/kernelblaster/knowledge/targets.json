@@ -1,5 +1,5 @@
 {
- "_doc": "Families and targets (knowledge_architecture.md section 2). Levels are fixed in code; this file is data. Peaks are fp32 GFLOP/s and DRAM GB/s; width = parallel lanes the machine needs to be full (SMs x max resident threads, subgroups, VLEN/32 lanes); launch_us = per-kernel launch/sync floor.",
+ "_doc": "Families and targets (knowledge_architecture.md section 2); keys are <manifest target>:<TargetProfile.arch_label>, peaks match the agents' ARCH_PEAKS / OPENCL_PEAKS, which fill in for targets missing here. Levels are fixed in code; this file is data. Peaks are fp32 GFLOP/s and DRAM GB/s; width = parallel lanes the machine needs to be full (SMs x max resident threads, subgroups, VLEN/32 lanes); launch_us = per-kernel launch/sync floor.",
  "families": {
   "simt_gpu": {"description": "SIMT GPUs: CUDA (NVIDIA), OpenCL (Adreno)", "backends": ["cuda", "opencl"]},
   "vector_cpu": {"description": "in-order CPUs with a vector unit (RISC-V V)", "backends": ["riscv", "rvv"]},
@@ -21,9 +21,12 @@
   "cuda:sm_90": {"family": "simt_gpu", "name": "H100 SXM", "peak_gflops": 67000.0, "peak_gbps": 3350.0,
                  "sms": 132, "threads_per_sm": 2048, "warp": 32, "smem_kb": 228, "l2_kb": 51200,
                  "launch_us": 3.0, "profiler": "ncu"},
-  "opencl:adreno_740": {"family": "simt_gpu", "name": "Adreno 740", "peak_gflops": 2000.0, "peak_gbps": 64.0,
-                        "sms": 6, "threads_per_sm": 1024, "warp": 64, "smem_kb": 32, "l2_kb": 1024,
-                        "launch_us": 20.0, "profiler": "adreno"},
+  "opencl:adreno650": {"family": "simt_gpu", "name": "Adreno 650 (QRB5165 / RB5)", "peak_gflops": 1228.0, "peak_gbps": 44.0,
+                       "sms": 2, "threads_per_sm": 1024, "warp": 64, "smem_kb": 32, "l2_kb": 1024,
+                       "launch_us": 10.0, "profiler": "opencl_profile"},
+  "opencl:adreno740": {"family": "simt_gpu", "name": "Adreno 740", "peak_gflops": 3000.0, "peak_gbps": 67.0,
+                       "sms": 6, "threads_per_sm": 1024, "warp": 64, "smem_kb": 32, "l2_kb": 1024,
+                       "launch_us": 10.0, "profiler": "opencl_profile", "aliases": ["opencl:adreno_740"]},
   "rvv:vlen256": {"family": "vector_cpu", "name": "Saturn VLEN=256", "peak_gflops": 8.0, "peak_gbps": 16.0,
                   "sms": 1, "threads_per_sm": 8, "warp": 8, "smem_kb": 32, "l2_kb": 512,
                   "launch_us": 1.0, "profiler": "mcycle", "aliases": ["riscv:rvv-vlen256"]},
