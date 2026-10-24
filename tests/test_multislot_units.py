@@ -65,7 +65,10 @@ def test_store_retrieval_tiers(tmp_path):
     r = s.retrieve(target="cuda", arch="sm_75", op="linear", op_class="gemm", signature=sig,
                    shapes=[{"M": 4096, "K": 4096, "N": 4096}])
     assert r["seed"] is None and r["adapt"] is None                      # no shared bucket: not an adapt seed
-    assert [e.op for e in r["examples"]][0] == "linear"                  # ...but an ideas-only example
+    assert [e.op for e in r["examples"]] == ["bmm"]                      # ...and by default not shown at all
+    r = s.retrieve(target="cuda", arch="sm_75", op="linear", op_class="gemm", signature=sig,
+                   shapes=[{"M": 4096, "K": 4096, "N": 4096}], far_same_op=True)
+    assert [e.op for e in r["examples"]][0] == "linear"                  # opt-in: ideas-only example
     r = s.retrieve(target="cuda", arch="sm_89", op="linear", op_class="gemm", signature=sig, shapes=sh)
     assert r["seed"] is None and r["adapt"] is not None                  # other arch, same bucket -> adapt
     r = s.retrieve(target="cuda", arch="sm_75", op="linear", op_class="gemm", signature=sig, shapes=sh,
