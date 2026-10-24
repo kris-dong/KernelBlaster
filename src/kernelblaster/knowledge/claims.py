@@ -70,7 +70,9 @@ SCOPE_FIELDS = ("target", "arch", "op_class", "state", "technique", "problem_id"
 LOCAL_FIELDS = ("problem_id", "slot")
 
 MIN_SUPPORT = 2                 # default prompt threshold
-MIN_SUPPORT_BY_KIND = {IMPL_NOTE: 1}   # one observation of a dead end on a slot is the fact
+# one observed dead end on a slot is the fact; a pitfall must cite a real failure
+# (validated) and its fix is cheap to try, so one is enough for those two kinds
+MIN_SUPPORT_BY_KIND = {IMPL_NOTE: 1, PITFALL: 1}
 AGE_OUT_EPOCHS = 12             # retire ineligible claims untouched this long
 HALF_LIFE_EPOCHS = 30           # ranking decay of eligible claims
 PURGE_RETIRED_EPOCHS = 100      # drop retired claims from the file after this
