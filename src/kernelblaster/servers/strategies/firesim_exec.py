@@ -68,7 +68,9 @@ from ..utils.exec_strategy import (
 # regex + subprocess plumbing, import the pieces we can reuse. If we
 # ever grow a third RISC-V exec target, promote these to a shared
 # ``strategies/utils/riscv_batching.py``.
-from .spike_exec import _WALL_CYCLES_RE, _kernel_id_for
+from .spike_exec import (
+    _kernel_id_for, _split_wall_windows, _window_for,
+)
 
 
 class FireSimError(Exception):
@@ -562,22 +564,11 @@ class FireSimExecStrategy(ExecStrategy):
 
         Missing markers → per-job failure with a clear message.
         """
-        matches: list[tuple[int, int, str]] = []
-        for m in _WALL_CYCLES_RE.finditer(stdout):
-            tag = m.group("name") or ""
-            base = tag.split("@", 1)[0]
-            matches.append((m.start(), m.end(), base))
-
-        per_name: dict[str, str] = {}
-        prev_wall_end = 0
-        for start, end, base in matches:
-            window = stdout[prev_wall_end:end]
-            per_name[base] = window
-            prev_wall_end = end
+        windows = _split_wall_windows(stdout)
 
         results: list[ExecJobResult] = []
         for j, name in zip(jobs, model_names):
-            block = per_name.get(name)
+            block = _window_for(windows, name)
             if block is None:
                 results.append(ExecJobResult(
                     stdout="", stderr=stderr,

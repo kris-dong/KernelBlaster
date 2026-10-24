@@ -76,8 +76,10 @@ from ..utils.exec_strategy import (
 #     === MODELBLASTER_WALL_CYCLES [kb_19_ReLU@fp32] === 12345678
 #     === MODELBLASTER_VERIFY [kb_19_ReLU@fp32] === max_abs_err=0.0 max_rel_err=0.0 n=1024
 # The optional bracket carries the tag as ``<model>@<quant>`` (or
-# ``<model>@p<pool_size>`` for pool sweeps). Bucketing below strips the
-# ``@`` suffix so a job whose filename stem is ``kb_19_ReLU`` matches
+# ``<model>@p<pool_size>`` for pool sweeps, or ``<mid>@<variant>`` for
+# harness_shared_input same-problem batches). Bucketing below keys on
+# the full tag; a lookup name without ``@`` falls back to the bare
+# model part so a job whose filename stem is ``kb_19_ReLU`` matches
 # ``kb_19_ReLU@fp32``.
 _WALL_CYCLES_RE = re.compile(
     r"=== MODELBLASTER_WALL_CYCLES(?: \[(?P<name>[^\]]+)\])? === (?P<cycles>\d+)"
@@ -544,30 +546,11 @@ class SpikeExecStrategy(ExecStrategy):
 
         Missing markers → per-job failure with a specific message.
         """
-        # Find every WALL_CYCLES occurrence — record its char span + name.
-        # WALL_CYCLES is emitted AFTER everything else for its model
-        # (OUTPUT / PROFILE / VERIFY all print earlier), so slicing on
-        # WALL-to-WALL boundaries captures each model's full block.
-        matches: list[tuple[int, int, str]] = []   # (start, end, name)
-        for m in _WALL_CYCLES_RE.finditer(stdout):
-            tag = m.group("name") or ""     # e.g. "kb_19_ReLU@fp32"
-            base = tag.split("@", 1)[0]     # → "kb_19_ReLU"
-            matches.append((m.start(), m.end(), base))
-
-        # Window for model k spans [end_of_k-1_wall .. end_of_k_wall];
-        # the first model's window starts at 0.
-        per_name: dict[str, str] = {}
-        prev_wall_end = 0
-        for start, end, base in matches:
-            window = stdout[prev_wall_end:end]
-            # Later windows overwrite earlier ones for a given name so
-            # retries / reruns report the most recent metric.
-            per_name[base] = window
-            prev_wall_end = end
+        windows = _split_wall_windows(stdout)
 
         results: list[ExecJobResult] = []
         for j, name in zip(jobs, model_names):
-            block = per_name.get(name)
+            block = _window_for(windows, name)
             if block is None:
                 results.append(ExecJobResult(
                     stdout="", stderr=stderr,
@@ -654,6 +637,45 @@ class SpikeExecStrategy(ExecStrategy):
 def _kernel_id_for(job: ExecJob) -> str:
     stem = Path(job.filename).stem if job.filename else "gpu_executable"
     return stem
+
+
+def _split_wall_windows(stdout: str) -> tuple[dict[str, str], dict[str, str]]:
+    """Slice runner stdout into per-model blocks keyed by marker tag.
+
+    WALL_CYCLES is emitted AFTER everything else for its model
+    (OUTPUT / PROFILE / VERIFY all print earlier), so slicing on
+    WALL-to-WALL boundaries captures each model's full block: window
+    k spans [end_of_k-1_wall .. end_of_k_wall], the first starts at 0.
+
+    Returns ``(by_tag, by_base)``: ``by_tag`` keyed on the full bracket
+    tag (``kb_19_ReLU@fp32``, ``<mid>@<variant>``), ``by_base`` on the
+    part before ``@``. Later windows overwrite earlier ones for a given
+    key so retries / reruns report the most recent metric.
+    """
+    by_tag: dict[str, str] = {}
+    by_base: dict[str, str] = {}
+    prev_wall_end = 0
+    for m in _WALL_CYCLES_RE.finditer(stdout):
+        tag = m.group("name") or ""     # e.g. "kb_19_ReLU@fp32"
+        window = stdout[prev_wall_end:m.end()]
+        by_tag[tag] = window
+        by_base[tag.split("@", 1)[0]] = window   # → "kb_19_ReLU"
+        prev_wall_end = m.end()
+    return by_tag, by_base
+
+
+def _window_for(
+    windows: tuple[dict[str, str], dict[str, str]], name: str,
+) -> Optional[str]:
+    """Exact tag match first. Only a plain (``@``-less) lookup name
+    falls back to the bare-model bucket — a ``<mid>@<variant>`` name
+    must never pick up a sibling variant's window."""
+    by_tag, by_base = windows
+    if name in by_tag:
+        return by_tag[name]
+    if "@" not in name:
+        return by_base.get(name)
+    return None
 
 
 def _all_failed(jobs: list[ExecJob], message: str) -> list[ExecJobResult]:
