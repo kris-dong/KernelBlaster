@@ -40,8 +40,10 @@ universal                      reuse, parallelism exposure, latency hiding, fusi
 │   │   ├── ada                cuda:sm_89
 │   │   └── hopper             cuda:sm_90
 │   └── adreno                 opencl:adreno650, opencl:adreno740
-├── vector_cpu                 rvv:vlen256
-└── systolic                   gemmini:default
+├── vector_cpu
+│   └── rvv                    rvv:vlen128, rvv:vlen256, rvv:vlen512 (Saturn)
+└── systolic
+    └── gemmini                gemmini:default
 ```
 
 Depth is open: nodes and targets are data, and can be added at run time
@@ -148,6 +150,9 @@ Missing metrics are absent (not zero). Predicates over an absent metric evaluate
   (falling back up its scope chain), so CUDA spellings never reach an Adreno prompt.
 * Seeded from the existing 16 states × ~80 techniques, the multi-slot `TECHNIQUES` catalogue,
   and the CUDA / OpenCL / RISC-V database footers — mapped onto mechanisms; duplicates merged.
+  The comprehensive seed (section 15) has 69 curated techniques at their nodes, each with a
+  seed prior (low pseudo-count) that recorded evidence overrides, plus evidence mined from
+  earlier runs.
 
 ## 6. Hypotheses: proactive, creative proposals
 
@@ -275,6 +280,76 @@ Retrieval for a slot builds a budgeted prompt section, most specific first:
 | graph hypotheses (impl.) | keyed by ModelBlaster `graph_hints/v1` ids, decisions synced from MB | a KB-side lifecycle | MB already builds and decides graph changes (section 14) |
 | metric adapters (impl.) | chosen by the agent's `TargetProfile.profiler` module; profile peaks fill `targets.json` gaps | a separate target switch | one place decides per-target behaviour (section 14) |
 
+## 15. The seeded knowledge base
+
+The seed is data files plus a loader; databases are never hand-edited.
+
+| file (`data/kernelblaster/knowledge/`) | contents |
+|---|---|
+| `targets.json` | the scope tree (12 nodes), 11 targets with peaks and resource limits (registers, shared memory, tensor-core types, cp.async / TF32 support; Adreno wave / local memory / fp16 rate; RVV VLEN / LMUL / L1D; Gemmini array, scratchpad, accumulator), the backend -> node map |
+| `states.json` | 21 states: the 15 of section 4 plus `uncoalesced_memory_bound`, `streaming_low_reuse` (AI < 1), `smem_bank_conflicted`, `uncoalesced_access`, `register_limited_occupancy`, `tensor_core_eligible` (matrix op class, AI >= 16, underutilized); the bank-conflict / uncoalesced states use two new canonical metrics that are measured only when the profiler reports them (NCU SourceCounters / memory tables or their rule hints; the current `ncu.py` sections do not), otherwise classification stays at the parent |
+| `techniques/*.json` | 69 curated techniques in nine files by area (general, GEMM / conv, reductions / norms / pooling / softmax, elementwise / data movement, attention / scan / RNN, NVIDIA, Adreno, RVV, Gemmini): mechanism, preconditions, predicted metric directions, pitfalls, op-class and op-kind gates (`conv2d_dw`, `conv_transpose2d`, `lstm_seq`, `cumsum`, `topk`, ...; a fused slot matches when any stage does), a seed prior `{mean, n<=1}`, and realizations by scope (e.g. cp.async only on `target:cuda:sm_80+`, wgmma / TMA on `sm_90+`, fp16-only tensor cores on sm_75, image2d / 64-128 work-groups / subgroups / half on Adreno, LMUL / strip-mining / segment loads on RVV, scratchpad tiling / im2col / accumulator on Gemmini). The 21 v1 DB / footer names not folded in as aliases are still imported with `slot=false` |
+| `mined.json` | written by `scripts/mine_knowledge.py` from the recorded runs (17 knowledge-v2 databases, 7 v1 outcome logs, 25 implementation stores): 573 technique outcomes (folded into the statistics as evidence, never double-counted against a DB's own outcomes) and 40 applicability claims (`helps` / `hurts` when >= 2/3 of >= 3 attempts agree; an implementation-store record counts for the last technique of its lineage), scoped to the lowest common ancestor of their targets (12 at `nvidia_gpu`) and citing their record ids |
+
+`scripts/seed_knowledge.py OUT [--fresh] [--no-mined] [--seed-dir DIR] [--report]` builds or
+refreshes `OUT/knowledge.db` (idempotent; a newer seed version refreshes seed-sourced rows only;
+`--seed-dir` / `KB_KNOWLEDGE_SEED_DIR` build from another seed, e.g. for A/B runs). `KnowledgeV2`
+runs the same seeding when it opens a database. Tests (`tests/test_knowledge_seed.py`): every
+technique parses and its predicates evaluate, every scope and realization target exists, no
+duplicate ids or aliases, state predicates evaluate, no CUDA spelling in an OpenCL / RVV
+realization, op-kind coverage, mined data validity, and the retrieval budget: the knowledge
+section of a slot prompt stays <= 3500 characters for every target and op class, each
+technique description < 1200.
+
+Curated slot techniques by op class and scope node (a technique at `universal` or `simt_gpu`
+applies to everything below it through its realizations; "(any)" = no op-class gate):
+
+| op class | universal | simt_gpu | nvidia_gpu | hopper | adreno | rvv | gemmini |
+|---|---|---|---|---|---|---|---|
+| gemm | 10 | 1 | 3 | 1 | 3 | 1 | 3 |
+| conv | 13 | 1 | 3 | 1 | 3 | 2 | 4 |
+| reduction | 11 | 3 |  |  | 1 | 2 |  |
+| elementwise | 6 | 1 |  |  | 2 | 1 |  |
+| data_movement | 5 | 1 |  |  |  | 1 |  |
+| attention | 8 | 2 | 3 | 1 | 1 |  |  |
+| scan | 1 |  |  |  |  |  |  |
+| other | 2 |  |  |  |  |  |  |
+| (any) | 9 | 4 |  |  |  | 1 |  |
+
+Offered per target (techniques with a realization there, over all states):
+
+| op class | sm_75 | sm_89 | sm_90 | adreno650 | rvv vlen256 | gemmini |
+|---|---|---|---|---|---|---|
+| gemm | 25 | 26 | 27 | 25 | 10 | 7 |
+| conv | 28 | 29 | 30 | 28 | 14 | 10 |
+| reduction | 26 | 26 | 26 | 26 | 13 | 3 |
+| elementwise | 19 | 19 | 19 | 19 | 13 | 3 |
+| data_movement | 18 | 18 | 18 | 16 | 12 | 3 |
+| attention | 24 | 25 | 26 | 22 | 13 | 4 |
+| scan | 13 | 13 | 13 | 12 | 8 | 2 |
+| other | 14 | 14 | 14 | 13 | 9 | 3 |
+
+For one slot the state chain and op kind gate this to 10-18 candidates (e.g. an underutilized
+conv2d on sm_89: 18; a memory-bound relu: 10); the seed priors and the mined statistics order
+the untried ones.
+
+**Live checks.** Open tree + automatic promotion, sanity run (sm_75 local, Haiku codegen,
+reflection and upkeep, 2 problems x 2 x 4 steps, on a copy of a seed-version-1 database): the old
+database upgraded in place, states / hypotheses / probation ran automatically (one state confirmed
+to core, 2 admitted, 7 proposals rejected), no errors; $0.54. A/B of this seed against the previous
+one (`--seed-dir` from 1301719), L40S sm_89, `--ncu best`, Haiku, 3 x 4 steps, 2 seeds per arm, on
+three Level2 problems none of the mined runs used (final partition speedup over the exported seed):
+
+| problem | previous seed | comprehensive seed |
+|---|---|---|
+| 21_Conv2d_Add_Scale_Sigmoid_GroupNorm | 18.6x, 16.6x | 15.6x, 17.1x |
+| 30_Gemm_GroupNorm_Hardtanh | 50.0x, 49.9x | 80.9x, 76.9x |
+| 57_Conv2d_ReLU_HardSwish | 9.0x, 10.3x | 9.6x, 10.2x |
+
+It does not hurt; on the GEMM problem the seeded arm went to `tensor_core_mma` (TF32 realization
+for sm_89, within tolerance) while the previous seed's arm spent its steps on
+`read_only_cache_and_restrict`. Two seeds per arm: indicative only. Cost $4.72 (4 runs).
+
 ## 14. Implementation (steps 1-6) and evaluation
 
 ### Where things are
@@ -285,7 +360,8 @@ Retrieval for a slot builds a budgeted prompt section, most specific first:
 | 1 canonical metrics, adapters | `metrics.py`: `NCUAdapter` (per-slot `ncu.summarize`), `NCUTextAdapter` (single-file text reports), `roofline_vector` (any target), `AdrenoAdapter` / `MCycleAdapter` stubs | |
 | 1 predicate DSL | `predicates.py` (`all`/`any`/`not`, metric comparisons incl. `ref` to another metric, `op_class`/`dtype`/`family`/`target in`) | |
 | 1 states + classifier | `states.py` | `states.json` (15 seed states, `legacy_map` for the 16 technique-DB and the v1 roofline names) |
-| 2 ontology + mechanism check | `ontology.py` (`seed_legacy` reads the old JSON DB and the three footers once) | `techniques.json` (27 curated, 84 v1/DB/footer names folded in as aliases, 21 imported as `slot=false`) |
+| 2 ontology + mechanism check | `ontology.py` (`load_seed_techniques`, op-kind gates, seed priors; `seed_legacy` reads the old JSON DB and the three footers once) | `techniques/*.json` (69 curated, section 15; v1/DB/footer names folded in as aliases, the rest imported as `slot=false`) |
+| seed loader, mining | `knowledge.py` (`_seed`, `_seed_mined`), `scripts/seed_knowledge.py`, `scripts/mine_knowledge.py` | `mined.json` |
 | 3 hierarchical stats | `stats.py` | |
 | 4 store, claims, reflection | `store.py` (`KnowledgeDB` incl. the audit log and runtime scopes, `SQLiteOutcomeLog`, `SQLiteClaimStore`), `reflect_v2.py` (`lift` to the lowest common ancestor, `revalidate_lifts` rollback, `mechanism`, `SemanticUpdaterV2`); `claims.Claim` gains `level`, `family`, `hypothesis_id`, kind `mechanism` | |
 | 5 hypotheses | `hypotheses.py` (`HypothesisBook`: automatic promotion with `MIN_EFFECT`, `revalidate` demotion, `validate_spec`, graph hypotheses) | |
@@ -304,7 +380,7 @@ Tests: `tests/test_knowledge_v2.py`.
 
 | design | implemented | why |
 |---|---|---|
-| `targets.yaml`, YAML seeds | JSON (`targets.json`, `states.json`, `techniques.json`) | no PyYAML in the environment; JSON loads the same and is diffable |
+| `targets.yaml`, YAML seeds | JSON (`targets.json`, `states.json`, `techniques/*.json`, `mined.json`) | no PyYAML in the environment; JSON loads the same and is diffable |
 | `occupancy` = achieved / theoretical | achieved occupancy, % of the hardware maximum | it is what NCU and the single-file report give directly; the theoretical limit is reflected in `reg_pressure` and the `register_limited` / `stalled_low_occupancy` states |
 | seed roots `memory_bound` (bw >= 50, compute < 40), `latency_bound` | five ordered roots: `latency_bound`, `balanced_bound`, `memory_bound` (`mem_util >= 50`, compute below it), `compute_bound`, `underutilized` (both < 50) | with both utilisations present the roots are total (nothing is unexplained); roofline estimates rarely reach 50 % of peak, so the old 15 %-threshold roofline names map to `underutilized > underutilized_memory|compute` |
 | stats ancestors "(family, ..., universal, parent states)" | one linear path: target -> its scope nodes -> universal at the leaf state, then the state chain at universal, then op class `*` (fp16 adds a most specific node) | the shrinkage recursion needs one parent per node; a parent node includes its children's data (empirical-Bayes approximation) |
