@@ -344,18 +344,39 @@ class HypothesisBook:
             out.append(h)
         return out
 
-    def sync_graph_hints(self, doc: dict) -> int:
-        """Fold ModelBlaster's decisions (graph_hints/v1 accepted|rejected) into graph hypotheses."""
+    def sync_graph_hints(self, doc: dict, *, target_key: str = "cuda:sm_75", mirror=None) -> int:
+        """Fold ModelBlaster's decisions (graph_hints/v1 accepted|rejected) into graph hypotheses.
+
+        Hints KB proposed update their hypothesis; decided hints from other producers
+        (MB's cost model, its kernel cache, XPU-RT) are added as graph hypotheses with
+        the decision, so the knowledge base sees every graph-level outcome."""
         n = 0
         for hint in doc.get("hints", []):
-            h = self.items.get(hint.get("id"))
-            if h is None or h.kind != "graph":
-                continue
+            hid = hint.get("id")
             st = {"accepted": PROMOTED, "rejected": RETIRED}.get(hint.get("status"))
-            if st and h.status != st:
-                h.status, h.reason = st, f"ModelBlaster graph_hints: {hint.get('status')} " \
-                                         f"({len(hint.get('evidence', []))} decisions)"
+            if not hid or (st is None and hid not in self.items):
+                continue
+            h = self.items.get(hid)
+            if h is not None and h.kind != "graph":
+                continue
+            reason = f"ModelBlaster graph_hints: {hint.get('status')} ({len(hint.get('evidence', []))} decisions)"
+            if h is None:
+                tgt = hint.get("target", "cuda")
+                h = Hypothesis(id=hid, name=re.sub(r"[^a-z0-9_]", "_", hid.lower())[:64] or "graph_hint", kind="graph",
+                               source="graph", mechanism=f"{hint.get('kind', 'graph')} hint {hid} decided by ModelBlaster",
+                               how=json.dumps({k: hint[k] for k in hint if k not in ("evidence", "source")},
+                                              default=str)[:800],
+                               target_key=target_key if tgt in target_key else f"{tgt}:unknown", budget=0,
+                               status=st, reason=reason)
+                h.trigger = {"evidence": hint.get("evidence", [])[-4:]}
                 self.save(h)
+                self.db.audit("graph_hint_synced", hid, {"status": st, "new": True, "reason": reason}, mirror)
+                n += 1
+            elif st and h.status != st:
+                h.status, h.reason = st, reason
+                h.trigger = {**h.trigger, "evidence": hint.get("evidence", [])[-4:]}
+                self.save(h)
+                self.db.audit("graph_hint_synced", hid, {"status": st, "new": False, "reason": reason}, mirror)
                 n += 1
         return n
 

@@ -30,13 +30,19 @@ from ..outcomes import IMPROVED, OutcomeRecord
 from . import discovery as D
 from . import metrics as M
 from . import predicates as P
-from .hypotheses import EXPLORE_FRAC, Hypothesis, HypothesisBook, build_generation_messages, validate_spec
+from .hypotheses import (EXPLORE_FRAC, MIN_EFFECT, Hypothesis, HypothesisBook, build_generation_messages,
+                         validate_spec)
 from .ontology import MECH_UNKNOWN, Ontology, Technique, mechanism_check
+from .predictions import PredictionBook
 from .states import Classification, State, StateHierarchy, load_seed
 from .stats import HierStats, path as stat_path
 from .store import KnowledgeDB, SQLiteClaimStore, SQLiteOutcomeLog
 from .targets import DATA_DIR, TargetRegistry
 
+MAX_PORT_TRIGGERS = 1        # per generation call
+GAP_MIN_TRIES = 4
+GAP_WINDOW = 12
+ACCESS_TRIGGER_PCT = 50.0    # measured uncoalesced / bank-conflict excess that makes a profiler trigger
 SEED_VERSION = 3              # 2: scope tree, node-level techniques; 3: comprehensive seed
 
 
@@ -79,6 +85,7 @@ class KnowledgeV2:
             self._seed_mined()
         self.stats = HierStats(self.registry, self.db, kappa=kappa)
         self.hypotheses = HypothesisBook(self.db, self.registry, self.ontology)
+        self.predictions = PredictionBook(self.db, self.hierarchy, self.review_path)
         self.n_selected = self.n_explore = 0
         self.usage: Counter = Counter()
         self.events: list[dict] = []              # upkeep events of this process (for result.json)
@@ -240,19 +247,20 @@ class KnowledgeV2:
         _, est, n, tid = ranked[0]
         t = self.ontology.techniques[tid]
         ev, _ = self.stats.evidence_level(tid, nodes)
-        return Choice(tid, "technique", self.technique_text(t, target_key), est, n, ev,
+        return Choice(tid, "technique", self.technique_text(t, target_key, chain), est, n, ev,
                       ranked=[(i, round(e, 4), k) for _, e, k, i in ranked[:8]])
 
     def priors(self, items) -> dict:
         return {i: self.ontology.techniques[i].prior for i in items
                 if i in self.ontology.techniques and self.ontology.techniques[i].prior}
 
-    def technique_text(self, t: Technique, target_key: str) -> str:
+    def technique_text(self, t: Technique, target_key: str, chain: Optional[list] = None) -> str:
         r = self.ontology.realization(t, target_key) or {}
         bits = [r.get("how") or t.mechanism, f"Mechanism: {t.mechanism}."]
-        if t.predicts:
+        pred = self.predictions.effective(t.id, t.predicts, chain)
+        if pred:
             bits.append("Expected measurable effect: " + ", ".join(f"{k} {v.replace('_', ' ')}"
-                                                                   for k, v in t.predicts.items()) + ".")
+                                                                   for k, v in pred.items()) + ".")
         if t.risks:
             bits.append("Risks: " + "; ".join(t.risks) + ".")
         if r.get("params_prior"):
@@ -309,7 +317,7 @@ class KnowledgeV2:
             pred = self.hypotheses.items[choice.item_id].predicts
         else:                                        # legacy flows may name techniques the ontology lacks
             t = self.ontology.get(choice.item_id)
-            pred = t.predicts if t is not None else {}
+            pred = self.predictions.effective(t.id, t.predicts, cls.chain) if t is not None else {}
         mech = mechanism_check(pred, before, after) if after else {"label": MECH_UNKNOWN, "agree": 0,
                                                                   "disagree": 0, "metrics": {}}
         measured = bool(mech["metrics"])
@@ -378,6 +386,7 @@ class KnowledgeV2:
             from .reflect_v2 import revalidate_lifts
             index = {r.id: r for r in self.outcomes}
             evs += revalidate_lifts(self.claims, index, self.registry, self.review_path, self.db)
+            evs += self.predictions.refine(rows, self.ontology, self.claims)
             self.claims.save()
             if self.upkeep_model:
                 evs += await self.discover_states(rows)
@@ -445,12 +454,9 @@ class KnowledgeV2:
         for (tk, opc, chain, dt), vec in ctxs.items():
             techs, _ = self.candidates(target_key=tk, op_class=opc, dtype=dt, chain=list(chain), vec=vec)
             nodes = stat_path(self.registry, target_key=tk, op_class=opc, chain=list(chain), dtype=dt)
-            tried = [(t.id, self.stats.estimate(t.id, nodes), self.stats.count(t.id, nodes[0])) for t in techs]
+            tried = [(t.id, self.stats.estimate(t.id, nodes, t.prior or None), self.stats.count(t.id, nodes[0]))
+                     for t in techs]
             tried_local = [x for x in tried if x[2] > 0]
-            key = f"gap|{tk}|{opc}|{chain[-1]}"
-            if len(tried_local) >= 4 and all(e <= 0 for _, e, _ in tried_local) and key not in handled:
-                trig.append({"source": "gap", "key": key, "target": tk, "op_class": opc, "state": list(chain),
-                             "tried": [{"technique": i, "est": round(e, 4), "n": n} for i, e, n in tried_local]})
             pos = sorted([x for x in tried_local if x[1] > 0], key=lambda x: -x[1])[:3]
             for i in range(len(pos)):
                 for j in range(i + 1, len(pos)):
@@ -469,9 +475,19 @@ class KnowledgeV2:
                         trig.append({"source": "port", "key": key, "target": tk, "op_class": opc,
                                      "technique": t.id, "mechanism": t.mechanism,
                                      "realizations": t.realizations[:2]})
+        trig += self.gap_triggers(rows, handled)
         for r in rows[-200:]:
             v2 = r.get("v2") or {}
             tk = f"{r['target']}:{r['arch']}"
+            vb = v2.get("metrics_before") or {}
+            for metric, label in (("uncoalesced", "UncoalescedGlobalAccess"), ("bank_conflicts", "SharedBankConflicts")):
+                m = vb.get(metric)
+                key = f"profiler|{tk}|{r['op_class']}|{label}"
+                if m and m.get("src") == "measured" and m["v"] >= ACCESS_TRIGGER_PCT and key not in handled:
+                    handled.add(key)
+                    trig.append({"source": "profiler", "key": key, "target": tk, "op_class": r["op_class"],
+                                 "state": v2.get("chain"), "rule": {"rule": label, "measured_excess_pct": m["v"],
+                                                                    "hint": f"{metric} = {m['v']:.0f}% excess"}})
             for rule in v2.get("ncu_rules") or []:
                 key = f"profiler|{tk}|{r['op_class']}|{rule.get('rule')}"
                 if (rule.get("est_speedup_pct") or 0) >= 20 and key not in handled:
@@ -484,14 +500,57 @@ class KnowledgeV2:
                 trig.append({"source": "code_mining", "key": key, "target": tk, "op_class": r["op_class"],
                              "technique": v2.get("item_id"), "speedup": r.get("speedup"),
                              "mechanism_check": m.get("metrics"), "diff": (v2.get("diff_excerpt") or "")[:1500]})
-        # one of each source first, then the rest (diversity under the cap)
+        # priority gap > profiler > code mining > combine > port; port capped (footer techniques
+        # without a realization here are plentiful and crowded the others out)
         order = {"gap": 0, "profiler": 1, "code_mining": 2, "combine": 3, "port": 4}
-        dedup = {t["key"]: t for t in trig}
-        firsts, rest, got = [], [], set()
-        for t in sorted(dedup.values(), key=lambda t: order.get(t["source"], 9)):
-            (rest if t["source"] in got else firsts).append(t)
-            got.add(t["source"])
-        return (firsts + rest)[:max_triggers]
+        dedup = sorted({t["key"]: t for t in trig}.values(), key=lambda t: order.get(t["source"], 9))
+        ports = [t for t in dedup if t["source"] == "port"][:MAX_PORT_TRIGGERS]
+        return ([t for t in dedup if t["source"] != "port"] + ports)[:max_triggers]
+
+    def gap_triggers(self, rows: list[dict], handled: set) -> list[dict]:
+        """Contexts where the local evidence shows nothing known pays.
+
+        v1 of this trigger asked for >= 4 locally tried techniques whose *shrunk* estimates
+        were all <= 0; with naive seeds nearly everything wins, and the estimates are pulled
+        toward positive parents and priors, so it never fired. Now: per (target, op class,
+        leaf state), >= GAP_MIN_TRIES recent outcomes over >= 3 techniques and no technique
+        whose local mean reaches MIN_EFFECT; and per (problem, slot), >= GAP_MIN_TRIES
+        attempts since its last win (a stalled slot)."""
+        out = []
+        ctx: dict = {}
+        slot_hist: dict = {}
+        for r in rows:
+            v2 = r.get("v2") or {}
+            if v2.get("reward") is None or not v2.get("chain") or v2.get("kind") == "hypothesis":
+                continue
+            tk = f"{r['target']}:{r['arch']}"
+            ctx.setdefault((tk, r["op_class"], v2["chain"][-1]), []).append(
+                (v2.get("item_id") or r["technique"], float(v2["reward"]), list(v2["chain"])))
+            slot_hist.setdefault((r.get("problem_id"), r.get("slot"), tk, r["op_class"]), []).append(
+                (v2.get("item_id") or r["technique"], float(v2["reward"]), list(v2["chain"])))
+        for (tk, opc, leaf), hist in ctx.items():
+            hist = hist[-GAP_WINDOW:]
+            per: dict = {}
+            for item, rw, _ in hist:
+                per.setdefault(item, []).append(rw)
+            key = f"gap|{tk}|{opc}|{leaf}"
+            if key in handled or len(hist) < GAP_MIN_TRIES or len(per) < 3:
+                continue
+            if max(sum(v) / len(v) for v in per.values()) < MIN_EFFECT:
+                out.append({"source": "gap", "key": key, "target": tk, "op_class": opc, "state": hist[-1][2],
+                            "tried": [{"technique": i, "mean_reward": round(sum(v) / len(v), 4), "n": len(v)}
+                                      for i, v in per.items()]})
+        for (pid, slot, tk, opc), hist in slot_hist.items():
+            since = 0
+            for _, rw, _ in hist:
+                since = 0 if rw >= MIN_EFFECT else since + 1
+            key = f"gap|{tk}|{pid}|{slot}|{len(hist) // GAP_MIN_TRIES}"
+            if since >= GAP_MIN_TRIES and key not in handled:
+                tail = hist[-since:]
+                out.append({"source": "gap", "key": key, "target": tk, "op_class": opc, "state": tail[-1][2],
+                            "stalled_slot": {"problem": pid, "slot": slot, "attempts_since_last_win": since},
+                            "tried": sorted({i for i, _, _ in tail})})
+        return out
 
     @staticmethod
     def _stacked(rows: list[dict], a: str, b: str) -> bool:
@@ -537,6 +596,18 @@ class KnowledgeV2:
                 evs.append({"event": "hypothesis_rejected", "spec": (sp or {}).get("name") if isinstance(sp, dict)
                             else None, "reason": str(e)})
         return evs
+
+    def sync_graph_hints(self, path, target_key: str = "cuda:sm_75") -> int:
+        """Read a ModelBlaster ``graph_hints.json`` (modelblaster.graph_hints/v1) and fold its
+        decisions into the graph hypotheses (also run by ``run_multislot.py --graph-hints``)."""
+        p = Path(path)
+        if not p.exists():
+            return 0
+        doc = json.loads(p.read_text())
+        n = self.hypotheses.sync_graph_hints(doc, target_key=target_key, mirror=self.review_path)
+        if n:
+            self._log("info", f"graph hints: {n} decisions synced from {p}")
+        return n
 
     # ---------------------------------------------------------------- reporting
     def summary(self) -> dict:

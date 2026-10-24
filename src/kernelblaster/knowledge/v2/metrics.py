@@ -193,6 +193,9 @@ def canonical_ncu_delta(d: dict) -> dict:
     out = {dst: d[src] for src, dst in NCUAdapter._MAP.items() if isinstance(d.get(src), (int, float))}
     if isinstance(d.get("registers_per_thread_max"), (int, float)):
         out["reg_pressure"] = 100.0 * d["registers_per_thread_max"] / 255.0
+    for src, dst in (("smem_bank_conflict_pct", "bank_conflicts"), ("global_excess_sector_pct", "uncoalesced")):
+        if isinstance(d.get(src), (int, float)):
+            out[dst] = d[src]
     for k in CANONICAL:                          # already canonical (v2 records)
         if k not in out and isinstance(d.get(k), (int, float)):
             out[k] = d[k]
