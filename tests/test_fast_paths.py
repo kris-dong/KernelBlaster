@@ -42,7 +42,7 @@ needs_cmake = pytest.mark.skipif(ARCH is None or shutil.which("cmake") is None,
 
 def _stable(text: str) -> list[str]:
     """Driver output without the timing lines."""
-    return [l for l in text.splitlines() if not re.match(r"MB_(SLOT|OP|PARTITION)_US", l)]
+    return [l for l in text.splitlines() if not re.match(r"MB_(SLOT|OP|PARTITION)_US|MB_PARTITION_DIST|MB_PHASE_MS", l)]
 
 
 # ---------------------------------------------------------------- cache
