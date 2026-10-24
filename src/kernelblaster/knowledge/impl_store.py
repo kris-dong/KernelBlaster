@@ -126,11 +126,16 @@ class ImplStore:
         return next((r for r in self.records() if r.id == rec_id), None)
 
     def retrieve(self, *, target: str, arch: str, op: str, op_class: str, signature: str,
-                 shapes: list, n_examples: int = 2) -> dict:
-        """-> {"seed": rec|None, "adapt": rec|None, "examples": [rec, ...]}"""
+                 shapes: list, n_examples: int = 2, exclude_problem: Optional[str] = None) -> dict:
+        """-> {"seed": rec|None, "adapt": rec|None, "examples": [rec, ...]}
+
+        ``exclude_problem`` drops the asking problem's own records: during a
+        run they are its current state, and its baseline seeds would
+        otherwise always win the exact tier and hide other problems' work."""
         sig = signature_sha(signature)
         want = {shape_bucket(op_class, s) for s in shapes}
-        recs = [r for r in self.records() if r.target == target]
+        recs = [r for r in self.records() if r.target == target
+                and (exclude_problem is None or r.problem_id != exclude_problem)]
         same_op = [r for r in recs if r.op == op and r.signature_sha == sig]
         exact = [r for r in same_op if r.arch == arch and want <= set(r.buckets)]
         seed = min(exact, key=lambda r: r.slot_us / max(len(r.shapes), 1), default=None)
