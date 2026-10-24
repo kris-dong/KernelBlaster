@@ -15,7 +15,10 @@ write is a short ``BEGIN IMMEDIATE`` transaction with a busy timeout), tables::
     outcomes    seq, id, ..., rec json, v2 json      append-only
     stats       (item, level, scope, op, state) -> n, sum, sumsq
     proposals   id, status, json            state-discovery proposals (admitted / rejected + reason)
-    review      seq, ts, kind, ref, json    human review queue (mirrored to review.jsonl)
+    scopes      id, parent, json            scope nodes added at run time (the seed tree is targets.json)
+    review      seq, ts, kind, ref, json    audit log of every automatic change (mirrored to
+                                            review.jsonl); nothing waits on it -- the table keeps
+                                            its v1 name so old databases stay readable
 
 On top: :class:`SQLiteOutcomeLog` (the :class:`OutcomeLog` API) and
 :class:`SQLiteClaimStore` (the :class:`ClaimStore` API, level-aware
@@ -35,7 +38,7 @@ from typing import Iterator, Optional
 
 from ..claims import ACTIVE, Claim, ClaimStore, IMPL_NOTE, IMPROVED
 from ..outcomes import OutcomeRecord
-from .targets import FAMILY, TARGET, UNIVERSAL, TargetRegistry, target_key
+from .targets import FAMILY, NODE, TARGET, UNIVERSAL, TargetRegistry, target_key
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -55,6 +58,7 @@ CREATE INDEX IF NOT EXISTS outcomes_item ON outcomes (item_id);
 CREATE TABLE IF NOT EXISTS stats (item TEXT, level TEXT, scope TEXT, op TEXT, state TEXT,
                                   n REAL, s REAL, ss REAL, PRIMARY KEY (item, level, scope, op, state));
 CREATE TABLE IF NOT EXISTS proposals (id TEXT PRIMARY KEY, status TEXT, data TEXT, updated TEXT);
+CREATE TABLE IF NOT EXISTS scopes (id TEXT PRIMARY KEY, parent TEXT, data TEXT);
 CREATE TABLE IF NOT EXISTS review (seq INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, kind TEXT,
                                    ref TEXT, data TEXT);
 """
@@ -157,8 +161,8 @@ class KnowledgeDB:
     def all_stats(self) -> dict[tuple, list]:
         return {tuple(r[:5]): [r[5], r[6], r[7]] for r in self.query("SELECT * FROM stats")}
 
-    # -- review queue -------------------------------------------------------
-    def review(self, kind: str, ref: str, data: dict, mirror: Optional[Path] = None) -> None:
+    # -- audit log (no human gate: changes take effect when they are logged) ----
+    def audit(self, kind: str, ref: str, data: dict, mirror: Optional[Path] = None) -> None:
         ts = _now()
         with self.tx() as c:
             c.execute("INSERT INTO review (ts, kind, ref, data) VALUES (?, ?, ?, ?)",
@@ -167,9 +171,26 @@ class KnowledgeDB:
             with open(mirror, "a", encoding="utf-8") as f:
                 f.write(json.dumps({**data, "ts": ts, "kind": kind, "ref": ref}, default=str) + "\n")
 
-    def review_items(self) -> list[dict]:
+    def audit_items(self) -> list[dict]:
         return [{**json.loads(d), "seq": s, "ts": ts, "kind": k, "ref": r}
                 for s, ts, k, r, d in self.query("SELECT * FROM review ORDER BY seq")]
+
+    review, review_items = audit, audit_items          # v1 names
+
+    # -- runtime scope tree --------------------------------------------------------
+    def put_scope(self, nid: str, parent: str, data: dict) -> None:
+        with self.tx() as c:
+            c.execute("INSERT OR REPLACE INTO scopes VALUES (?, ?, ?)", (nid, parent, json.dumps(data, sort_keys=True)))
+
+    def scopes(self) -> list[dict]:
+        return [json.loads(d) for (d,) in self.query("SELECT data FROM scopes ORDER BY rowid")]
+
+    def put_target(self, key: str, node: str, data: dict) -> None:
+        with self.tx() as c:
+            c.execute("INSERT OR REPLACE INTO targets VALUES (?, ?, ?)", (key, node, json.dumps(data, sort_keys=True)))
+
+    def target_rows(self) -> list[tuple]:
+        return [(k, n, json.loads(d)) for k, n, d in self.query("SELECT key, family, data FROM targets")]
 
 
 # ---------------------------------------------------------------- outcomes
@@ -221,14 +242,23 @@ class SQLiteOutcomeLog:
 
 # ---------------------------------------------------------------- claims
 
-LEVEL_LABEL = {UNIVERSAL: "general lesson", FAMILY: "{family} family", TARGET: "{arch} only"}
+def claim_scope(c: Claim, registry: TargetRegistry) -> Optional[str]:
+    """A claim's scope id: universal | node id (``level`` node, or v1 ``family``, with the
+    node in ``c.family``) | None for target-level claims (backend + optional arch, as in v1)."""
+    level = getattr(c, "level", TARGET) or TARGET
+    if level == UNIVERSAL:
+        return UNIVERSAL
+    if level in (FAMILY, NODE):
+        return c.family or UNIVERSAL
+    return None
 
 
 class SQLiteClaimStore(ClaimStore):
     """Claims in the ``claims`` table with level-aware retrieval (design section 8).
 
-    * a ``universal`` claim applies everywhere, a ``family`` claim to every
-      target of its family, a ``target`` claim as in v1 (backend + arch);
+    * a ``universal`` claim applies everywhere, a ``node`` claim (v1:
+      ``family``; the node id is in ``Claim.family``) to every target whose
+      scope chain contains that node, a ``target`` claim as in v1 (backend + arch);
     * a claim's ``state`` matches the query state or any of its ancestors;
     * ``save`` writes only changed claims and unions their cited ids with
       what concurrent writers stored meanwhile;
@@ -294,19 +324,17 @@ class SQLiteClaimStore(ClaimStore):
 
     def _matches(self, c: Claim, q: dict) -> Optional[int]:
         tk = target_key(q["target"], q.get("arch"))
-        level = getattr(c, "level", TARGET) or TARGET
-        if level == UNIVERSAL:
-            spec = 0
-        elif level == FAMILY:
-            if c.family != self.registry.family_of(tk):
+        sid = claim_scope(c, self.registry)
+        if sid is not None:
+            if sid not in self.registry.chain(tk):
                 return None
-            spec = 1
+            spec = self.registry.depth(sid)           # deeper node = more specific
         else:
             if c.target != q["target"]:
                 return None
             if c.arch is not None and q.get("arch") is not None and c.arch != q.get("arch"):
                 return None
-            spec = 2 + (1 if c.arch is not None and q.get("arch") else 0)
+            spec = 20 + (1 if c.arch is not None and q.get("arch") else 0)
         for f in ("op_class", "technique", "problem_id", "slot", "impl_id"):
             cv, qv = getattr(c, f), q.get(f)
             if cv is None:
@@ -324,10 +352,10 @@ class SQLiteClaimStore(ClaimStore):
         return spec
 
     def level_label(self, c: Claim) -> str:
-        level = getattr(c, "level", TARGET) or TARGET
-        if level == TARGET:
+        sid = claim_scope(c, self.registry)
+        if sid is None:
             return f"{c.arch or c.target} only"
-        return LEVEL_LABEL[level].format(family=c.family or "?")
+        return self.registry.label(sid)
 
     def render(self, claims) -> str:
         lines = []

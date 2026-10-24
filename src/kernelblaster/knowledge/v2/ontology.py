@@ -23,7 +23,7 @@ from typing import Iterable, Optional
 
 from . import predicates as P
 from .metrics import CANONICAL, MEASURED, flat_band
-from .targets import DATA_DIR, FAMILY, TARGET, UNIVERSAL, TargetRegistry
+from .targets import DATA_DIR, NODE, TARGET, UNIVERSAL, TargetRegistry
 
 CONFIRMED, CONTRADICTED, MECH_UNKNOWN = "confirmed", "contradicted", "unknown"
 DIRECTIONS = ("up", "down", "flat", "up_or_flat", "down_or_flat")
@@ -47,6 +47,7 @@ class Technique:
     op_classes: list = field(default_factory=list)     # gate to these op classes ([] = any)
     slot: bool = True                                  # offered by the multi-slot agent
     source: str = "seed"                               # seed | legacy_db | footer:<x> | hypothesis:<id>
+    status: str = "active"                             # active | retired (automatic rollback)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -74,31 +75,45 @@ def _arch_num(key: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
-def scope_rank(scope: str, target_key: str, registry: TargetRegistry) -> Optional[int]:
-    """How specifically realization ``scope`` matches ``target_key`` (lower = more specific; None = no)."""
+def scope_rank(scope: str, target_key: str, registry: TargetRegistry) -> Optional[float]:
+    """How specifically realization ``scope`` matches ``target_key`` (lower = more specific; None = no).
+
+    Scopes: ``target:<key>`` (0), ``target:<backend>:sm_NN+`` (1), ``node:<id>`` /
+    ``family:<id>`` (v1 spelling) / ``universal`` by their distance up the target's chain
+    (1 + index), ``target:<backend>`` just below the node that backend maps to."""
     t = registry.get(target_key)
+    chain = registry.chain(t.key)
     if scope == "universal":
-        return 4
+        return 1.0 + chain.index("universal")
     kind, _, rest = scope.partition(":")
-    if kind == "family":
-        return 3 if rest == t.family else None
+    if kind in ("family", "node"):
+        return 1.0 + chain.index(rest) if rest in chain else None
     if kind != "target":
         return None
     if rest == t.key:
-        return 0
+        return 0.0
     m = re.fullmatch(r"([a-z0-9_]+):sm_(\d+)\+", rest)
     if m:
         n = _arch_num(t.key)
-        return 1 if m.group(1) == t.backend and n is not None and n >= int(m.group(2)) else None
+        return 1.0 if m.group(1) == t.backend and n is not None and n >= int(m.group(2)) else None
     if rest == t.backend:
-        return 2
+        bn = registry.node_for_backend(t.key)
+        return 0.5 + chain.index(bn) if bn in chain else 1.5
     return None
 
 
 def scope_level(scope: str) -> str:
     if scope == "universal":
         return UNIVERSAL
-    return FAMILY if scope.startswith("family:") else TARGET
+    return NODE if scope.split(":", 1)[0] in ("family", "node") else TARGET
+
+
+def scope_of(scope: str) -> str:
+    """Realization scope string -> scope id (``family:X`` / ``node:X`` -> X)."""
+    if scope == "universal":
+        return "universal"
+    kind, _, rest = scope.partition(":")
+    return rest
 
 
 # ---------------------------------------------------------------- mechanism check
@@ -192,7 +207,7 @@ class Ontology:
 
     def applies(self, t: Technique, *, target_key: str, op_class: Optional[str], chain: list,
                 values: dict, ctx: dict, slot_only: bool = True) -> bool:
-        if slot_only and not t.slot:
+        if (slot_only and not t.slot) or t.status != "active":
             return False
         if not self.registry.covers(t.level, t.scope, target_key):
             return False
@@ -264,8 +279,8 @@ def seed_legacy(o: Ontology, db_path: Optional[Path] = None, footer_dir: Optiona
             m = re.search(rf"`{re.escape(name)}` \(\d+%\): (.+?)(?=\n- `|\n\n)", text, re.S)
             how = " ".join(m.group(1).split())[:400] if m else name.replace("_", " ")
             o.add(Technique(id=re.sub(r"[^A-Za-z0-9_.+-]", "_", name)[:64], mechanism=how[:300],
-                            level=scope_level(scope) if scope_level(scope) != TARGET else FAMILY,
-                            scope=("vector_cpu" if scope.startswith("family:vector_cpu") else "simt_gpu"),
+                            level=NODE, scope=(scope_of(scope) if scope_level(scope) == NODE
+                                               else o.registry.node_for_backend(scope_of(scope) + ":x")),
                             slot=False, source=src, realizations=[{"scope": scope, "how": how}]))
             added.append(name)
     return {"added": len(added), "folded": len(set(folded)), "added_names": added}

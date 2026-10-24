@@ -25,21 +25,35 @@ hierarchy, proposed from evidence and validated, never spawned by copying; (c) *
 creative optimisation** — explicit hypotheses with mechanisms and predictions, tested on a
 budget, promoted or retired on evidence.
 
-## 2. Abstraction levels
+## 2. Abstraction levels: an open scope tree
 
-Every piece of knowledge lives at one level of a fixed three-level hierarchy and applies to
-everything below it:
+Every piece of knowledge is scoped to one node of a **tree of scope nodes** and applies to every
+target below it. The root is `universal`; nodes have an id, a parent and a description; targets
+hang off any node. The seed tree (`data/kernelblaster/knowledge/targets.json`):
 
 ```
 universal                      reuse, parallelism exposure, latency hiding, fusion, precision, vectorisation
-└── family                     simt_gpu (CUDA, OpenCL/Adreno), vector_cpu (RVV), systolic (Gemmini)
-    └── target                 cuda:sm_75, cuda:sm_89, opencl:adreno_740, rvv:vlen256, ...
+├── simt_gpu                   warps/wavefronts, on-chip shared/local memory
+│   ├── nvidia_gpu             CUDA, 32-wide warps, NCU
+│   │   ├── turing             cuda:sm_75
+│   │   ├── ampere             cuda:sm_80, cuda:sm_86
+│   │   ├── ada                cuda:sm_89
+│   │   └── hopper             cuda:sm_90
+│   └── adreno                 opencl:adreno650, opencl:adreno740
+├── vector_cpu                 rvv:vlen256
+└── systolic                   gemmini:default
 ```
 
-The levels are fixed in code; **families and targets are data** (`targets.yaml`): name,
-family, peaks (GFLOP/s, GB/s), machine width (SMs × warp, subgroups, VLEN), on-chip memory
-sizes, profiler (ncu / adreno / mcycle / roofline). Adding a target is a data change; the
-LLM does not invent families.
+Depth is open: nodes and targets are data, and can be added at run time
+(`KnowledgeV2.add_scope` / `add_target`, persisted in the DB `scopes` / `targets` tables and
+logged). An unknown target is placed under the node its backend maps to (`backends` in
+`targets.json`: `cuda -> nvidia_gpu`, `opencl -> adreno`, ...), so a new arch starts from its
+vendor's evidence. Targets carry peaks (GFLOP/s, GB/s), machine width, on-chip memory sizes and
+the profiler; a node or target may set its own shrinkage `kappa`. Every consumer works on the
+chain target -> ... -> universal of any depth: statistics, technique / realization / state
+scopes, claim retrieval and lifting, hypothesis promotion, prompt labels. The v1 vocabulary
+(`level="family"` with `family=X`, `family:X` realization scopes) is read as node X, so old
+databases and claims stay valid.
 
 ## 3. Canonical metrics (the vocabulary states are written in)
 
@@ -102,8 +116,10 @@ Missing metrics are absent (not zero). Predicates over an absent metric evaluate
    reduced by ≥ 30 %), and both sides need ≥ 3 outcomes. Otherwise the proposal is recorded
    as rejected with the reason (the LLM sees it next time).
 4. Admitted as `probationary`; becomes `core` after ≥ 10 more classified outcomes keep the
-   separation. Retired if separation collapses. Every change lands in a review queue
-   (`knowledge/review.jsonl`) for humans; probation runs without waiting for review.
+   separation. Retired if separation collapses. There is no human gate: a probationary state
+   is used for classification and prompts from the moment it is admitted, and probation is an
+   automatic re-validation. Every change is written to the audit log (`review` table,
+   mirrored to `review.jsonl`); nothing waits on it.
 
 ## 5. Techniques: mechanisms with predictions
 
@@ -129,7 +145,7 @@ Missing metrics are absent (not zero). Predicates over an absent metric evaluate
   reflection writes claims about.
 * **Realizations** carry the target-specific how-to and parameter priors, and link to
   implementation-store exemplars. The prompt shows the realization for the slot's target
-  (falling back to its family), so CUDA spellings never reach an Adreno prompt.
+  (falling back up its scope chain), so CUDA spellings never reach an Adreno prompt.
 * Seeded from the existing 16 states × ~80 techniques, the multi-slot `TECHNIQUES` catalogue,
   and the CUDA / OpenCL / RISC-V database footers — mapped onto mechanisms; duplicates merged.
 
@@ -150,21 +166,25 @@ similarity) from:
 | graph level | ModelBlaster partition evidence | fusion / layout / split proposals (kb-proposal) |
 
 The bandit reserves an **exploration budget** (default 15 % of steps) for hypotheses whose
-preconditions hold on the chosen slot. Promotion: wins (reward > 0) on ≥ 2 problems, mean
-reward's lower confidence bound > 0, mechanism confirmed in ≥ 50 % of measured attempts →
-becomes a technique at the lowest level that covers its evidence. Retired after its budget
-with no win. Every hypothesis outcome is evidence the reflection pass can use.
+preconditions hold on the chosen slot. Promotion is automatic and immediate: wins (reward > 0)
+on ≥ 2 problems, mean reward ≥ 0.01 (1 % of partition time, the minimum effect: below it a
+"win" is timing noise on a shared GPU), the mean's lower confidence bound > 0, mechanism
+confirmed in ≥ 50 % of measured attempts → a technique scoped to the lowest common ancestor of
+the targets it won on. Retired after its budget without meeting that bar. Since nobody reviews
+promotions, they are re-validated: when a target under the technique's scope averages ≤ 0 over
+≥ 3 later outcomes, the technique is rescoped to the targets where it still pays, and retired
+when none is left. Every hypothesis outcome is evidence the reflection pass can use.
 
 ## 7. Statistics: shrinkage up the hierarchy
 
 Reward statistics are kept per (technique or hypothesis, scope key) where the scope key is
-(target, op_class, state) and its ancestors (family, …, universal, parent states). The
-estimate used by the bandit and shown in prompts:
+(target, op_class, state) and its ancestors (every node of the target's chain, universal,
+parent states). The estimate used by the bandit and shown in prompts:
 
-    est(k) = (n_k · mean_k + κ · est(parent(k))) / (n_k + κ)        κ = 3 by default
+    est(k) = (n_k · mean_k + κ_k · est(parent(k))) / (n_k + κ_k)     κ_k = 3 unless the node sets it
 
-so a new target starts from its family's (then universal) evidence and moves to its own as
-data arrives. UCB uses `est` with an exploration term on the local count. This replaces the
+so a new target starts from its nearest scope's evidence (e.g. a new Ada card from `ada`, then
+`nvidia_gpu`) and moves to its own as data arrives. UCB uses `est` with an exploration term on the local count. This replaces the
 v1 flat cross-key prior.
 
 ## 8. Claims: levels and lifting
@@ -173,9 +193,13 @@ Claims keep their v1 machinery (citations, support/contradiction, thresholds, de
 `level` + `scope` and links to technique/state/hypothesis ids. Reflection gets two new edit
 kinds:
 
-* `lift`: move a claim up (target → family needs consistent support on ≥ 2 targets of the
-  family; family → universal on ≥ 2 families) — validated against the cited outcomes'
-  targets, not taken on the LLM's word;
+* `lift`: move a claim to the lowest common ancestor of the ≥ 2 targets with consistent
+  support (sm_75 + sm_89 → `nvidia_gpu`; + adreno → `simt_gpu`); lifting is stepwise, one
+  common ancestor at a time, and only up. Validated against the cited outcomes' targets, not
+  taken on the LLM's word, and applied at once. Lifts are rolled back automatically: when a
+  target under the claim's node later disagrees (contradictions ≥ support), the claim moves to
+  the largest node covering ≥ 2 still-supporting targets and none of the disagreeing ones,
+  else back to its best-supported target, and is retired when none is left;
 * `mechanism`: an explanation tying a technique's predicted effects to observed deltas (the
   material for refining `predicts` and `risks`).
 
@@ -218,7 +242,7 @@ Retrieval for a slot builds a budgeted prompt section, most specific first:
 3. Hierarchical statistics in the bandit and retrieval.
 4. Claim levels + `lift` / `mechanism` edits in reflection; SQLite store.
 5. Hypothesis loop: generation sources, exploration budget, promotion/retirement.
-6. Evidence-driven state discovery with validation and the review queue.
+6. Evidence-driven state discovery with validation and the audit log.
 7. Evaluation (below).
 
 ## 12. Evaluation
@@ -235,19 +259,19 @@ Retrieval for a slot builds a budgeted prompt section, most specific first:
 * Budget: prototyping/testing ≈ $200 of Haiku/Sonnet; per-run token accounting
   (`llm_usage`), conservative price estimates for Bedrock (which returns tokens only).
 
-## 13. Decisions (proposed defaults, for review)
+## 13. Decisions
 
 | decision | default | alternative | why |
 |---|---|---|---|
-| hierarchy | fixed universal/family/target; families + targets as data | open, LLM-proposed families | families are a hardware fact; letting the LLM invent them adds noise for no gain |
-| promotion gate | automatic probation, human review queue | human approval before use | keeps the loop moving; review catches bad generalisations |
+| hierarchy | **resolved: an open tree of scope nodes** (data, extendable at run time; unknown targets placed by a backend -> node map); lifting to the lowest common ancestor, stepwise | fixed universal / family / target | the natural groupings are deeper than one family level (vendor, architecture generation); the tree stays data, the LLM never invents nodes |
+| promotion gate | **resolved: fully automatic, no human gate**: admitted states, promoted hypotheses and lifted claims are used at once; probation and rollback are automatic re-validation; the review queue is an audit log | human approval before use | nobody reviews in the loop; the safeguards are the minimum effect size and the automatic demotion / rollback |
 | state definition | predicates over canonical metrics | LLM-described profiles | testable, deterministic, mergeable |
 | value inheritance | statistical shrinkage to parent | copying technique lists into new states | no duplicated, drifting entries; evidence flows both ways |
 | store | SQLite (WAL) | JSON files | concurrency, queries across entities, one source of truth |
 | seed format (impl.) | JSON seeds | YAML | no PyYAML dependency (section 14) |
 | `occupancy` (impl.) | achieved occupancy, % of hardware max | achieved / theoretical | what the profilers report directly (section 14) |
 | seed roots (impl.) | five ordered roots, total over (mem_util, compute_util) | the design's partial roots | nothing falls between roots; estimates rarely reach 50 % (section 14) |
-| stats path (impl.) | linear: target -> family -> universal at the leaf, then the state chain, then op class `*` | a lattice with several parents | one parent per node keeps the shrinkage recursion simple (section 14) |
+| stats path (impl.) | linear: target -> every scope node -> universal at the leaf, then the state chain, then op class `*` | a lattice with several parents | one parent per node keeps the shrinkage recursion simple (section 14) |
 | graph hypotheses (impl.) | keyed by ModelBlaster `graph_hints/v1` ids, decisions synced from MB | a KB-side lifecycle | MB already builds and decides graph changes (section 14) |
 | metric adapters (impl.) | chosen by the agent's `TargetProfile.profiler` module; profile peaks fill `targets.json` gaps | a separate target switch | one place decides per-target behaviour (section 14) |
 
@@ -257,14 +281,14 @@ Retrieval for a slot builds a budgeted prompt section, most specific first:
 
 | step | module (`knowledge/v2/`) | seed data (`data/kernelblaster/knowledge/`) |
 |---|---|---|
-| 1 levels, targets | `targets.py` | `targets.json` |
+| 1 scope tree, targets | `targets.py` (`TargetRegistry`: nodes, chain, lca, covers, runtime add) | `targets.json` (scopes, backends, targets) |
 | 1 canonical metrics, adapters | `metrics.py`: `NCUAdapter` (per-slot `ncu.summarize`), `NCUTextAdapter` (single-file text reports), `roofline_vector` (any target), `AdrenoAdapter` / `MCycleAdapter` stubs | |
 | 1 predicate DSL | `predicates.py` (`all`/`any`/`not`, metric comparisons incl. `ref` to another metric, `op_class`/`dtype`/`family`/`target in`) | |
 | 1 states + classifier | `states.py` | `states.json` (15 seed states, `legacy_map` for the 16 technique-DB and the v1 roofline names) |
 | 2 ontology + mechanism check | `ontology.py` (`seed_legacy` reads the old JSON DB and the three footers once) | `techniques.json` (27 curated, 84 v1/DB/footer names folded in as aliases, 21 imported as `slot=false`) |
 | 3 hierarchical stats | `stats.py` | |
-| 4 store, claims, reflection | `store.py` (`KnowledgeDB`, `SQLiteOutcomeLog`, `SQLiteClaimStore`), `reflect_v2.py` (`lift`, `mechanism`, `SemanticUpdaterV2`); `claims.Claim` gains `level`, `family`, `hypothesis_id`, kind `mechanism` | |
-| 5 hypotheses | `hypotheses.py` (`HypothesisBook`, `validate_spec`, graph hypotheses) | |
+| 4 store, claims, reflection | `store.py` (`KnowledgeDB` incl. the audit log and runtime scopes, `SQLiteOutcomeLog`, `SQLiteClaimStore`), `reflect_v2.py` (`lift` to the lowest common ancestor, `revalidate_lifts` rollback, `mechanism`, `SemanticUpdaterV2`); `claims.Claim` gains `level`, `family`, `hypothesis_id`, kind `mechanism` | |
+| 5 hypotheses | `hypotheses.py` (`HypothesisBook`: automatic promotion with `MIN_EFFECT`, `revalidate` demotion, `validate_spec`, graph hypotheses) | |
 | 6 state discovery | `discovery.py` | |
 | facade | `knowledge.py` (`KnowledgeV2`: vector, classify, select, retrieve, record, maybe_upkeep) | |
 
@@ -283,9 +307,9 @@ Tests: `tests/test_knowledge_v2.py`.
 | `targets.yaml`, YAML seeds | JSON (`targets.json`, `states.json`, `techniques.json`) | no PyYAML in the environment; JSON loads the same and is diffable |
 | `occupancy` = achieved / theoretical | achieved occupancy, % of the hardware maximum | it is what NCU and the single-file report give directly; the theoretical limit is reflected in `reg_pressure` and the `register_limited` / `stalled_low_occupancy` states |
 | seed roots `memory_bound` (bw >= 50, compute < 40), `latency_bound` | five ordered roots: `latency_bound`, `balanced_bound`, `memory_bound` (`mem_util >= 50`, compute below it), `compute_bound`, `underutilized` (both < 50) | with both utilisations present the roots are total (nothing is unexplained); roofline estimates rarely reach 50 % of peak, so the old 15 %-threshold roofline names map to `underutilized > underutilized_memory|compute` |
-| stats ancestors "(family, ..., universal, parent states)" | one linear path: target -> family -> universal at the leaf state, then the state chain at universal, then op class `*` (fp16 adds a most specific node) | the shrinkage recursion needs one parent per node; a parent node includes its children's data (empirical-Bayes approximation) |
+| stats ancestors "(family, ..., universal, parent states)" | one linear path: target -> its scope nodes -> universal at the leaf state, then the state chain at universal, then op class `*` (fp16 adds a most specific node) | the shrinkage recursion needs one parent per node; a parent node includes its children's data (empirical-Bayes approximation) |
 | `realizations` linked to impl-store exemplars | realizations carry `how` / `params_prior`; impl-store records keep `techniques` (now ontology ids) | the store's retrieval by op/shape already supplies exemplars; no schema change needed |
-| claims "level + scope" | `level` + `family` on the v1 claim; target-level claims keep v1's backend + optional arch scope | v1 claims load unchanged as target-level |
+| claims "level + scope" | `level` (target / node / universal; v1 `family` = node) + the node id in `family` on the v1 claim; target-level claims keep v1's backend + optional arch scope | v1 claims load unchanged as target-level |
 | promotion "mechanism confirmed in >= 50 % of measured attempts" | same; with no measured attempt the gate is skipped and recorded ("mechanism unmeasured") | roofline-only targets could never promote otherwise |
 | hypothesis generation "cheap model" | the upkeep model is configurable (`--upkeep-model`); runs below used Sonnet for generation and state discovery, Haiku for codegen and reflection | design reasoning quality matters most there |
 | graph-level hypotheses with the same lifecycle | kb-proposals become `kind=graph` hypotheses keyed by ModelBlaster's `graph_hints/v1` ids (`fuse:<kind>`, `split:<slot>`); MB's accepted / rejected decisions are synced into promoted / retired (`sync_graph_hints`) | MB's hint layer already owns building and deciding graph changes; KB does not duplicate it |
@@ -377,8 +401,8 @@ $15.51, Sonnet upkeep in A1-A3 and B1 $0.83).
   refine `predicts` (or condition them on the state) from eligible mechanism claims.
 * Gap triggers never fired and port triggers dominate hypothesis generation (footer techniques
   without a CUDA realization); give gap/profiler/code-mining triggers priority and cap port.
-* Promotion with tiny rewards (mean 0.005) passes "LCB > 0" on two or three attempts; consider a
-  minimum effect size or >= 3 attempts.
+* ~~Promotion with tiny rewards~~: resolved by the minimum effect (0.01) and the automatic
+  demotion of promoted techniques (section 6).
 * Seed thresholds at 50 % of peak put most roofline-estimated slots under `underutilized`;
   state discovery admitted refinements but both are still probationary (probation needs 10 more
   decidable outcomes of the trigger technique).

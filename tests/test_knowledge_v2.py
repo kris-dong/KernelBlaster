@@ -169,10 +169,12 @@ def test_hierarchical_shrinkage():
     p89 = stat_path(REG, target_key="cuda:sm_89", op_class="conv", chain=["underutilized", "underutilized_compute"])
     for _ in range(6):
         s.update("tiling", p75, 0.4)
-    assert s.count("tiling", p89[0]) == 0 and s.count("tiling", p89[1]) == 6     # shares the family node
+    assert [n[1] for n in p89[:5]] == ["cuda:sm_89", "ada", "nvidia_gpu", "simt_gpu", ""]   # the chain, any depth
+    assert s.count("tiling", p89[0]) == 0 and s.count("tiling", p89[1]) == 0     # ada: nothing yet
+    assert s.count("tiling", p89[2]) == 6                                        # shares nvidia_gpu
     e89 = s.estimate("tiling", p89)
-    assert 0.2 < e89 < 0.4                                     # starts from the family / universal evidence
-    assert s.evidence_level("tiling", p89)[0].startswith("simt_gpu family")
+    assert 0.2 < e89 < 0.4                                     # starts from the nearest shared node
+    assert s.evidence_level("tiling", p89)[0].startswith("nvidia_gpu")
     for _ in range(12):
         s.update("tiling", p89, -0.2)
     assert s.estimate("tiling", p89) < 0 < s.estimate("tiling", p75)          # own data takes over
@@ -259,18 +261,18 @@ def test_claim_levels_retrieval_and_lift(tmp_path):
     q89 = dict(target="cuda", arch="sm_89", op_class="conv", technique="tiling", state="underutilized_compute")
     assert cs.relevant(**q89) == []                                           # sm_75-only claim
     assert cs.relevant(**{**q89, "arch": "sm_75"}) == [c]                      # parent state matches child query
-    with pytest.raises(EditError, match=">= 2 of its targets"):
+    with pytest.raises(EditError, match=">= 2 targets"):
         validate_lift({"kind": "lift", "claim_id": c.id, "to": "family", "evidence": []}, index=idx, claims=cs,
                       registry=REG)
     e = validate_lift({"kind": "lift", "claim_id": c.id, "to": "family", "evidence": [r.id for r in r89]},
                       index=idx, claims=cs, registry=REG)
-    assert e["targets"] == ["cuda:sm_75", "cuda:sm_89"]
+    assert e["targets"] == ["cuda:sm_75", "cuda:sm_89"] and e["to"] == "nvidia_gpu"   # lowest common ancestor
     from kernelblaster.knowledge.v2.reflect_v2 import apply_lift
     apply_lift(e, cs)
-    assert c.level == "family" and c.family == "simt_gpu" and c.support == 4
-    assert cs.relevant(**q89) == [c]
-    assert cs.relevant(target="opencl", arch="adreno740", op_class="conv", technique="tiling") == [c]
-    assert "simt_gpu family" in cs.render([c])
+    assert c.level == "node" and c.family == "nvidia_gpu" and c.support == 4
+    assert cs.relevant(**q89) == [c] and cs.relevant(**{**q89, "arch": "sm_86"}) == [c]
+    assert cs.relevant(target="opencl", arch="adreno740", op_class="conv", technique="tiling") == []
+    assert "nvidia_gpu (" in cs.render([c])
     with pytest.raises(EditError, match="2 families"):
         validate_lift({"kind": "lift", "claim_id": c.id, "to": "universal", "evidence": []}, index=idx, claims=cs,
                       registry=REG)
@@ -357,9 +359,10 @@ def test_hypothesis_exploration_budget_and_lifecycle(tmp_path):
         kv.hypotheses.record_attempt(h.id, outcome_id=f"o{i}", problem_id=pid, target_key=f"cuda:{arch}",
                                      reward=0.2 + 0.01 * i, status="improved", mechanism=CONFIRMED, measured=True)
     ev = kv.hypotheses.review()
-    assert ev and ev[0]["event"] == "promoted" and ev[0]["level"] == "family"
+    assert ev and ev[0]["event"] == "promoted" and ev[0]["level"] == "node"
     t = kv.ontology.get("h_one")
-    assert t is not None and t.scope == "simt_gpu" and kv.ontology.realization(t, "cuda:sm_86")
+    assert t is not None and t.scope == "nvidia_gpu" and kv.ontology.realization(t, "cuda:sm_86")
+    assert kv.ontology.realization(t, "opencl:adreno740") is None
     assert KnowledgeV2(tmp_path / "kv").ontology.get("h_one") is not None       # persisted
     # retire: budget spent, one problem only
     h2 = _hyp(kv, name="h_two", budget=2)
@@ -375,7 +378,7 @@ def test_hypothesis_exploration_budget_and_lifecycle(tmp_path):
                                      reward=0.3, status="improved", mechanism=CONTRADICTED, measured=True)
     ev = kv.hypotheses.review()
     assert ev[0]["event"] == "retired" and "mechanism confirmed in 0%" in ev[0]["reason"]
-    kinds = {r["kind"] for r in kv.db.review_items()}
+    kinds = {r["kind"] for r in kv.db.audit_items()}
     assert {"hypothesis_proposed", "hypothesis_promoted", "hypothesis_retired"} <= kinds
     _hyp(kv, name="h_units", preconditions={"bw_util": "<", "v": 0.8})       # stored before the unit check
     ev = kv.hypotheses.review()
@@ -446,7 +449,7 @@ def test_state_discovery_trigger_validation_probation(tmp_path):
     ev = D.review_probation(h, later, kv.db)
     assert ev and ev[0]["status"] == "core"
     assert KnowledgeV2(tmp_path / "kv").hierarchy.states["low_l1_reuse"].status == "core"
-    kinds = [r["kind"] for r in kv.db.review_items()]
+    kinds = [r["kind"] for r in kv.db.audit_items()]
     assert "state_admitted" in kinds and "state_core" in kinds
 
 
@@ -516,8 +519,8 @@ def test_reflection_v2_lift_through_updater(tmp_path):
         {"kind": "lift", "claim_id": c.id, "to": "family", "evidence": ["r2"]},
         {"kind": "lift", "claim_id": c.id, "to": "universal", "evidence": ["r2"]}]},
         index={r.id: r for r in recs})
-    assert [a["result"] for a in applied] == ["lifted target->family"] and "2 families" in rejected[0]["reason"]
-    assert any(r["kind"] == "claim_lifted" for r in kv.db.review_items())
+    assert [a["result"] for a in applied] == ["lifted cuda:sm_75->nvidia_gpu"] and "2 families" in rejected[0]["reason"]
+    assert any(r["kind"] == "claim_lifted" for r in kv.db.audit_items())
     msgs = up.build_messages(recs, [])
     assert "lift" in msgs[0]["content"] and "mechanism" in msgs[0]["content"]
     # an sm_75 claim is shown for an sm_89 batch, with the agreeing records as lift candidates
@@ -526,7 +529,7 @@ def test_reflection_v2_lift_through_updater(tmp_path):
                                 data={"effect": "helps"}), ["r0"])
     assert c2.id in {c.id for c in up._context_claims([recs[2]])}
     msgs = up.build_messages([recs[2]], [c2])
-    assert f"claim {c2.id} (cuda:sm_75) is supported by ['r2']" in msgs[1]["content"]
+    assert f"claim {c2.id} (cuda:sm_75) is supported by ['r2'] on targets outside its scope" in msgs[1]["content"]
 
 
 def test_legacy_single_file_adapter_path(tmp_path, monkeypatch):
