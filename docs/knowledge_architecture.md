@@ -350,6 +350,113 @@ It does not hurt; on the GEMM problem the seeded arm went to `tensor_core_mma` (
 for sm_89, within tolerance) while the previous seed's arm spent its steps on
 `read_only_cache_and_restrict`. Two seeds per arm: indicative only. Cost $4.72 (4 runs).
 
+## 16. Follow-ups: predictions, access metrics, triggers, graph-hint sync
+
+**Refined predictions** (`v2/predictions.py`, run in the upkeep pass). For each (technique,
+metric) the outcomes with the metric measured before and after are grouped by state (every state
+of their chain, and "all"). Where >= 2/3 of >= 4 of them disagree with the technique's prediction,
+the majority observed direction becomes a *prediction override* for the most general such state
+(`up_or_flat` / `down_or_flat` when the rest is flat), provided an eligible `mechanism` claim on that
+technique and metric points the same way -- the reflection pass's validated explanation -- or
+>= 8 outcomes support it on their own. A state below an accepted override is not overridden again.
+The mechanism check and the prompt's "expected measurable effect" use the effective prediction for
+the slot's chain; overrides live in the DB (`meta.prediction_overrides`, untouched by seed
+refreshes), are reverted automatically when >= 4 later outcomes under their state disagree by the
+same rule, and every change is in the audit log (`prediction_refined` / `prediction_reverted`).
+
+**Access metrics.** `knowledge/ncu.py` adds six raw counters through `--metrics` (no extra
+section): shared-memory bank conflicts and wavefronts, and global load / store sectors and the
+bytes the instructions requested. Per slot (counters summed over its kernels):
+`smem_bank_conflict_pct` = conflicts / (wavefronts - conflicts) and `global_excess_sector_pct` =
+32 x sectors / bytes requested - 1, mapped to the canonical `bank_conflicts` / `uncoalesced`
+metrics, so `smem_bank_conflicted`, `uncoalesced_access` and `uncoalesced_memory_bound` are now
+measured. On the L40S a whole-partition profile took 5.2-12.3 s without and 5.4-7.6 s with them
+(eight paired runs on two problems: within the ssh / replay noise). They discriminate: on the
+LeNet fixture the float4 relu shows 0.1 % excess, the naive linear 693 %; a naive GEMM 699 %, its
+shared-memory-tiled successor 0 % excess but 81 % bank conflicts. `KB_NCU_ACCESS_METRICS=0` turns
+them off. The OpenCL profile (`opencl_profile`, cl_event times + kernel info) has no counters for
+either; the OpenCL adapter keeps its launch-fraction and register-pressure proxies.
+
+**Hypothesis triggers.** Gap triggers never fired because they required >= 4 locally tried
+techniques whose *shrunk* estimates were all <= 0: with naive seeds nearly everything wins, and
+the estimates are pulled toward positive parents and seed priors. They now use local evidence:
+a (target, op class, leaf state) context with >= 4 recent outcomes over >= 3 techniques and no
+technique whose local mean reaches the minimum effect (0.01), or a slot with >= 4 attempts since
+its last win (a stalled slot). Measured access excess >= 50 % makes a profiler trigger. Order:
+gap > profiler > code mining > combine > port, with port capped at one per generation call. In
+the strong-seed learning run below the 19 generated hypotheses came from gap (6), combine (7) and
+port (6) triggers.
+
+**Graph-hint sync.** `KnowledgeV2.sync_graph_hints(path)` folds a ModelBlaster
+`graph_hints.json` (`modelblaster.graph_hints/v1`) into the graph hypotheses: accepted hints are
+promoted, rejected ones retired, keyed by the shared ids (`fuse:<kind>`, `split:<slot>`); decided
+hints from other producers (MB's cost model, kernel cache, XPU-RT) are added as graph hypotheses
+with their decision. `run_multislot.py --graph-hints FILE` (repeatable; `KB_GRAPH_HINTS`) runs it
+at the start of every run, and `scripts/sync_graph_hints.py KNOWLEDGE_DIR FILE` does it on its own.
+ModelBlaster side (not changed here, its graph optimiser is being reworked): `KBRunner` in
+`pipeline/kb_graph_opt.py` can pass `--graph-hints <work>/graph_hints.json` to every KernelBlaster
+call (with `--knowledge v2`), so decisions taken so far are synced before each round.
+
+### Stronger transfer experiment and the v1 / v2 comparison
+
+Setup:
+- six Level2 problems across op classes (conv, GEMM, group/instance norm, softmax, elementwise
+  epilogues: 1_Conv2D_ReLU_BiasAdd, 12_Gemm_Multiply_LeakyReLU, 21_Conv2d_Add_Scale_Sigmoid_GroupNorm,
+  30_Gemm_GroupNorm_Hardtanh, 57_Conv2d_ReLU_HardSwish, 99_Matmul_GELU_Softmax);
+- strong seeds: every slot starts from the best verified kernel of the earlier runs (ImplStore
+  winners), not the naive export -- for the sm_75 learning copies, slots using sm_80-only features
+  (mma m16n8k8, cp.async, tf32) fall back to an sm_75 winner or the hand seed;
+- learning on sm_75 (local TITAN RTX, shared): one v2 run (Sonnet upkeep) and one v1 run, 3 x 5 steps
+  per problem;
+- transfer to sm_89 (L40S via `--evaluator ssh --cuda-visible-devices auto`, `--parallel-problems 2`,
+  `--ncu best`), 3 x 5 steps per problem, 3 seeds per arm: **v2-on** (the sm_75 v2 database),
+  **v2-off** (a fresh database: the comprehensive seed only), **v1-on** (the sm_75 v1 claims and
+  outcome log). Haiku for codegen and reflection, no upkeep model in the transfer arms.
+
+Final partition speedup over the strong seed (geometric mean over 3 seeds [per seed]):
+
+| problem | v1-on | v2-off | v2-on |
+|---|---|---|---|
+| 12_Gemm_Multiply_LeakyReLU | 0.966 [0.97, 0.96, 0.97] | 1.417 [1.82, 1.59, 0.99] | 1.554 [1.49, 1.70, 1.48] |
+| 1_Conv2D_ReLU_BiasAdd | 1.228 [1.10, 1.24, 1.35] | 1.186 [1.31, 1.17, 1.09] | 1.093 [1.02, 1.11, 1.14] |
+| 21_Conv2d_Add_Scale_Sigmoid_GroupNorm | 1.100 [1.08, 1.09, 1.13] | 1.172 [1.17, 1.20, 1.15] | 1.123 [1.10, 1.13, 1.14] |
+| 30_Gemm_GroupNorm_Hardtanh | 1.007 [0.99, 1.02, 1.00] | 1.169 [1.56, 1.02, 1.01] | 1.108 [1.01, 1.33, 1.02] |
+| 57_Conv2d_ReLU_HardSwish | 1.071 [1.03, 1.04, 1.15] | 1.045 [1.04, 1.06, 1.04] | 1.068 [1.06, 1.09, 1.06] |
+| 99_Matmul_GELU_Softmax | 1.703 [1.73, 1.67, 1.70] | 2.005 [2.69, 1.72, 1.74] | 1.835 [1.65, 2.17, 1.72] |
+
+Mean per-problem log ratio, permutation test within problems (20 000 shuffles), bootstrap 95 % CI:
+
+| comparison | geo-mean ratio | 95 % CI | p |
+|---|---|---|---|
+| v1-on / v2-off | 0.890 | 0.825-0.963 | 0.035 |
+| v1-on / v2-on | 0.913 | 0.875-0.950 | 0.036 |
+| v2-off / v2-on | 1.026 | 0.945-1.115 | 0.62 |
+
+Runs that never found a win (> 1 % of the partition): v1-on 9 of 18, v2-off 7, v2-on 5. What the
+v2 machinery did on the way: in the v2-on runs 37 of 270 steps went to hypotheses (the exploration
+budget), 1 was promoted and 4 retired, 12 claims were lifted (sm_75 + sm_89 -> `nvidia_gpu`) and 9
+rolled back; in the v2-off runs 20 mined claims were retired by the rollback once sm_89 evidence
+contradicted them. v2 arms had more responses without a code block (15 and 20 of 270 steps vs 7 for
+v1; Haiku's 8192-token output limit on long kernels with ambitious techniques such as tensor cores
+or cp.async pipelines) and still came out ahead.
+
+sm_89 -> OpenCL (local NVIDIA OpenCL stand-in `titanrtx`, naive OpenCL exports of problems 1, 12
+and 99, 3 x 4 steps, 3 seeds; v2-on = the sm_75 + sm_89 database of a v2-on transfer run, v2-off =
+the seed only): final partition times 591.8 / 1095.2 / 984.8 us (on) vs 570.4 / 961.4 / 935.0 us (off)
+(geometric means; speedup ratio 1.04, 95 % CI 0.73-1.52, p = 0.86). The local GPU is shared, so
+baselines alone varied 2x between runs: no measurable effect either way.
+
+**Recommendation: make v2 the default knowledge mode.** At the same budget it beats v1 by about 10 %
+in final partition speedup (p = 0.035, CI excludes 1, 6 problems x 3 seeds) and leaves fewer runs
+without a win. Caveats, stated plainly:
+- The gain comes from v2's machinery and seed -- state-aware candidates, priors, realizations per
+  architecture, retrieval -- not from transferred learning. v2-on and v2-off do not differ (p = 0.62),
+  and neither does OpenCL with sm_89 knowledge.
+- The comprehensive seed's mined evidence includes earlier sm_89 runs on these same six problems
+  (from naive seeds, not these strong ones). That favours both v2 arms over v1. A v2 arm built
+  with `--no-mined` was not run (budget).
+- Single learning run per mode on sm_75, a shared local GPU, 15 steps per problem.
+
 ## 14. Implementation (steps 1-6) and evaluation
 
 ### Where things are
@@ -472,20 +579,17 @@ $15.51, Sonnet upkeep in A1-A3 and B1 $0.83).
 
 ### Open issues / next steps
 
-* Predictions: `thread_coarsening` / `loop_unrolling_and_ilp` predict `compute_util` up, but on
-  naive kernels it falls with a win; the validated `mechanism` claims say so. Close the loop:
-  refine `predicts` (or condition them on the state) from eligible mechanism claims.
-* Gap triggers never fired and port triggers dominate hypothesis generation (footer techniques
-  without a CUDA realization); give gap/profiler/code-mining triggers priority and cap port.
+* ~~Predictions~~: closed by prediction overrides with rollback (section 16).
+* ~~Gap triggers never fired; port triggers dominated~~: resolved (section 16).
 * ~~Promotion with tiny rewards~~: resolved by the minimum effect (0.01) and the automatic
   demotion of promoted techniques (section 6).
 * Seed thresholds at 50 % of peak put most roofline-estimated slots under `underutilized`;
   state discovery admitted refinements but both are still probationary (probation needs 10 more
   decidable outcomes of the trigger technique).
-* The transfer needs a harder setting to be informative: stronger seeds (e.g. ModelBlaster's
-  kernel-cache winners), more steps, more problems/op classes, and an OpenCL target.
-* Graph hypotheses are recorded from kb-proposals and synced from ModelBlaster's graph_hints
-  decisions, but nothing runs `sync_graph_hints` automatically yet.
+* ~~Stronger transfer~~: done (section 16) -- v2 beats v1, learned knowledge does not transfer
+  measurably yet.
+* ~~Graph-hint sync~~: `--graph-hints` / `scripts/sync_graph_hints.py` (section 16); ModelBlaster's
+  `KBRunner` still has to pass the flag.
 
 A v1 bug surfaced on the way: `parse_json_response` cut JSON at a ```` ```cuda ```` mentioned
 inside a claim text and silently dropped whole reflection passes (fixed, tested).
