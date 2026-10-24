@@ -40,7 +40,8 @@
  "tolerance": {
   "output_rel": 0.001,
   "output_abs": 1e-05,
-  "slot_rel": 0.001
+  "slot_rel": 0.001,
+  "slot_abs": 0.0
  },
  "assembly": {
   "head": "walker_head.cpp",

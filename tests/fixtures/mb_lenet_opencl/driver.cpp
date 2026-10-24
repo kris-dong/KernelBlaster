@@ -46,7 +46,13 @@ static const char *SLOT_NAME[] = {"conv2d", "relu", "maxpool2d", "linear"};
 static const char *OP_NAME[] = {"conv1", "relu", "pool1", "conv2", "relu_1", "pool2", "fc1", "relu_2", "fc2", "relu_3", "fc3"};
 static const double OUT_REL = 0.001, OUT_ABS = 1e-05, SLOT_REL = 0.001, SLOT_ABS = 0.0;
 enum { K_INPUT, K_CONST, K_WEIGHT, K_INTER, K_OUTPUT };
-static const int ESZ[] = {4, 4, 8};
+static const int ESZ[] = {4, 4, 8, 2};
+// binary16 -> float, exact (subnormals, inf, NaN)
+static float half_to_float(unsigned short h) {
+    unsigned s = (h >> 15) & 1, e = (h >> 10) & 31, m = h & 1023;
+    float v = e == 0 ? std::ldexp((float)m, -24) : e == 31 ? (m ? NAN : INFINITY) : std::ldexp((float)(m | 1024), (int)e - 25);
+    return s ? -v : v;
+}
 
 static unsigned char *blob;
 static void *dev[NB];
@@ -73,7 +79,8 @@ static std::vector<double> widen(const unsigned char *p, int b) {
     for (long i = 0; i < B_NUMEL[b]; ++i) {
         if (B_DT[b] == 0) { float f; memcpy(&f, p + 4 * i, 4); v[i] = f; }
         else if (B_DT[b] == 1) { int x; memcpy(&x, p + 4 * i, 4); v[i] = x; }
-        else { long long x; memcpy(&x, p + 8 * i, 8); v[i] = (double)x; }
+        else if (B_DT[b] == 2) { long long x; memcpy(&x, p + 8 * i, 8); v[i] = (double)x; }
+        else { unsigned short x; memcpy(&x, p + 2 * i, 2); v[i] = half_to_float(x); }
     }
     return v;
 }
@@ -228,7 +235,7 @@ int main(int argc, char **argv) {
         if (!report(OP_NAME[i])) { slot_bad[OP_SLOT[i]] = 1; slot_err[OP_SLOT[i]] = INFINITY; continue; }
         double scale = 0;
         for (int k = OP_IN_OFS[i]; k < OP_IN_OFS[i + 1]; ++k)
-            if (B_DT[OP_IN[k]] == 0) scale = std::max(scale, max_finite(ref_vec(OP_IN[k])));
+            if (B_DT[OP_IN[k]] == 0 || B_DT[OP_IN[k]] == 3) scale = std::max(scale, max_finite(ref_vec(OP_IN[k])));
         for (int k = OP_OUT_OFS[i]; k < OP_OUT_OFS[i + 1]; ++k) {
             int b = OP_OUT[k];
             std::vector<double> r = ref_vec(b), a = dev_vec(b);
