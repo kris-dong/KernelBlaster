@@ -44,8 +44,23 @@ that slot only, with neighbours' signatures, the C reference, shapes, store exam
 and "already tried" notes → assemble, build, run the driver (partition + isolated-op checks,
 per-slot times) with a bounded fix loop → reward = slot time saved / partition time → outcome
 record, store record, claim tally. Parallel rollouts share a per-slot composite best that is
-re-verified at the end. After the run, `propose_fusions` writes `kb-proposal/1` for
-ModelBlaster.
+re-verified at the end. After the run, `propose_fusions` and `propose_splits` write
+`kb-proposal/1` for ModelBlaster.
+
+## Proposals
+
+- `fuse`: a producer -> consumer pair where the consumer is elementwise and the only reader of
+  the producer's output; gain = the consumer instances' time. Producers or consumers may already
+  be fused ops, so chains grow over rounds.
+- `split`: a slot whose instances fall into several shape buckets and whose per-op times
+  (`MB_OP_US`) show the one kernel much less efficient (fraction of the binding roofline peak) on
+  some groups than on its best; gain = every group at the best group's efficiency. ModelBlaster
+  gives each group its own slot (`<slot>__v<k>`), seeded with the current kernel.
+
+ModelBlaster turns proposals into graph hints, builds original and variant problems of the
+affected ops, has them optimised with the same budget and decides on re-measured times
+(ModelBlaster's `docs/graph_optimizer.md`). `--plugin FILE` runs a python file first, e.g. to
+register `stub:` models when ModelBlaster drives this runner as a subprocess.
 
 ## Tests
 
@@ -53,6 +68,8 @@ ModelBlaster.
 (`tests/fixtures/mb_lenet`, exported by ModelBlaster) with a scripted `stub:` LLM: a real
 float4 improvement, no-op rewrites, and a broken candidate repaired by the fix loop; and reuse
 of a stored winner by a second problem. Needs nvcc and a GPU (skipped otherwise).
+`tests/test_multislot_units.py` covers proposals (fusion, split), the roofline state, bandit
+transfer and driver-output parsing without a GPU.
 
 ## Notes
 
