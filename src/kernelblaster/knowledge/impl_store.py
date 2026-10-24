@@ -49,8 +49,11 @@ def shape_bucket(op_class: str, shape: dict) -> str:
     """Coarse shape key: winners usually transfer within a bucket.
 
     GEMM/conv/attention use their work dimensions; everything else the total
-    element count (the shape dict's ``n`` or the product of its dims).
+    element count (the shape dict's ``n`` or the product of its dims). A
+    fused op ({"a": stage 0 shape, ...}) is bucketed by its first stage.
     """
+    if isinstance(shape.get("a"), dict):
+        shape = shape["a"]
     keys = _BUCKET_KEYS.get(op_class)
     if keys:
         parts = [f"{k}{_mag(shape[k])}" for k in keys if k in shape]
