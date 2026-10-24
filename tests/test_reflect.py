@@ -174,8 +174,10 @@ def test_reflect_applies_valid_and_rejects_bad(env):
     # persisted, and the eligible claim is retrievable for prompts
     s2 = ClaimStore(store.path)
     rel = s2.relevant(target="cuda", arch="sm_89", op_class="gemm", technique="tensor_core_utilization")
-    assert [c.kind for c in rel] == ["applicability"]       # the pitfall has 1 support < 2
-    assert "FIX:" in s2.render(s2.relevant(target="cuda", kinds=["pitfall"], include_ineligible=True))
+    assert sorted(c.kind for c in rel) == ["applicability", "pitfall"]   # pitfall threshold is 1
+    pit = s2.relevant(target="cuda", kinds=["pitfall"])
+    assert pit[0].state is None                  # pitfalls do not inherit the bottleneck state
+    assert "FIX:" in s2.render(pit)
 
 
 def test_reflect_garbage_response_is_harmless(env):
@@ -294,3 +296,18 @@ def test_consolidate_merges_only_compatible(env):
     assert [r["result"] for r in res] == ["merged", "rejected"]
     assert a.text == "wmma / tensor cores speed up gemm" and a.support == 2
     assert b.status == "retired" and h.status == "active"
+
+
+def test_nested_data_under_kind_is_unwrapped(env):
+    # sonnet's first live response nested data as {"applicability": {"effect": ...}}
+    log, store, R, index = env
+    e = V({"kind": "applicability", "text": "x", "evidence": [R["tc1"].id],
+           "data": {"applicability": {"effect": "helps"}}}, store, index)
+    assert e["data"] == {"effect": "helps"}
+
+
+def test_prompt_shows_flat_data_shapes(env):
+    from kernelblaster.knowledge.reflect import build_reflect_messages
+    log, store, R, index = env
+    sys_ = build_reflect_messages([R["tc1"]], [], max_edits=5)[0]["content"]
+    assert "DATA_BY_KIND" in sys_ and '"effect": "helps|no_effect|hurts"' in sys_ and "{max_edits}" not in sys_

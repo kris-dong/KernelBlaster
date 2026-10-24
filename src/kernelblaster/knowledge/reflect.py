@@ -58,6 +58,8 @@ RELATIONS = ("works_after", "works_before", "undoes", "conflicts", "enables")
 NOTE_TYPES = ("why_fast", "dead_end")
 ERROR_STATUSES = (COMPILE_ERROR, WRONG_OUTPUT, RUNTIME_ERROR)
 ANY = ("*", "any", "all")
+#: kinds whose scope.state is not inherited from the cited records
+STATELESS_KINDS = (PITFALL, REVISE_DESCRIPTION, IMPL_NOTE)
 
 #: documented in docs/semantic_update_pass.md; also shown to the model
 EDIT_SCHEMA = {
@@ -69,16 +71,22 @@ EDIT_SCHEMA = {
         "claim_id": "existing claim id (support/contradict only)",
         "scope": {"arch": "...|*", "op_class": "...|*", "technique": "...|*", "state": "...|*",
                   "problem_id": "impl_note only", "slot": "impl_note only", "impl_id": "impl_note only"},
-        "data": {
-            "applicability": {"effect": "|".join(EFFECTS)},
-            "pitfall": {"symptom": "error / failure seen", "fix": "what fixed it (optional)"},
-            "interaction": {"other": "technique name", "relation": "|".join(RELATIONS)},
-            "parameter": {"params": {"name": "value"}},
-            "state_split": {"proposed_state": "snake_case_name", "criterion": "what separates the groups"},
-            "impl_note": {"note_type": "|".join(NOTE_TYPES)},
-        },
+        "data": "flat object whose keys depend on kind, see DATA_BY_KIND",
     }]
 }
+#: the flat ``data`` object each kind takes (revise_description / support / contradict: none)
+DATA_BY_KIND = {
+    "applicability": {"effect": "|".join(EFFECTS)},
+    "pitfall": {"symptom": "error / failure seen", "fix": "what fixed it (optional)"},
+    "interaction": {"other": "technique name", "relation": "|".join(RELATIONS)},
+    "parameter": {"params": {"name": "value"}},
+    "state_split": {"proposed_state": "snake_case_name", "criterion": "what separates the groups"},
+    "impl_note": {"note_type": "|".join(NOTE_TYPES)},
+}
+EXAMPLE_EDIT = {"kind": "applicability", "text": "<when it helps, with the condition>",
+                "evidence": ["<record id>", "<record id>"],
+                "scope": {"technique": "<technique>", "op_class": "gemm"},
+                "data": {"effect": "helps"}}
 
 
 class EditError(ValueError):
@@ -154,6 +162,8 @@ def validate_edit(edit: Any, *, index: dict[str, OutcomeRecord], claims: ClaimSt
     data = edit.get("data") or {}
     if not isinstance(data, dict):
         raise EditError("data must be an object")
+    if set(data) == {kind} and isinstance(data[kind], dict):
+        data = data[kind]   # tolerate {"data": {"<kind>": {...}}} (seen from sonnet)
     counter = _ids(edit.get("counter_evidence"), "counter_evidence", index, required=False)
     if any(index[i].target != target for i in counter):
         raise EditError("counter_evidence crosses targets")
@@ -180,7 +190,9 @@ def validate_edit(edit: Any, *, index: dict[str, OutcomeRecord], claims: ClaimSt
         "arch": resolve("arch", _common(r.arch for r in recs), {r.arch for r in recs if r.arch}),
         "op_class": resolve("op_class", _common(r.op_class for r in recs), set(OP_CLASSES)),
         "technique": resolve("technique", _common(rec_techs), all_techs),
-        "state": resolve("state", _common(r.state_before for r in recs), all_states),
+        # failures / descriptions / impl notes are not bottleneck-state dependent
+        "state": resolve("state", None if kind in STATELESS_KINDS else _common(r.state_before for r in recs),
+                         all_states),
         "problem_id": None, "slot": None, "impl_id": None,
     }
     statuses = {r.status for r in recs}
@@ -347,6 +359,12 @@ Rules:
 
 Return ONLY a JSON object of this shape (no prose, no markdown fences):
 {schema}
+
+DATA_BY_KIND -- "data" is FLAT, e.g. "data": {{"effect": "helps"}}, never nested under the kind:
+{data_by_kind}
+
+Example edit:
+{example}
 """
 
 
@@ -383,7 +401,9 @@ def _fmt_claim(c: Claim) -> str:
 
 def build_reflect_messages(records: list[OutcomeRecord], existing: list[Claim], *,
                            max_edits: int, known_techniques: Optional[Iterable[str]] = None) -> list:
-    system = REFLECT_SYSTEM.format(max_edits=max_edits, schema=json.dumps(EDIT_SCHEMA, indent=1))
+    system = REFLECT_SYSTEM.format(max_edits=max_edits, schema=json.dumps(EDIT_SCHEMA, indent=1),
+                                   data_by_kind=json.dumps(DATA_BY_KIND, indent=1),
+                                   example=json.dumps(EXAMPLE_EDIT))
     parts = [f"OUTCOME RECORDS ({len(records)}):"]
     parts += [_fmt_record(r) for r in records]
     parts.append("")
