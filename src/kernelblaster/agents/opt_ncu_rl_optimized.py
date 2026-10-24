@@ -72,6 +72,7 @@ from .utils import (
 from .utils.perf_log import perf_span, perf_record
 from ..backends import CUDABackend, ProfileResult
 from .rl import ProfileCacheEntry
+from ..knowledge.outcomes import classify_speedup
 
 # ---------------------------------------------------------------------------
 # CUDA backend singleton — passed to :class:`RLOptimizedAgentBase` so it
@@ -125,7 +126,12 @@ class OptimizedRLNCUAgent(RLOptimizedAgentBase):
         cost_tracker: Optional[CostTracker] = None,
         problem_id: Optional[str] = None,
         progress_writer: Optional[ProgressWriter] = None,
+        knowledge: Optional[Any] = None,
     ):
+        """``knowledge``: optional :class:`knowledge.semantic.SemanticKnowledge`.
+        When ``None`` and ``$KB_KNOWLEDGE_DIR`` is set, one is built from the
+        env; otherwise the agent runs exactly as before (no outcome records,
+        no claims in prompts, no reflection calls)."""
         # Shared init (bandit, profile_cache, seed_buffer, tiered
         # model config, prune knobs) lives on the base.
         super().__init__(
@@ -173,6 +179,70 @@ class OptimizedRLNCUAgent(RLOptimizedAgentBase):
 
         # CUDA-only knob (NCU profiling timeout).
         self.ncu_timeout_s = int(os.getenv("KERNELBLASTER_NCU_TIMEOUT_S", "600"))
+
+        # Optional semantic knowledge (claims + outcome log + reflection).
+        self.knowledge = knowledge
+        if self.knowledge is None:
+            try:
+                from ..knowledge.semantic import SemanticKnowledge
+                self.knowledge = SemanticKnowledge.from_env(
+                    target="cuda",
+                    arch=self._kb_arch(),
+                    op_class=os.getenv("KB_OP_CLASS", "other"),
+                    problem_id=problem_id,
+                    logger=self.agent_logger,
+                    known_techniques=self._kb_known_techniques(),
+                    known_states=set(self.database.optimization_strategies),
+                )
+            except Exception as e:
+                self.agent_logger.warning(f"Semantic knowledge disabled: {e}")
+                self.knowledge = None
+
+    # ------------------------------------------------------------------
+    # Semantic knowledge helpers (all no-ops when self.knowledge is None)
+    # ------------------------------------------------------------------
+
+    def _kb_arch(self) -> Optional[str]:
+        try:
+            return self.gpu.sm
+        except Exception:
+            return str(getattr(self, "gpu", "") or "") or None
+
+    def _kb_known_techniques(self) -> set:
+        try:
+            return {
+                o.technique
+                for sd in self.database.optimization_strategies.values()
+                for o in sd.get("optimizations", [])
+            }
+        except Exception:
+            return set()
+
+    def _kb_notes(self, kind: str, *, state: Optional[str] = None,
+                  technique: Optional[str] = None) -> Optional[str]:
+        if self.knowledge is None:
+            return None
+        try:
+            if kind == "plan":
+                return self.knowledge.plan_notes(state) or None
+            if kind == "fix":
+                cl = self.knowledge.claims
+                pit = cl.relevant(target=self.knowledge.target, arch=self.knowledge.arch,
+                                  op_class=self.knowledge.op_class, technique=technique,
+                                  kinds=["pitfall"], k=6)
+                return cl.render(pit) or None
+            return self.knowledge.codegen_notes(technique, state) or None
+        except Exception as e:
+            self.agent_logger.warning(f"Knowledge retrieval failed: {e}")
+            return None
+
+    def _kb_record(self, **fields) -> None:
+        if self.knowledge is None:
+            return
+        try:
+            self.knowledge.record(**fields)
+        except Exception as e:
+            self.agent_logger.warning(f"Outcome record failed: {e}")
 
     # ------------------------------------------------------------------
     # Profiling — cached by code hash
@@ -667,6 +737,14 @@ class OptimizedRLNCUAgent(RLOptimizedAgentBase):
         except Exception as e:
             self.agent_logger.warning(f"Database persist failed: {e}")
 
+        # Final (bounded: one call) reflection over the remaining records.
+        if self.knowledge is not None:
+            await self.knowledge.maybe_reflect(force=True)
+            try:
+                self.knowledge.save()
+            except Exception as e:
+                self.agent_logger.warning(f"Knowledge save failed: {e}")
+
         if best_filename is not None:
             if self.initial_cycles is not None and best_cycles < self.initial_cycles:
                 final = self.folder / "success_rl_optimization.cu"
@@ -732,10 +810,17 @@ class OptimizedRLNCUAgent(RLOptimizedAgentBase):
                     elapsed_cycles=current_cycles,
                 )
                 analysis_json = json.dumps(asdict(profile), indent=2)
+                plan_kwargs = {}
+                if self.knowledge is not None:
+                    plan_kwargs = {
+                        "knowledge_notes": self._kb_notes("plan", state=current_state),
+                        "stats_context": self.knowledge.stats_context,
+                    }
                 plan = await self.database.generate_optimization_plan(
                     analysis_json,
                     current_code,
                     top_n=max(4, self.max_rollout_steps - step),
+                    **plan_kwargs,
                 )
             except Exception as e:
                 self.agent_logger.warning(f"Plan failed for traj {traj_idx} step {step}: {e}")
@@ -775,10 +860,18 @@ class OptimizedRLNCUAgent(RLOptimizedAgentBase):
 
             try:
                 optimized_code, new_cycles, new_ncu_log, new_metrics = await self._apply_optimization(
-                    current_code, chosen_name, strategy_description, current_cycles, traj_dir, step
+                    current_code, chosen_name, strategy_description, current_cycles, traj_dir, step,
+                    state=current_state,
                 )
             except Exception as e:
                 self.agent_logger.error(f"Apply failed traj {traj_idx} step {step}: {e}")
+                if self.knowledge is not None:
+                    from ..knowledge.semantic import classify_error
+                    self._kb_record(
+                        technique=chosen_name, status=classify_error(str(e)),
+                        state_before=current_state, metric_before=current_cycles,
+                        error=str(e), diff_summary=(strategy_description or "")[:300],
+                    )
                 break
 
             # Reward = improvement fraction; bandit consumes this directly.
@@ -803,7 +896,12 @@ class OptimizedRLNCUAgent(RLOptimizedAgentBase):
                     else None
                 ),
                 current_file_path=self.folder / "init.cu",
+                **(
+                    {"op_class": self.knowledge.op_class, "arch": self.knowledge.arch}
+                    if self.knowledge is not None else {}
+                ),
             )
+            state_before = current_state
 
             traj_step = TrajectoryStep(
                 state=current_state,
@@ -844,6 +942,27 @@ class OptimizedRLNCUAgent(RLOptimizedAgentBase):
             except Exception:
                 pass  # keep current_state on failure
 
+            if self.knowledge is not None:
+                step_speedup = (
+                    float(current_cycles) / float(new_cycles)
+                    if current_cycles and new_cycles else None
+                )
+                before_m = parse_ncu_metrics(last_ncu_log) if last_ncu_log else {}
+                after_m = parse_ncu_metrics(new_ncu_log) if new_ncu_log else {}
+                self._kb_record(
+                    technique=chosen_name, status=classify_speedup(step_speedup),
+                    state_before=state_before, state_after=current_state,
+                    metric_before=current_cycles, metric_after=new_cycles,
+                    speedup=step_speedup,
+                    metrics_delta={
+                        k: round(after_m[k] - before_m[k], 3)
+                        for k in after_m
+                        if k in before_m and (after_m[k] or before_m[k])
+                        and after_m[k] != before_m[k]
+                    },
+                    diff_summary=(strategy_description or "")[:300],
+                )
+
             current_code = optimized_code
             current_cycles = new_cycles
             last_ncu_log = new_ncu_log
@@ -866,6 +985,8 @@ class OptimizedRLNCUAgent(RLOptimizedAgentBase):
                 )
                 break
 
+        if self.knowledge is not None:
+            await self.knowledge.maybe_reflect()
         return trajectory
 
     # ------------------------------------------------------------------
@@ -880,6 +1001,8 @@ class OptimizedRLNCUAgent(RLOptimizedAgentBase):
         current_cycles: Optional[int],
         traj_dir: Path,
         step: int,
+        *,
+        state: Optional[str] = None,
     ) -> Tuple[str, int, str, Dict[str, Any]]:
         """Generate + compile + profile a step. Returns (code, cycles, ncu_log, metrics)."""
         # Per-step span — bottleneck dashboard groups by phase, but this
@@ -894,7 +1017,7 @@ class OptimizedRLNCUAgent(RLOptimizedAgentBase):
         try:
             return await self.__apply_optimization_inner(
                 code, technique_name, strategy_description,
-                current_cycles, traj_dir, step,
+                current_cycles, traj_dir, step, state=state,
             )
         except Exception:
             step_status = "raised"
@@ -919,6 +1042,8 @@ class OptimizedRLNCUAgent(RLOptimizedAgentBase):
         current_cycles: Optional[int],
         traj_dir: Path,
         step: int,
+        *,
+        state: Optional[str] = None,
     ) -> Tuple[str, int, str, Dict[str, Any]]:
         # 1. Build messages with cache-stable system prompt.
         # Use last cached profile metrics if available; else minimal dict.
@@ -953,6 +1078,10 @@ class OptimizedRLNCUAgent(RLOptimizedAgentBase):
             ncu_metrics_json=current_metrics_json,
             strategy_description=strategy_description,
             best_so_far_summary=best_so_far_summary,
+            **(
+                {"knowledge_notes": self._kb_notes("codegen", state=state, technique=technique_name)}
+                if self.knowledge is not None else {}
+            ),
         )
 
         # 2. Codegen.
@@ -994,7 +1123,11 @@ class OptimizedRLNCUAgent(RLOptimizedAgentBase):
                 if attempt >= self.max_fix_attempts:
                     raise
                 fix_messages = self.database.build_fix_messages(
-                    broken_kernel=optimized_code, compiler_error=err
+                    broken_kernel=optimized_code, compiler_error=err,
+                    **(
+                        {"knowledge_notes": self._kb_notes("fix", technique=technique_name)}
+                        if self.knowledge is not None else {}
+                    ),
                 )
                 try:
                     fix_text = await self._llm_fix(fix_messages)
