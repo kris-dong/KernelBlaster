@@ -156,6 +156,7 @@ class EvalResult:
     stage: str                                 # "compile" | "run" | "check" | "ok"
     partition_us: Optional[float] = None
     slot_us: dict = field(default_factory=dict)
+    op_us: dict = field(default_factory=dict)          # op name -> us (MB_OP_US; newer drivers)
     slot_checks: dict = field(default_factory=dict)    # sid -> {"rel_err", "ok"}
     outputs: dict = field(default_factory=dict)
     errors: list = field(default_factory=list)
@@ -188,6 +189,8 @@ def parse_driver_output(text: str) -> EvalResult:
         r.slot_checks[m.group(1)] = {"rel_err": float(m.group(2)), "ok": m.group(3) == "1"}
     for m in re.finditer(r"^MB_SLOT_US (\S+) (\S+)", text, re.M):
         r.slot_us[m.group(1)] = float(m.group(2))
+    for m in re.finditer(r"^MB_OP_US (\S+) (\S+)", text, re.M):
+        r.op_us[m.group(1)] = float(m.group(2))
     m = re.search(r"^MB_PARTITION_US (\S+)", text, re.M)
     if m:
         r.partition_us = float(m.group(1))
