@@ -255,6 +255,13 @@ Every run records per-LLM-call tokens (input, cache, output), stop reasons / tru
 
 See [telemetry.md](telemetry.md).
 
+## LLM relay
+
+To make the provider calls on another machine (VPN, keys kept there), run `kernelblaster.servers.llm_server` on
+that machine and set `KB_LLM_SERVER_URL` (plus `KB_LLM_SERVER_TOKEN_FILE`) here. Typically this goes through an
+`ssh -L` tunnel. `run_multislot.py` needs no flags, and accounting and telemetry are unchanged. Provider settings
+such as `BEDROCK_MAX_TOKENS` are then read on the server. See [llm_server.md](llm_server.md).
+
 ## Notes
 
 - `KERNELBLASTER_ALLOW_SHARED_GPU=1` lets the exec server start when other processes use the
