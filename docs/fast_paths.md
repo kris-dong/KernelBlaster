@@ -258,6 +258,7 @@ or NCU pass at a time:
 | `LocalEvaluator` nvcc processes | adaptive | 4 unit jobs + 2 assembled builds | `build_jobs=` / `max_parallel=`, `--compile-jobs N`, `KERNELBLASTER_MULTISLOT_COMPILE_JOBS` |
 | `LocalEvaluator` GPUs | pool over the auto GPUs | one `asyncio.Lock`, `CUDA_VISIBLE_DEVICES` untouched | `gpus=`, `--gpus auto\|all\|0,2`, `pool=` |
 | `SSHEvaluator` | every `--ssh-host`, each with its auto (idle) GPUs | one host, one fixed `CUDA_VISIBLE_DEVICES` string | `--cuda-visible-devices` once for all hosts or once per host; `{host: spec}` / `{host: dir}` in the API |
+| GPU model | any model the spec selects (each problem pinned to the model of its first lease) | | `gpu_model=` / `--gpu-model M`: only GPUs of model M, none of them is `NoDevice`; `max_devices=` caps the pool |
 | `run_multislot.py` problems | `--parallel-problems` = GPUs in the pool | sequential | `--parallel-problems N` |
 | exec server (local strategy) | one worker per auto GPU (UUIDs); the pre-flight check is scoped to them | one worker on GPU 0, global check | `KERNELBLASTER_GPU_SERVER_GPU_IDS`, `KERNELBLASTER_GPU_SERVER_NUM_WORKERS` |
 | compile server workers | `--num-workers auto`: `min(16, CPUs/2, MemAvailable/3 GB)` workers; adaptive admission of `free CPUs × 0.75 / 2` jobs | physical cores − 1 (`management.py`), 4 (CLI) | `--num-workers N`, `KERNELBLASTER_COMPILE_SERVER_NUM_WORKERS`, `KERNELBLASTER_MAX_COMPILE_WORKERS` |
@@ -345,6 +346,9 @@ NCU runs, go only to GPUs of that model, on any host.
   models.
 - The store keys records by arch label, so a mixed pool should only mix GPUs that share
   `--arch`. `SSHEvaluator` builds one binary for one SM.
+- Across processes the pin is explicit: `result.json` records the GPU (`gpu`), and a later
+  timing of the same work passes that model as `gpu_model` (ModelBlaster's model result does
+  this through `scripts/time_problems.py`).
 
 Alternatives considered: requiring a homogeneous pool per evaluator, which wastes the other
 GPUs; and pinning a problem to a single device, which serialises the problem's rollouts on

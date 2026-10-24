@@ -1369,6 +1369,8 @@ class MultiSlotAgent:
             "e2e_speedup": (base.deployed_us / final.deployed_us) if final.ok and final.deployed_us and
             base.deployed_us else None,
             "final_e2e_ratio": final.e2e_ratio,           # final vs the seeds, paired (persistent host)
+            # the GPU the final (else the baseline) numbers were timed on: model, uuid, host, arch
+            "gpu": getattr(final, "gpu", None) or getattr(base, "gpu", None),
             "runtime": {"baseline": partition_runtime(base), "final": partition_runtime(final),
                         **({"evaluator": self.ev.host_stats()} if hasattr(self.ev, "host_stats") else {})},
             "attr_op_us": final.attr_op_us,

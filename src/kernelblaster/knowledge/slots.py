@@ -16,6 +16,7 @@ tail.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import json
 import os
@@ -213,6 +214,8 @@ class EvalResult:
     launch_overhead_frac: Optional[float] = None       # of the eager partition time
     runtime: str = "process"                           # "process" (one driver run) | "host" (persistent host)
     eval_wall_s: Optional[float] = None
+    # the GPU the run was timed on (pool evaluators): host, label, index, uuid, name (model), arch
+    gpu: Optional[dict] = None
 
     @property
     def deployed_us(self) -> Optional[float]:
@@ -346,6 +349,14 @@ def step_eval_options(sid: str) -> dict:
 
 # ---------------------------------------------------------------- evaluators
 
+# the device the current evaluate() call's run was leased (set at each lease, read by evaluate)
+_LEASED: contextvars.ContextVar = contextvars.ContextVar("kb_leased_device", default=None)
+
+
+def _leased(dev) -> None:
+    _LEASED.set(dev)
+
+
 class Evaluator:
     """Compile an assembled candidate with the problem's driver and run it.
 
@@ -406,13 +417,20 @@ class LocalEvaluator(Evaluator):
     context and the data, the partition is timed as a CUDA graph where it is
     capturable, and ``incumbent=`` sources are timed in the same request
     (paired). ``"process"`` (and the fallback when the host cannot be built or
-    started) runs one driver process per evaluation, as before."""
+    started) runs one driver process per evaluation, as before.
+
+    Hardware: ``gpu_model`` (e.g. ``"NVIDIA L40S"``) keeps only the selected
+    devices of that model -- none of it is an error (``NoDevice``), never a
+    run on another model -- and ``max_devices`` caps the pool (1: every run on
+    one GPU). Every result records the device it was timed on
+    (``EvalResult.gpu``)."""
 
     def __init__(self, arch: str = "75", work_root: Optional[Path] = None, nvcc: str = "nvcc",
                  max_parallel: Optional[int] = None, timeout_s: int = 900, keep: bool = False,
                  incremental: Optional[bool] = None, cache_dir: Optional[Path] = None,
                  build_jobs: Optional[int] = None, gpus=None, pool=None, infra_retries: int = 2,
-                 graph: Optional[bool] = None, runtime: Optional[str] = None, hosts_per_device: int = 3):
+                 graph: Optional[bool] = None, runtime: Optional[str] = None, hosts_per_device: int = 3,
+                 gpu_model: Optional[str] = None, max_devices: Optional[int] = None):
         from ..servers.utils.resources import build_limiter
         from .runtime_host import HostPool
 
@@ -432,6 +450,7 @@ class LocalEvaluator(Evaluator):
                                    name="multislot nvcc")
         self._sem = self._unit_sem = self._jobs
         self.gpus, self._pool, self._pool_lock = gpus, pool, None
+        self.gpu_model, self.max_devices = gpu_model, max_devices
         self.infra_retries = infra_retries
         # one TU per slot, objects + binaries cached by content (see _build_units)
         self.incremental = _incremental_default() if incremental is None else incremental
@@ -446,13 +465,15 @@ class LocalEvaluator(Evaluator):
 
     async def pool(self):
         """The GPU pool (built on first use from ``gpus``)."""
-        from ..servers.utils.resources import GPUPool, loop_local
+        from ..servers.utils.resources import GPUPool, loop_local, restrict_devices
 
         if self._pool is None:
             self._pool_lock = loop_local(self._pool_lock, asyncio.Lock)
             async with self._pool_lock:
                 if self._pool is None:
-                    self._pool = GPUPool(await self._devices(), name=type(self).__name__)
+                    devs = restrict_devices(await self._devices(), gpu_model=self.gpu_model,
+                                            max_devices=self.max_devices)
+                    self._pool = GPUPool(devs, name=type(self).__name__)
                     _log().info(f"{type(self).__name__}: GPU pool {self._pool.describe()}; "
                                 f"compile jobs {self._jobs.describe()}")
         return self._pool
@@ -466,6 +487,7 @@ class LocalEvaluator(Evaluator):
         avoid: set = set()
         for attempt in range(self.infra_retries + 1):
             async with pool.lease(str(problem.root), avoid) as lease:
+                _leased(lease.device)
                 text = await self._run(exe, env, prefix, device=lease.device, problem=problem)
                 lease.infra_error = text is not None and is_infra_failure(text) and \
                     not re.search(r"^passed$", text, re.M)
@@ -596,7 +618,26 @@ class LocalEvaluator(Evaluator):
             return None
         return out.decode(errors="replace")
 
+    def gpu_info(self, dev) -> Optional[dict]:
+        """What a result records of the device it was timed on."""
+        if dev is None:
+            return None
+        ident = dev.ident
+        return {"host": dev.host, "label": dev.label(), "index": dev.index,
+                "uuid": ident if ident and str(ident).startswith("GPU-") else None, "name": dev.name,
+                "arch": f"sm_{self.arch}"}
+
     async def evaluate(self, problem, sources, tag, *, only_slots=None, screen=False, incumbent=None):
+        tok = _LEASED.set(None)
+        try:
+            res = await self._evaluate(problem, sources, tag, only_slots, screen, incumbent)
+            if res is not None and res.gpu is None:
+                res.gpu = self.gpu_info(_LEASED.get())
+            return res
+        finally:
+            _LEASED.reset(tok)
+
+    async def _evaluate(self, problem, sources, tag, only_slots, screen, incumbent):
         if self._use_host(problem):
             res = await self._evaluate_host(problem, sources, tag, only_slots, screen, incumbent)
             if res is not None:
@@ -795,6 +836,7 @@ class LocalEvaluator(Evaluator):
         for attempt in range(self.infra_retries + 1):
             async with pool.lease(str(problem.root), avoid) as lease:
                 dev = lease.device
+                _leased(dev)
                 key = (str(problem.root), dev.key, str(exe))
                 h = await self._hosts.get(key, dev.key, lambda: HostClient(
                     [str(exe)], env=host_env(dev.env()), label=f"{problem.name}@{dev.label()}",
@@ -1175,6 +1217,7 @@ class SSHEvaluator(LocalEvaluator):
             else:
                 run_env = {**(env or {}), **({"MB_DATA_PATH": data} if data else {})}
                 async with pool.lease(group, host=host) as lease:
+                    _leased(lease.device)
                     text = await self._exec_staged(host, name, basis, run_env, prefix, device=lease.device)
                     missing = self._data_missing(text, data)
                     lease.infra_error = missing or (text is not None and is_infra_failure(text) and
@@ -1268,6 +1311,7 @@ class SSHEvaluator(LocalEvaluator):
                 continue
             async with pool.lease(group, host=host) as lease:
                 dev = lease.device
+                _leased(dev)
                 key = (group, dev.key, hname)
                 # the host maps data.bin once at start-up: MB_DATA_PATH is the process's
                 envs = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in

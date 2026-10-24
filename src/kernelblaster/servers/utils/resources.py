@@ -750,6 +750,40 @@ def is_infra_failure(text: Optional[str]) -> bool:
     return bool(text) and bool(_INFRA_PATTERNS.search(text))
 
 
+def gpu_model_key(name: Optional[str]) -> Optional[str]:
+    """A GPU model name normalised for comparison ("NVIDIA L40S" == "l40s");
+    None for the placeholder names of devices whose model is unknown
+    ("default", "gpu": no nvidia-smi, or its inventory failed)."""
+    if not name:
+        return None
+    k = re.sub(r"\s+", " ", str(name)).strip().lower()
+    k = re.sub(r"^nvidia ", "", k)
+    return None if k in ("", "default", "gpu") else k
+
+
+def same_gpu_model(a: Optional[str], b: Optional[str]) -> bool:
+    """Both names are known and denote the same GPU model."""
+    ka, kb = gpu_model_key(a), gpu_model_key(b)
+    return ka is not None and ka == kb
+
+
+def restrict_devices(devices: Sequence[Device], *, gpu_model: Optional[str] = None,
+                     max_devices: Optional[int] = None) -> list[Device]:
+    """The devices of ``gpu_model`` (all when None), at most ``max_devices``.
+    Raises :class:`NoDevice` (naming the models found) when none is of that
+    model: a timing on another GPU model is never silently substituted."""
+    devs = list(devices)
+    if gpu_model:
+        keep = [d for d in devs if same_gpu_model(d.name, gpu_model)]
+        if not keep:
+            found = ", ".join(f"{d.label()} ({d.name})" for d in devs) or "none"
+            raise NoDevice(f"no {gpu_model} GPU among the selected devices ({found})")
+        devs = keep
+    if max_devices:
+        devs = devs[:max(1, int(max_devices))]
+    return devs
+
+
 def local_devices(spec=None, *, inventory: Optional[list[GPUInfo]] = None,
                   logger: Optional[logging.Logger] = None) -> list[Device]:
     """Devices for this host from a GPU spec (see :func:`select_gpus`).
