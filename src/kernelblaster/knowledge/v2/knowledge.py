@@ -6,12 +6,13 @@
     exploration budget) -> prompt from retrieval -> record (metric vectors,
     state chain, item id, mechanism check, stats, hypothesis attempt)
 
-plus :meth:`maybe_upkeep`, the slower passes: hypothesis review (no LLM),
+plus :meth:`maybe_upkeep`, the slower passes: hypothesis decisions and the
+automatic rollback of promotions / lifts (no LLM),
 hypothesis generation and state discovery (one LLM call each, on the
 ``upkeep_model``, only when deterministic triggers fire) and probation.
 
-Everything lives in ``<root>/knowledge.db``; the human review queue is
-mirrored to ``<root>/review.jsonl``. Seeds (targets, states, techniques, the
+Everything lives in ``<root>/knowledge.db``; the audit log of automatic
+changes (nothing waits on it) is mirrored to ``<root>/review.jsonl``. Seeds (targets, states, techniques, the
 legacy technique DB) are loaded idempotently on first open.
 """
 from __future__ import annotations
@@ -34,9 +35,9 @@ from .ontology import MECH_UNKNOWN, Ontology, Technique, mechanism_check
 from .states import Classification, State, StateHierarchy, load_seed
 from .stats import HierStats, path as stat_path
 from .store import KnowledgeDB, SQLiteClaimStore, SQLiteOutcomeLog
-from .targets import TargetRegistry
+from .targets import DATA_DIR, TargetRegistry
 
-SEED_VERSION = 1
+SEED_VERSION = 3              # 2: scope tree, node-level techniques; 3: comprehensive seed
 
 
 @dataclass
@@ -58,7 +59,7 @@ class Choice:
 class KnowledgeV2:
     def __init__(self, root: Path, *, upkeep_model: Optional[str] = None, logger=None,
                  explore_frac: float = EXPLORE_FRAC, kappa: float = 3.0, ucb_c: float = 1.0,
-                 upkeep_every: int = 8, max_new_hypotheses: int = 3):
+                 upkeep_every: int = 8, max_new_hypotheses: int = 3, seed_mined: bool = True):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.review_path = self.root / "review.jsonl"
@@ -69,12 +70,15 @@ class KnowledgeV2:
         self.explore_frac, self.ucb_c = explore_frac, ucb_c
         self.upkeep_every, self.max_new_hyp = upkeep_every, max_new_hypotheses
         self._seed()
+        self._load_scopes()
         self.hierarchy = self._load_hierarchy()
         self.ontology = self._load_ontology()
-        self.stats = HierStats(self.registry, self.db, kappa=kappa)
-        self.hypotheses = HypothesisBook(self.db, self.registry, self.ontology)
         self.outcomes = SQLiteOutcomeLog(self.db)
         self.claims = SQLiteClaimStore(self.db, registry=self.registry, hierarchy=self.hierarchy)
+        if seed_mined:
+            self._seed_mined()
+        self.stats = HierStats(self.registry, self.db, kappa=kappa)
+        self.hypotheses = HypothesisBook(self.db, self.registry, self.ontology)
         self.n_selected = self.n_explore = 0
         self.usage: Counter = Counter()
         self.events: list[dict] = []              # upkeep events of this process (for result.json)
@@ -82,19 +86,95 @@ class KnowledgeV2:
 
     # ---------------------------------------------------------------- seeding / loading
     def _seed(self) -> None:
-        if (self.db.get_meta("seed_version") or 0) >= SEED_VERSION:
+        """Load the seed data idempotently; a newer SEED_VERSION refreshes seed-sourced rows only
+        (discovered states, promoted techniques and runtime scopes are never touched)."""
+        have = self.db.get_meta("seed_version") or 0
+        if have >= SEED_VERSION:
             return
         for k, t in self.registry.targets.items():
-            with self.db.tx() as c:
-                c.execute("INSERT OR IGNORE INTO targets VALUES (?, ?, ?)", (k, t.family, json.dumps(t.__dict__)))
+            self.db.put_target(k, t.node, t.to_dict())
         states, legacy = load_seed()
+        old_states = {d["id"]: d for d in self.db.rows("states")}
         for s in states:
-            self.db.put("states", s.id, s.to_dict(), replace=False)
+            if old_states.get(s.id, {}).get("source", "seed") == "seed":
+                self.db.put("states", s.id, s.to_dict())
         o = Ontology.seed(self.registry, legacy=True)       # reads the old JSON DB + footers once
+        old_t = {d["id"]: d for d in self.db.techniques()}
         for t in o.techniques.values():
-            self.db.put("techniques", t.id, t.to_dict(), replace=False)
+            src = old_t.get(t.id, {}).get("source", t.source)
+            if not src.startswith("hypothesis:"):
+                self.db.put("techniques", t.id, t.to_dict())
         self.db.set_meta("legacy_state_map", legacy)
         self.db.set_meta("seed_version", SEED_VERSION)
+
+    def _seed_mined(self) -> None:
+        """Fold ``mined.json`` (scripts/mine_knowledge.py) in once: its outcomes become statistics
+        (evidence), its claims evidence-backed claims at their mined scope."""
+        fp = DATA_DIR / "mined.json"
+        if not fp.exists():
+            return
+        import hashlib
+        sha = hashlib.sha1(fp.read_bytes()).hexdigest()[:16]
+        if self.db.get_meta("mined_seed") == sha:
+            return
+        if self.db.get_meta("mined_seed"):        # a newer mined file: earlier mined stats are not re-added
+            self._log("info", "mined.json changed; adding only claims not seen before")
+            stats_too = False
+        else:
+            stats_too = True
+        d = json.loads(fp.read_text())
+        if stats_too:
+            agg: dict = {}
+            have = {r[0] for r in self.db.query("SELECT id FROM outcomes")}
+            for o in d.get("outcomes", []):
+                if o["item"] not in self.ontology.techniques or o["id"] in have:   # no double counting
+                    continue
+                for node in stat_path(self.registry, target_key=o["target"], op_class=o["op_class"],
+                                      chain=o.get("chain") or [], dtype=o.get("dtype")):
+                    a = agg.setdefault((o["item"], *node), [0.0, 0.0, 0.0])
+                    a[0] += 1
+                    a[1] += o["reward"]
+                    a[2] += o["reward"] ** 2
+            self.db.add_stats_bulk(agg)
+        from ..claims import Claim
+        from .reflect_v2 import set_claim_scope
+        for c in d.get("claims", []):
+            cl = Claim(kind=c["kind"], text=c["text"], technique=c["technique"], op_class=c["op_class"],
+                       data={"effect": c["effect"]}, source="mined")
+            first = c["targets"][0]
+            set_claim_scope(cl, c["scope"] if c["scope"] in self.registry.nodes or c["scope"] == "universal"
+                            else first)
+            self.claims.add(cl, c["evidence"])
+        self.claims.save()
+        self.db.set_meta("mined_seed", sha)
+
+    def _load_scopes(self) -> None:
+        """Scope nodes and targets added at run time (DB) on top of targets.json."""
+        for n in self.db.scopes():
+            try:
+                self.registry.add_node(n["id"], n.get("parent") or "universal", n.get("description", ""),
+                                       n.get("kappa"))
+            except ValueError as e:
+                self._log("warning", f"scope {n.get('id')}: {e}")
+        for key, node, data in self.db.target_rows():
+            if key in self.registry.targets:
+                continue
+            node = data.get("node") or (node if node in self.registry.nodes else None)
+            info = {k: v for k, v in data.items() if k not in ("key", "node", "family")}
+            self.registry.add_target(key, node, **info)
+
+    def add_scope(self, nid: str, parent: str = "universal", description: str = "",
+                  kappa: Optional[float] = None) -> None:
+        """Add (or move) a scope node at run time; persisted and audited."""
+        n = self.registry.add_node(nid, parent, description, kappa)
+        self.db.put_scope(nid, parent, n.to_dict())
+        self.db.audit("scope_added", nid, n.to_dict(), self.review_path)
+
+    def add_target(self, key: str, node: str, **info) -> None:
+        """Add a target under ``node`` at run time; persisted and audited."""
+        t = self.registry.add_target(key, node, **info)
+        self.db.put_target(t.key, t.node, t.to_dict())
+        self.db.audit("target_added", t.key, t.to_dict(), self.review_path)
 
     def _load_hierarchy(self) -> StateHierarchy:
         rows = [State.from_dict(d) for d in self.db.rows("states")]
@@ -131,18 +211,20 @@ class KnowledgeV2:
         return {"op_class": op_class, "dtype": dtype or "fp32", "family": t.family, "target": t.key}
 
     # ---------------------------------------------------------------- selection
-    def candidates(self, *, target_key: str, op_class: str, dtype: Optional[str], chain: list, vec: dict):
+    def candidates(self, *, target_key: str, op_class: str, dtype: Optional[str], chain: list, vec: dict,
+                   op_kind: Optional[str] = None):
         ctx = self._ctx(target_key, op_class, dtype)
         vals = M.values(vec)
         techs = self.ontology.candidates(target_key=target_key, op_class=op_class, chain=chain,
-                                         values=vals, ctx=ctx)
+                                         values=vals, ctx=ctx, op_kind=op_kind)
         hyps = self.hypotheses.testable(target_key=target_key, op_class=op_class, chain=chain, values=vals, ctx=ctx)
         return techs, hyps
 
     def select(self, *, target_key: str, op_class: str, dtype: Optional[str], cls: Classification, vec: dict,
-               rng: random.Random, exclude: tuple = ()) -> Choice:
+               rng: random.Random, exclude: tuple = (), op_kind: Optional[str] = None) -> Choice:
         chain = cls.chain
-        techs, hyps = self.candidates(target_key=target_key, op_class=op_class, dtype=dtype, chain=chain, vec=vec)
+        techs, hyps = self.candidates(target_key=target_key, op_class=op_class, dtype=dtype, chain=chain, vec=vec,
+                                      op_kind=op_kind)
         nodes = stat_path(self.registry, target_key=target_key, op_class=op_class, chain=chain, dtype=dtype)
         self.n_selected += 1
         # exploration budget: hypotheses get ~explore_frac of the steps when one is testable here
@@ -154,12 +236,16 @@ class KnowledgeV2:
         items = [t.id for t in techs if t.id not in exclude] or [t.id for t in techs]
         if not items:
             raise RuntimeError(f"no technique applies to {target_key} {op_class} {cls.label()}")
-        ranked = self.stats.ucb(items, nodes, rng, c=self.ucb_c)
+        ranked = self.stats.ucb(items, nodes, rng, c=self.ucb_c, priors=self.priors(items))
         _, est, n, tid = ranked[0]
         t = self.ontology.techniques[tid]
         ev, _ = self.stats.evidence_level(tid, nodes)
         return Choice(tid, "technique", self.technique_text(t, target_key), est, n, ev,
                       ranked=[(i, round(e, 4), k) for _, e, k, i in ranked[:8]])
+
+    def priors(self, items) -> dict:
+        return {i: self.ontology.techniques[i].prior for i in items
+                if i in self.ontology.techniques and self.ontology.techniques[i].prior}
 
     def technique_text(self, t: Technique, target_key: str) -> str:
         r = self.ontology.realization(t, target_key) or {}
@@ -176,16 +262,17 @@ class KnowledgeV2:
     # ---------------------------------------------------------------- retrieval (prompt section)
     def retrieve(self, *, target_key: str, op_class: str, dtype: Optional[str], cls: Classification, vec: dict,
                  problem_id: Optional[str] = None, slot: Optional[str] = None, technique: Optional[str] = None,
-                 max_chars: int = 3500, k_tech: int = 6, k_claims: int = 10) -> str:
+                 max_chars: int = 3500, k_tech: int = 6, k_claims: int = 10, op_kind: Optional[str] = None) -> str:
         """Budgeted, most specific first: state chain, ranked techniques, claims, hypotheses."""
         parts = []
         if cls.chain:
             mech = self.hierarchy.states[cls.leaf].mechanism
             parts.append(f"State: {cls.label()} ({M.render(vec, keys=list(cls.decided_by)) or 'n/a'}). "
                          f"Meaning: {mech}.")
-        techs, hyps = self.candidates(target_key=target_key, op_class=op_class, dtype=dtype, chain=cls.chain, vec=vec)
+        techs, hyps = self.candidates(target_key=target_key, op_class=op_class, dtype=dtype, chain=cls.chain, vec=vec,
+                                      op_kind=op_kind)
         nodes = stat_path(self.registry, target_key=target_key, op_class=op_class, chain=cls.chain, dtype=dtype)
-        ranked = sorted(((self.stats.estimate(t.id, nodes), t) for t in techs), key=lambda x: -x[0])
+        ranked = sorted(((self.stats.estimate(t.id, nodes, t.prior or None), t) for t in techs), key=lambda x: -x[0])
         rows = []
         for est, t in ranked[:k_tech]:
             ev, n = self.stats.evidence_level(t.id, nodes)
@@ -286,6 +373,12 @@ class KnowledgeV2:
                 evs.append(e)
             rows = self.outcomes.rows()
             evs += D.review_probation(self.hierarchy, rows, self.db, self.review_path)
+            # no human gate: automatic rollback of promotions and lifts later evidence contradicts
+            evs += self.hypotheses.revalidate(rows, self.review_path)
+            from .reflect_v2 import revalidate_lifts
+            index = {r.id: r for r in self.outcomes}
+            evs += revalidate_lifts(self.claims, index, self.registry, self.review_path, self.db)
+            self.claims.save()
             if self.upkeep_model:
                 evs += await self.discover_states(rows)
                 evs += await self.generate_hypotheses(rows)
@@ -331,7 +424,7 @@ class KnowledgeV2:
                 evs.append({"event": "state_admitted", "state": s.id, "parent": s.parent,
                             "predicate": P.render(s.predicate), "reason": reason})
             else:
-                self.db.review("state_rejected", pid, {"proposal": prop, "reason": reason}, self.review_path)
+                self.db.audit("state_rejected", pid, {"proposal": prop, "reason": reason}, self.review_path)
                 evs.append({"event": "state_rejected", "proposal": pid, "reason": reason,
                             "predicate": P.render(prop["predicate"]) if isinstance(prop, dict) and
                             isinstance(prop.get("predicate"), dict) else None})

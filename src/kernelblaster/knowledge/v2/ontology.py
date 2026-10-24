@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Technique ontology: mechanisms with predictions and per-scope realizations (design section 5).
 
-Seeded from ``data/kernelblaster/knowledge/techniques.json`` (curated: the
+Seeded from ``data/kernelblaster/knowledge/techniques/*.json`` (curated: the
 multi-slot catalogue and the technique-DB names folded onto mechanisms) and,
 once, from the legacy JSON technique DB and the CUDA / OpenCL / RISC-V
 footers (:func:`seed_legacy`): every name not folded into a curated entry
@@ -23,7 +23,7 @@ from typing import Iterable, Optional
 
 from . import predicates as P
 from .metrics import CANONICAL, MEASURED, flat_band
-from .targets import DATA_DIR, FAMILY, TARGET, UNIVERSAL, TargetRegistry
+from .targets import DATA_DIR, NODE, REPO_DATA_DIR, TARGET, UNIVERSAL, TargetRegistry
 
 CONFIRMED, CONTRADICTED, MECH_UNKNOWN = "confirmed", "contradicted", "unknown"
 DIRECTIONS = ("up", "down", "flat", "up_or_flat", "down_or_flat")
@@ -45,8 +45,11 @@ class Technique:
     realizations: list = field(default_factory=list)   # [{scope, how, params_prior?, exemplars?}]
     states: list = field(default_factory=list)         # gate to these state chains ([] = any)
     op_classes: list = field(default_factory=list)     # gate to these op classes ([] = any)
+    op_kinds: list = field(default_factory=list)       # gate to these ModelBlaster op kinds ([] = any)
+    prior: dict = field(default_factory=dict)          # seed prior {mean, n}: low pseudo-count, evidence overrides
     slot: bool = True                                  # offered by the multi-slot agent
     source: str = "seed"                               # seed | legacy_db | footer:<x> | hypothesis:<id>
+    status: str = "active"                             # active | retired (automatic rollback)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -74,31 +77,46 @@ def _arch_num(key: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
-def scope_rank(scope: str, target_key: str, registry: TargetRegistry) -> Optional[int]:
-    """How specifically realization ``scope`` matches ``target_key`` (lower = more specific; None = no)."""
+def scope_rank(scope: str, target_key: str, registry: TargetRegistry) -> Optional[float]:
+    """How specifically realization ``scope`` matches ``target_key`` (lower = more specific; None = no).
+
+    Scopes: ``target:<key>`` (0), ``target:<backend>:sm_NN+`` (1), ``node:<id>`` /
+    ``family:<id>`` (v1 spelling) / ``universal`` by their distance up the target's chain
+    (1 + index), ``target:<backend>`` just below the node that backend maps to."""
     t = registry.get(target_key)
+    chain = registry.chain(t.key)
     if scope == "universal":
-        return 4
+        return 1.0 + chain.index("universal")
     kind, _, rest = scope.partition(":")
-    if kind == "family":
-        return 3 if rest == t.family else None
+    if kind in ("family", "node"):
+        return 1.0 + chain.index(rest) if rest in chain else None
     if kind != "target":
         return None
     if rest == t.key:
-        return 0
+        return 0.0
     m = re.fullmatch(r"([a-z0-9_]+):sm_(\d+)\+", rest)
     if m:
         n = _arch_num(t.key)
-        return 1 if m.group(1) == t.backend and n is not None and n >= int(m.group(2)) else None
+        lo = int(m.group(2))                    # sm_90+ is more specific than sm_80+ for sm_90
+        return 1.0 - lo / 1000.0 if m.group(1) == t.backend and n is not None and n >= lo else None
     if rest == t.backend:
-        return 2
+        bn = registry.node_for_backend(t.key)
+        return 0.5 + chain.index(bn) if bn in chain else 1.5
     return None
 
 
 def scope_level(scope: str) -> str:
     if scope == "universal":
         return UNIVERSAL
-    return FAMILY if scope.startswith("family:") else TARGET
+    return NODE if scope.split(":", 1)[0] in ("family", "node") else TARGET
+
+
+def scope_of(scope: str) -> str:
+    """Realization scope string -> scope id (``family:X`` / ``node:X`` -> X)."""
+    if scope == "universal":
+        return "universal"
+    kind, _, rest = scope.partition(":")
+    return rest
 
 
 # ---------------------------------------------------------------- mechanism check
@@ -139,6 +157,26 @@ def mechanism_from_delta(predicts: dict, measured_delta: dict) -> dict:
     return mechanism_check(predicts, zero, {k: {"v": d, "src": MEASURED} for k, d in measured_delta.items()})
 
 
+def _kind_match(op_kind: str, kinds: list) -> bool:
+    """A fused slot (``fused__conv2d__relu``) matches when any of its stages is listed."""
+    stages = op_kind.split("__")[1:] if op_kind.startswith("fused__") else [op_kind]
+    return any(k in kinds for k in stages)
+
+
+def load_seed_techniques(data_dir: Optional[Path] = None) -> list[dict]:
+    """Curated seeds: every ``techniques/*.json`` (sorted), or the single v1 ``techniques.json``."""
+    base = Path(data_dir) if data_dir else DATA_DIR
+    files = sorted((base / "techniques").glob("*.json")) if (base / "techniques").is_dir() else [base / "techniques.json"]
+    out, seen = [], {}
+    for f in files:
+        for t in json.loads(f.read_text())["techniques"]:
+            if t["id"] in seen:
+                raise ValueError(f"technique {t['id']!r} defined in {seen[t['id']]} and {f.name}")
+            seen[t["id"]] = f.name
+            out.append(t)
+    return out
+
+
 # ---------------------------------------------------------------- ontology
 
 class Ontology:
@@ -151,8 +189,7 @@ class Ontology:
 
     @classmethod
     def seed(cls, registry: Optional[TargetRegistry] = None, *, legacy: bool = True) -> "Ontology":
-        d = json.loads((DATA_DIR / "techniques.json").read_text())
-        o = cls([Technique.from_dict(x) for x in d["techniques"]], registry)
+        o = cls([Technique.from_dict(x) for x in load_seed_techniques()], registry)
         if legacy:
             seed_legacy(o)
         return o
@@ -191,14 +228,16 @@ class Ontology:
         return best
 
     def applies(self, t: Technique, *, target_key: str, op_class: Optional[str], chain: list,
-                values: dict, ctx: dict, slot_only: bool = True) -> bool:
-        if slot_only and not t.slot:
+                values: dict, ctx: dict, slot_only: bool = True, op_kind: Optional[str] = None) -> bool:
+        if (slot_only and not t.slot) or t.status != "active":
             return False
         if not self.registry.covers(t.level, t.scope, target_key):
             return False
         if self.realization(t, target_key) is None:
             return False
         if t.op_classes and op_class not in t.op_classes:
+            return False
+        if t.op_kinds and op_kind is not None and not _kind_match(op_kind, t.op_kinds):
             return False
         if t.states and not set(t.states) & set(chain):
             return False
@@ -218,7 +257,7 @@ _FOOTERS = {"footer:cuda": ("optimization_database_footer.md", "target:cuda"),
 
 def seed_legacy(o: Ontology, db_path: Optional[Path] = None, footer_dir: Optional[Path] = None) -> dict:
     """Read the old technique DB + footers once; add every unfolded name. Returns counters."""
-    base = DATA_DIR.parent
+    base = REPO_DATA_DIR.parent                     # the v1 DB + footers live next to the seeds
     db_path = Path(db_path) if db_path else base / "optimization_database.json"
     footer_dir = Path(footer_dir) if footer_dir else base
     added, folded = [], []
@@ -264,8 +303,8 @@ def seed_legacy(o: Ontology, db_path: Optional[Path] = None, footer_dir: Optiona
             m = re.search(rf"`{re.escape(name)}` \(\d+%\): (.+?)(?=\n- `|\n\n)", text, re.S)
             how = " ".join(m.group(1).split())[:400] if m else name.replace("_", " ")
             o.add(Technique(id=re.sub(r"[^A-Za-z0-9_.+-]", "_", name)[:64], mechanism=how[:300],
-                            level=scope_level(scope) if scope_level(scope) != TARGET else FAMILY,
-                            scope=("vector_cpu" if scope.startswith("family:vector_cpu") else "simt_gpu"),
+                            level=NODE, scope=(scope_of(scope) if scope_level(scope) == NODE
+                                               else o.registry.node_for_backend(scope_of(scope) + ":x")),
                             slot=False, source=src, realizations=[{"scope": scope, "how": how}]))
             added.append(name)
     return {"added": len(added), "folded": len(set(folded)), "added_names": added}

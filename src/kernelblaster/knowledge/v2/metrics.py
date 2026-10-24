@@ -43,6 +43,10 @@ CANONICAL = {
     "l2_hit": ("L2 hit rate", "%"),
     "reg_pressure": ("registers per thread, % of the 255 limit", "%"),
     "divergence": ("100 - branch efficiency", "%"),
+    # measured only when the profiler provides them (NCU SourceCounters / MemoryWorkloadAnalysis
+    # tables, or their rule hints); absent otherwise, so states over them stay at the parent
+    "bank_conflicts": ("excess shared-memory wavefronts from bank conflicts, % of ideal", "%"),
+    "uncoalesced": ("excess global-memory sectors from uncoalesced access, % of ideal", "%"),
 }
 #: |delta| below which a metric counts as unchanged ("flat"), per unit
 FLAT = {"%": 2.0, "frac": 0.03, "flop/B": 0.05}
@@ -164,6 +168,14 @@ class NCUAdapter(MetricAdapter):
         if s.get("waves_per_sm_heaviest") is not None:
             out["parallel_fill"] = metric(min(1.0, float(s["waves_per_sm_heaviest"])), MEASURED,
                                           "ncu:waves_per_sm (heaviest kernel)")
+        for key, dst in (("smem_bank_conflict_pct", "bank_conflicts"), ("global_excess_sector_pct", "uncoalesced")):
+            if s.get(key) is not None:
+                out[dst] = metric(s[key], MEASURED, f"ncu:{key}")
+        for r in s.get("rules") or []:            # NCU rule hints carry an estimated speedup
+            name, sp = r.get("rule") or "", r.get("est_speedup_pct")
+            dst = "bank_conflicts" if "BankConflict" in name else "uncoalesced" if "Uncoalesced" in name else None
+            if dst and sp is not None and dst not in out:
+                out[dst] = metric(float(sp), MEASURED, f"ncu rule {name} (est. speedup %)")
         if slot_us and s.get("duration_us"):
             # kernel time under the profiler vs the driver's wall time for the slot
             out["launch_frac"] = metric(max(0.0, min(1.0, 1.0 - s["duration_us"] / slot_us)), MEASURED,
