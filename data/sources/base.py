@@ -45,6 +45,11 @@ class Problem:
     1:1 backend mapping declare a single-element set; sources whose
     reference is backend-agnostic (KernelBench torch `.py`) declare
     both.
+
+    ``slots`` maps a slot id to its editable kernel source for problems
+    with several independently optimised kernels (ModelBlaster
+    partitions). Single-file problems leave it empty; :attr:`slot_artifacts`
+    then presents their ``kernel`` artifact as the one slot.
     """
 
     id: str                                # e.g. "kernelbench-cuda:level1/003_Foo"
@@ -56,6 +61,19 @@ class Problem:
     reference_code: Optional[str] = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
     backends_supported: frozenset[str] = frozenset()
+    slots: Mapping[str, Path] = field(default_factory=dict)
+
+    @property
+    def slot_artifacts(self) -> Mapping[str, Path]:
+        """Slot id -> source; a single-file problem is one ``"kernel"`` slot."""
+        if self.slots:
+            return self.slots
+        k = self.curated_artifacts.get("kernel")
+        return {"kernel": k} if k is not None else {}
+
+    @property
+    def is_multislot(self) -> bool:
+        return len(self.slots) > 0
 
     def artifact(self, role: str) -> Path:
         """Convenience accessor: ``problem.artifact("driver")`` etc.

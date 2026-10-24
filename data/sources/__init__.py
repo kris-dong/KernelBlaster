@@ -33,6 +33,7 @@ from .kernelbench_cuda_source import KernelBenchCUDASource
 from .kernelbench_opencl_source import KernelBenchOpenCLSource
 from .sol_execbench_torch_source import SOLExecBenchTorchSource
 from .sol_execbench_cuda_source import SOLExecBenchCUDASource
+from .modelblaster_source import ModelBlasterSource
 
 __all__ = [
     "Problem",
@@ -42,6 +43,7 @@ __all__ = [
     "KernelBenchOpenCLSource",
     "SOLExecBenchTorchSource",
     "SOLExecBenchCUDASource",
+    "ModelBlasterSource",
     "get_source",
     "parse_problem_numbers",
     "TIER_MARKERS",
@@ -219,6 +221,7 @@ _SOURCE_REGISTRY: dict[str, type[ProblemSource]] = {
     "kernelbench-opencl": KernelBenchOpenCLSource,
     "sol-execbench": SOLExecBenchTorchSource,
     "sol-execbench-cuda": SOLExecBenchCUDASource,
+    "modelblaster": ModelBlasterSource,
 }
 
 
