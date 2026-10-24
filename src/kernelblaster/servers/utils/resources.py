@@ -618,11 +618,15 @@ class GPUPool:
             return None, max(0.05, min(d.quarantined_until for d in cands) - now)
         return None, 0.0
 
-    def pick_host(self, group=None, avoid_hosts: Iterable = (), reserve: bool = True):
+    def pick_host(self, group=None, avoid_hosts: Iterable = (), reserve: bool = True,
+                  prefer_hosts: Iterable = ()):
         """The host to send the next run of ``group`` to: the most free healthy
         devices (minus runs already on their way there), then the least
-        recently used one (None: no device). ``reserve`` counts this run as on
-        its way until ``acquire(host=...)`` or ``unreserve``."""
+        recently used one (None: no device). ``prefer_hosts`` (e.g. the hosts
+        that already hold the problem's data) win over the others while they
+        have a device to spare; once they are all busy, a host with free
+        devices is picked as before. ``reserve`` counts this run as on its way
+        until ``acquire(host=...)`` or ``unreserve``."""
         now = self.clock()
         cands = [d for d in self._candidates(group) if d.quarantined_until <= now] or self._candidates(group)
         rest = [d for d in cands if d.host not in set(avoid_hosts)] or cands
@@ -632,7 +636,12 @@ class GPUPool:
         for d in rest:
             free, lru = score.get(d.host, (0, float("inf")))
             score[d.host] = (free + (d.key not in self._busy), min(lru, d.last_used))
-        host = max(score, key=lambda h: (score[h][0] - self._pending.get(h, 0), -score[h][1]))
+        prefer = set(prefer_hosts)
+
+        def rank(h):
+            spare = score[h][0] - self._pending.get(h, 0)
+            return (spare > 0, h in prefer, spare, -score[h][1])
+        host = max(score, key=rank)
         if reserve:
             self._pending[host] = self._pending.get(host, 0) + 1
         return host

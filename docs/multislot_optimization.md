@@ -132,7 +132,8 @@ process per run).
   only. An idle host does not block other runs on its GPU.
 - **SSH.** The host runs as `ssh host ./kbhost_<sha>` over the multiplexed connection. Its
   binary is copied once per problem and host. Shared objects (about 1 MB) are copied per
-  candidate, and at most 48 are kept per host.
+  candidate, and at most 48 are kept per host. A `data.bin` too big to link is copied once per
+  host and data sha1, and the host is started with `MB_DATA_PATH` pointing at the copy.
 - **Failures** are runtime errors of the candidate, and the next request starts a new host:
   - a crash ends the stream;
   - a hang is killed at the timeout;
@@ -185,6 +186,9 @@ bound and metrics replace the roofline state in prompts and the bandit key; outc
 `--evaluator ssh --ssh-host user@host --remote-dir DIR [--cuda-visible-devices auto|2,3]` builds
 here and runs the self-contained binary on remote GPUs (e.g. L40S with counter access);
 `--ssh-host` repeats for several hosts, and by default each host's idle GPUs are used.
+Problems whose `data.bin` is read at run time (above 1 GiB, e.g. SwinV2) are supported:
+`data.bin` is copied to `DIR/data_<sha12>/` once per host before a GPU is leased, and removed by
+`close()` unless `KERNELBLASTER_SSH_KEEP_DATA=1` (see *Load balancing* in `docs/fast_paths.md`).
 Problems run `--parallel-problems` at a time (default: the number of GPUs in the pool) over one
 shared implementation store, outcome log and claims; every timed run and NCU pass leases its
 own GPU. See *Load balancing* in `docs/fast_paths.md`.

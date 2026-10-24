@@ -22,6 +22,8 @@ import os
 import re
 import shlex
 import shutil
+import socket
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -820,8 +822,20 @@ class LocalEvaluator(Evaluator):
 class SSHEvaluator(LocalEvaluator):
     """Build here, run on remote GPU hosts over ssh (e.g. idle L40S GPUs with
     profiler-counter access). The binary is self-contained (data.bin is
-    linked in), so only the executable is copied. Problems whose data is too
-    big to link (read at start-up from a local path) are not supported.
+    linked in), so only the executable is copied.
+
+    Problems whose data is too big to link (ModelBlaster ``kb_export`` above
+    1 GiB: the driver mmaps data.bin at start-up from ``$MB_DATA_PATH``)
+    have data.bin copied once per (host, data sha1) to
+    ``<remote_dir>/data_<sha12>/data.bin``, before a GPU is leased, and the
+    runs (one process or the persistent host) get ``MB_DATA_PATH`` pointing
+    at it. Concurrent runs of the same data on a host share one transfer
+    (rsync ``--partial``, resumed by a retry; else scp) into a temporary
+    name, verified (size + sha1) and renamed into place; a valid copy left
+    by an earlier run is reused. Hosts that already hold a problem's data
+    are preferred while they have a GPU to spare; another host gets its own
+    copy when it is picked. ``close()`` removes the copies this evaluator
+    made unless ``keep_data`` (``KERNELBLASTER_SSH_KEEP_DATA=1``) is set.
 
     ``host`` is one ``user@host`` or several; ``cuda_visible_devices`` is a GPU
     spec for every host (``"auto"``/None: the host's idle GPUs, ``"all"``, or
@@ -840,7 +854,7 @@ class SSHEvaluator(LocalEvaluator):
 
     def __init__(self, host, *, arch: str, remote_dir, ssh_key: Optional[str] = None,
                  cuda_visible_devices=None, remote_path: str = "/usr/local/cuda/bin", ssh: str = "ssh",
-                 scp: str = "scp", rsync: Optional[str] = "rsync", **kw):
+                 scp: str = "scp", rsync: Optional[str] = "rsync", keep_data: Optional[bool] = None, **kw):
         super().__init__(arch, **kw)
         self.hosts = [host] if isinstance(host, str) else list(host)
         if not self.hosts:
@@ -865,6 +879,16 @@ class SSHEvaluator(LocalEvaluator):
                 pass
         self.transfer = {"rsync": 0, "scp": 0}
         self._staged: dict = {}                  # host -> OrderedDict of staged host binaries / .so names
+        # run-time data.bin (problems too big to link): one copy per (host, data sha1)
+        from ..servers.utils.resources import truthy
+        self.keep_data = truthy(os.getenv("KERNELBLASTER_SSH_KEEP_DATA")) if keep_data is None else keep_data
+        self._data_file: dict = {}               # driver path -> local data.bin or None (linked in)
+        self._data_sha: dict = {}                # (path, size, mtime) -> sha1
+        self._data_at: dict = {}                 # (host, sha) -> remote data.bin
+        self._data_made: dict = {}               # (host, sha) -> remote data.bin this evaluator copied
+        self._data_locks: dict = {}              # (host, sha) -> asyncio.Lock (one transfer at a time)
+        self._data_err: dict = {}                # (host, sha) -> (monotonic time, error) of the last failure
+        self.data_transfer = {"copies": 0, "reused": 0, "failures": 0, "bytes": 0, "seconds": 0.0}
 
     def _ssh_base(self) -> list[str]:
         mux = (["-o", "ControlMaster=auto", "-o", f"ControlPath={self._mux_dir}/%C", "-o", "ControlPersist=120"]
@@ -904,6 +928,161 @@ class SSHEvaluator(LocalEvaluator):
         if problem is None:
             return None
         return ".kb_basis_" + hashlib.sha1(str(problem.root).encode()).hexdigest()[:12]
+
+    # ---- run-time data.bin (drivers that read it from $MB_DATA_PATH)
+    TELEMETRY_STAGES = {**LocalEvaluator.TELEMETRY_STAGES, "_stage_data": "run.stage.data"}
+    DATA_TIMEOUT_S = 3600
+
+    def _local_data(self, problem) -> Optional[Path]:
+        """The problem's data.bin if its driver reads it at run time, else None (linked in)."""
+        drv = getattr(problem, "driver_path", None)
+        if drv is None:
+            return None
+        key = str(drv)
+        if key not in self._data_file:
+            reads = 'getenv("MB_DATA_PATH")' in drv.read_text()
+            data = problem.root / problem.manifest.get("data", "data.bin") if reads else None
+            self._data_file[key] = data
+        return self._data_file[key]
+
+    async def _problem_data(self, problem) -> Optional[tuple[Path, str, int]]:
+        """(local data.bin, its sha1, size) for a run-time-data problem, else None."""
+        path = self._local_data(problem)
+        if path is None:
+            return None
+        st = path.stat()
+        key = (str(path), st.st_size, st.st_mtime_ns)
+        if key not in self._data_sha:
+            def sha1():
+                h = hashlib.sha1()
+                with open(path, "rb") as f:
+                    for b in iter(lambda: f.read(1 << 24), b""):
+                        h.update(b)
+                return h.hexdigest()
+            self._data_sha[key] = await asyncio.to_thread(sha1)
+        return path, self._data_sha[key], st.st_size
+
+    def _data_hosts(self, problem) -> set:
+        """Hosts that already hold the problem's data (pick_host prefers them)."""
+        path = self._data_file.get(str(getattr(problem, "driver_path", "")))
+        if path is None:
+            return set()
+        shas = {s for (p, *_), s in self._data_sha.items() if p == str(path)}
+        return {h for (h, s) in self._data_at if s in shas}
+
+    async def _ensure_data(self, problem, host: str) -> tuple[Optional[str], Optional[str]]:
+        """-> (remote data.bin or None if the data is linked in, error text or None).
+        One transfer per (host, sha): concurrent callers wait for it; callers
+        that waited on a transfer that failed get its error (the infra retry
+        moves them on) instead of starting another one."""
+        from ..servers.utils.resources import loop_local
+
+        info = await self._problem_data(problem)
+        if info is None:
+            return None, None
+        path, sha, size = info
+        key = (host, sha)
+        if key in self._data_at:
+            return self._data_at[key], None
+        t0 = time.monotonic()
+        lock = self._data_locks[key] = loop_local(self._data_locks.get(key), asyncio.Lock)
+        async with lock:
+            if key in self._data_at:
+                return self._data_at[key], None
+            failed = self._data_err.get(key)
+            if failed is not None and failed[0] >= t0:
+                return None, failed[1]
+            remote, err = await self._stage_data(host, path, sha, size)
+            if err is not None:
+                self._data_err[key] = (time.monotonic(), err)
+                self.data_transfer["failures"] += 1
+                return None, err
+            self._data_at[key] = remote
+            return remote, None
+
+    def _forget_data(self, host: str, remote: Optional[str]) -> None:
+        """The copy on ``host`` went missing (removed under us): copy it again next time."""
+        for k, v in list(self._data_at.items()):
+            if k[0] == host and v == remote:
+                del self._data_at[k]
+
+    @staticmethod
+    def _data_tmp_name() -> str:
+        """This process's temporary name for a data.bin in flight (stable, so a retry resumes it)."""
+        return f".data.bin.part.{re.sub(r'[^A-Za-z0-9_.-]', '_', socket.gethostname())}.{os.getpid()}"
+
+    @staticmethod
+    def _data_missing(text: Optional[str], remote: Optional[str]) -> bool:
+        return bool(remote and text) and (f"MB_ERROR cannot open {remote}" in text or
+                                          f"MB_ERROR cannot map {remote}" in text)
+
+    async def _stage_data(self, host: str, path: Path, sha: str, size: int) -> tuple[Optional[str], Optional[str]]:
+        """Make ``<rdir>/data_<sha12>/data.bin`` on ``host`` hold ``path``
+        (reuse a valid copy, else copy to a temporary name, verify, rename)
+        -> (remote path, error text or None)."""
+        from .. import telemetry as tel
+
+        q = shlex.quote
+        rdir = self.remote_dirs.get(host, self.remote_dir)
+        d = f"{rdir}/data_{sha[:12]}"
+        final = f"{d}/data.bin"
+        tmp = self._data_tmp_name()
+        sz = '{ stat -c %s "$1" 2>/dev/null || wc -c < "$1"; }'
+        s1 = '{ sha1sum "$1" 2>/dev/null || shasum -a 1 "$1" 2>/dev/null || echo nosha; }'
+        same = f'{{ [ "$h" = {sha} ] || [ "$h" = nosha ]; }}'     # no sha1 tool there: size only
+        # KB_DATA_VALID: data.bin already holds this content (an earlier run's copy)
+        check = (f"mkdir -p {q(d)} && cd {q(d)} || exit 1; sz() {sz}; s1() {s1}; "
+                 f'if [ -f data.bin ] && [ "$(sz data.bin)" = {size} ]; then '
+                 f"h=$(s1 data.bin | cut -c1-40); {same} && echo KB_DATA_VALID; fi; true")
+        sp = tel.current() if tel.enabled() else None
+
+        def note(**kw):
+            if sp is not None and hasattr(sp, "set"):
+                sp.set(host=host, **kw)
+        rc, out = await self._sh(self.ssh, *self._ssh_base(), host, check, timeout=600)
+        if rc != 0:
+            return None, f"data check on {host} failed (rc {rc}): {out[-300:]}"
+        if "KB_DATA_VALID" in out:
+            self.data_transfer["reused"] += 1
+            note(reused=True, bytes=0)
+            _log().info(f"{host}: reusing {final} ({size / 2**30:.2f} GiB)")
+            return final, None
+        t0 = time.monotonic()
+        method, err = "scp", None
+        if host in self._rsync_hosts:
+            method = "rsync"
+            rc, out = await self._sh(self.rsync, "--partial", "--append-verify", "--timeout=300",
+                                     "-e", shlex.join([self.ssh, *self._ssh_base()]),
+                                     str(path), f"{host}:{d}/{tmp}", timeout=self.DATA_TIMEOUT_S)
+            if rc != 0:
+                _log().warning(f"rsync of data.bin to {host} failed ({out[-200:]!r}); using scp")
+                method = "scp"
+        if method == "scp":
+            rc, out = await self._sh(self.scp, "-q", *self._ssh_base(), str(path), f"{host}:{d}/{tmp}",
+                                     timeout=self.DATA_TIMEOUT_S)
+            if rc != 0:
+                err = f"copying data.bin to {host} failed: {out[-300:]}"
+        if err is None:
+            verify = (f"cd {q(d)} || exit 1; sz() {sz}; s1() {s1}; n=$(sz {q(tmp)}); h=$(s1 {q(tmp)} | cut -c1-40); "
+                      f'if [ "$n" = {size} ] && {same}; then mv -f {q(tmp)} data.bin && echo KB_DATA_OK; '
+                      f"else rm -f {q(tmp)}; echo KB_DATA_BAD $n $h; fi")
+            rc, out = await self._sh(self.ssh, *self._ssh_base(), host, verify, timeout=600)
+            if rc != 0 or "KB_DATA_OK" not in out:
+                err = f"data.bin on {host} did not verify (rc {rc}): {out[-300:]}"
+        secs = time.monotonic() - t0
+        if err is not None:
+            note(reused=False, method=method, ok=False)
+            return None, err
+        self._data_made[(host, sha)] = final
+        self.data_transfer["copies"] += 1
+        self.data_transfer["bytes"] += size
+        self.data_transfer["seconds"] = round(self.data_transfer["seconds"] + secs, 3)
+        self.transfer[method] += 1
+        note(reused=False, method=method, bytes=size, seconds=round(secs, 3),
+             mb_per_s=round(size / 2**20 / secs, 1) if secs > 0 else None)
+        tel.count("ssh_data_bytes", size)
+        _log().info(f"{host}: copied data.bin ({size / 2**30:.2f} GiB) by {method} in {secs:.1f} s")
+        return final, None
 
     async def _send(self, exe: Path, host: str, rdir: str, name: str, basis: Optional[str]) -> Optional[str]:
         """Copy exe to host:rdir/name; None, or the error text."""
@@ -961,33 +1140,47 @@ class SSHEvaluator(LocalEvaluator):
 
     async def _run(self, exe, env=None, prefix="", device=None, problem=None):
         host = device.host if device is not None and device.host else self.host
+        data, err = await self._ensure_data(problem, host) if problem is not None else (None, None)
+        if err is not None:
+            return f"MB_ERROR [infra] copy of data.bin to {host} failed: {err[-300:]}\nfailed\n"
         name, basis, err = await self._stage(exe, host, problem)
         if err is not None:
             return f"MB_ERROR [infra] copy to {host} failed: {err[-300:]}\nfailed\n"
-        return await self._exec_staged(host, name, basis, env, prefix, device)
+        return await self._exec_staged(host, name, basis, {**(env or {}), **({"MB_DATA_PATH": data} if data else {})},
+                                       prefix, device)
 
     async def _timed_run(self, problem, exe: Path, env: Optional[dict] = None, prefix: str = "") -> Optional[str]:
-        """Copy the binary to the host with the most free GPUs *before* leasing
-        one there, so a GPU is never held while a binary is in flight; an
-        infrastructure failure moves on to another host."""
+        """Copy the binary (and a run-time data.bin, once per host) to the host
+        with the most free GPUs *before* leasing one there, so a GPU is never
+        held while a file is in flight; an infrastructure failure moves on to
+        another host."""
         from ..servers.utils.resources import is_infra_failure
 
         pool = await self.pool()
         group = str(problem.root)
         bad_hosts: set = set()
         text = None
+        await self._problem_data(problem)                 # the sha, so pick_host can prefer the data's hosts
         for attempt in range(self.infra_retries + 1):
-            host = pool.pick_host(group, avoid_hosts=bad_hosts) or self.host
-            name, basis, err = await self._stage(exe, host, problem)
+            host = pool.pick_host(group, avoid_hosts=bad_hosts, prefer_hosts=self._data_hosts(problem)) or self.host
+            data, err = await self._ensure_data(problem, host)
+            what = "data.bin"
+            if err is None:
+                what = "the binary"
+                name, basis, err = await self._stage(exe, host, problem)
             if err is not None:
-                text = f"MB_ERROR [infra] copy to {host} failed: {err[-300:]}\nfailed\n"
+                text = f"MB_ERROR [infra] copy of {what} to {host} failed: {err[-300:]}\nfailed\n"
                 pool.unreserve(host)
                 pool.host_failure(host)
             else:
+                run_env = {**(env or {}), **({"MB_DATA_PATH": data} if data else {})}
                 async with pool.lease(group, host=host) as lease:
-                    text = await self._exec_staged(host, name, basis, env, prefix, device=lease.device)
-                    lease.infra_error = text is not None and is_infra_failure(text) and \
-                        not re.search(r"^passed$", text, re.M)
+                    text = await self._exec_staged(host, name, basis, run_env, prefix, device=lease.device)
+                    missing = self._data_missing(text, data)
+                    lease.infra_error = missing or (text is not None and is_infra_failure(text) and
+                                                    not re.search(r"^passed$", text, re.M))
+                if missing:
+                    self._forget_data(host, data)
                 if not lease.infra_error:
                     return text
             _log().warning(f"{problem.name}: infrastructure failure on {host} (attempt {attempt + 1}): "
@@ -996,24 +1189,34 @@ class SSHEvaluator(LocalEvaluator):
         return text
 
     async def close(self):
-        """Stop the persistent hosts; remove the rsync basis binaries and the
-        staged host binaries / shared objects from every host."""
+        """Stop the persistent hosts; remove the rsync basis binaries, the
+        staged host binaries / shared objects, and (unless ``keep_data``) the
+        data.bin copies this evaluator made from every host."""
         await self._hosts.close()
-        for h in sorted(self._rsync_hosts | set(self._staged)):
-            await self._sh(self.ssh, *self._ssh_base(), h,
-                           f"cd {shlex.quote(self.remote_dirs[h])} && rm -f .kb_basis_* kbhost_* kbso_*.so", timeout=60)
+        q = shlex.quote
+        data: dict = {}
+        if not self.keep_data:
+            for (h, _), f in self._data_made.items():
+                data.setdefault(h, []).append(f)
+        tmp = self._data_tmp_name()
+        for h in sorted(self._rsync_hosts | set(self._staged) | {h for h, _ in self._data_at} |
+                        {h for h, _ in self._data_err}):
+            rm = [f"cd {q(self.remote_dirs[h])} && rm -f .kb_basis_* kbhost_* kbso_*.so",
+                  f"rm -f data_*/{q(tmp)}"]
+            for f in data.get(h, []):          # the directory only goes if nothing else is in it
+                d = f.rsplit("/", 1)[0]
+                rm.append(f"rm -f {q(f)}; rmdir {q(d)} 2>/dev/null")
+            await self._sh(self.ssh, *self._ssh_base(), h, "; ".join(rm) + "; true", timeout=60)
         self._staged.clear()
+        if not self.keep_data:
+            for k in self._data_made:
+                self._data_at.pop(k, None)
+            self._data_made.clear()
 
     # ---- the persistent host on a remote GPU: `ssh host ./kbhost_<sha>` over the
     # multiplexed connection; the host binary is copied once per problem and
     # host, each candidate's shared object (~1 MB) per request
     STAGED_SO_LIMIT = 48
-
-    def _use_host(self, problem) -> bool:
-        drv = getattr(problem, "driver_path", None)
-        if drv is None or "MB_DATA_PATH" in drv.read_text():
-            return False                             # not self-contained: the process path reports it
-        return super()._use_host(problem)
 
     async def _stage_file(self, host: str, path: Path, name: str, keep: set) -> Optional[str]:
         """Copy ``path`` to host:rdir/name once (content-named); evict old shared objects."""
@@ -1045,15 +1248,20 @@ class SSHEvaluator(LocalEvaluator):
         hname = f"kbhost_{exe.stem[:16]}"
         names = {so: f"kbso_{so.stem[:16]}.so", **({ref: f"kbso_{ref.stem[:16]}.so"} if ref else {})}
         rep = None
+        await self._problem_data(problem)
         for attempt in range(self.infra_retries + 1):
-            host = pool.pick_host(group, avoid_hosts=bad_hosts) or self.host
+            host = pool.pick_host(group, avoid_hosts=bad_hosts, prefer_hosts=self._data_hosts(problem)) or self.host
             rdir = self.remote_dirs.get(host, self.remote_dir)
-            err = await self._stage_file(host, exe, hname, set())
+            data, err = await self._ensure_data(problem, host)
+            what = "data.bin" if err is not None else "the host binary / shared objects"
+            if err is None:
+                err = await self._stage_file(host, exe, hname, set())
             for path, name in names.items():
                 if err is None:
                     err = await self._stage_file(host, path, name, set(names.values()))
             if err is not None:
-                rep = HostReply(f"MB_ERROR [infra] copy to {host} failed: {err[-300:]}\nfailed\n", "done", rc=1)
+                rep = HostReply(f"MB_ERROR [infra] copy of {what} to {host} failed: {err[-300:]}\nfailed\n",
+                                "done", rc=1)
                 pool.unreserve(host)
                 pool.host_failure(host)
                 bad_hosts.add(host)
@@ -1061,7 +1269,9 @@ class SSHEvaluator(LocalEvaluator):
             async with pool.lease(group, host=host) as lease:
                 dev = lease.device
                 key = (group, dev.key, hname)
-                envs = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in dev.env().items())
+                # the host maps data.bin once at start-up: MB_DATA_PATH is the process's
+                envs = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in
+                                {**dev.env(), **({"MB_DATA_PATH": data} if data else {})}.items())
                 remote = (f"cd {shlex.quote(rdir)} && export PATH={shlex.quote(self.remote_path)}:$PATH && "
                           f"exec env {envs} ./{hname}")
                 h = await self._hosts.get(key, dev.key, lambda: HostClient(
@@ -1074,7 +1284,11 @@ class SSHEvaluator(LocalEvaluator):
                 # ssh itself failing (rc 255 before the host printed anything) is the link, not the candidate
                 link_down = rep.status in ("crash", "start_failed") and rep.rc == 255 and \
                     not re.search(r"^MB_", rep.text, re.M)
-                lease.infra_error = link_down or (is_infra_failure(rep.text) and not re.search(r"^passed$", rep.text, re.M))
+                missing = self._data_missing(rep.text, data)       # the copy was removed under us
+                lease.infra_error = link_down or missing or \
+                    (is_infra_failure(rep.text) and not re.search(r"^passed$", rep.text, re.M))
+            if missing:
+                self._forget_data(host, data)
             if not lease.infra_error:
                 return rep
             await self._hosts.drop(key)
@@ -1083,11 +1297,8 @@ class SSHEvaluator(LocalEvaluator):
                            f"{rep.text[-300:]!r}")
         return rep
 
-    async def _build(self, problem, sources, work):
-        if "MB_DATA_PATH" in problem.driver_path.read_text():
-            return EvalResult(ok=False, stage="compile", errors=[
-                "data.bin is read at run time (too big to link); SSHEvaluator needs a self-contained binary"])
-        return await super()._build(problem, sources, work)
+    def host_stats(self) -> dict:
+        return {**super().host_stats(), "transfer": dict(self.transfer), "data": dict(self.data_transfer)}
 
 
 class ServerEvaluator(Evaluator):
