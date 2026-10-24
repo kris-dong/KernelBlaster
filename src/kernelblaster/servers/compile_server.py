@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import shutil
 import time
 import uuid
@@ -86,6 +87,8 @@ class _CompileJob:
     artifacts_dir: Path
     board_host: Optional[str]
     debug: bool
+    # CUDA multi-TU build (``/compile_units``): kernel TUs besides main_file
+    units: Optional[list[str]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -102,18 +105,21 @@ async def _dispatch_compile_job(
     strategy = get_compile_strategy(job.backend)
     extras: dict[str, Optional[str]] = {}
     try:
-        extra_path = await strategy.compile(
-            worker_id=worker_id,
-            job_name=job.job_name,
-            main_file=job.main_file,
-            source_file=job.source_file,
-            backend_version=job.backend_version,
-            backend_flag=job.backend_flag,
-            output_path=job.output_path,
-            artifacts_dir=job.artifacts_dir,
-            board_host=job.board_host,
-            debug=job.debug,
-        )
+        if job.units is not None:
+            extra_path = await _compile_units(job)
+        else:
+            extra_path = await strategy.compile(
+                worker_id=worker_id,
+                job_name=job.job_name,
+                main_file=job.main_file,
+                source_file=job.source_file,
+                backend_version=job.backend_version,
+                backend_flag=job.backend_flag,
+                output_path=job.output_path,
+                artifacts_dir=job.artifacts_dir,
+                board_host=job.board_host,
+                debug=job.debug,
+            )
     except (CompilationError, OpenCLCompilationError) as e:
         return UnifiedCompilationResult(
             backend=job.backend,
@@ -147,6 +153,25 @@ async def _dispatch_compile_job(
         output_path=str(job.output_path),
         extras=extras,
     )
+
+
+async def _compile_units(job: _CompileJob) -> None:
+    """``/compile_units``: driver + several kernel TUs, cached per object
+    (see :meth:`cuda_fast.FastCudaBuilder.build_units`)."""
+    from . import compile as _compile_mod
+    from . import cuda_fast
+
+    builder = cuda_fast.get_builder(_compile_mod.ENV_DIR, _compile_mod.ENV_VARS)
+    timeout = int(os.getenv("KERNELBLASTER_COMPILE_TIMEOUT_S", "360"))
+    exe = job.output_path.parent / "build" / "main"
+    exe.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        await builder.build_units(job.main_file, job.units, job.backend_version, exe, timeout,
+                                  CompilationError)
+    except cuda_fast.ToolchainError as e:
+        raise CompilationError(f"multi-TU build unavailable: {e}")
+    os.replace(exe, job.output_path)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +263,43 @@ async def compile_endpoint(
     completion_future: asyncio.Future = asyncio.Future()
     await QUEUE.put((job, completion_future, time.time()))
 
+    try:
+        await completion_future
+        return completion_future.result()
+    except asyncio.CancelledError:
+        raise HTTPException(status_code=500, detail="Request was cancelled")
+
+
+class UnitsCompileRequest(BaseModel):
+    job_name: str
+    main_file: str
+    units: list[str]
+    backend_version: str
+
+
+@APP.post("/compile_units", response_model=UnifiedCompilationResult)
+async def compile_units_endpoint(req: UnitsCompileRequest):
+    """CUDA only: compile ``main_file`` and each of ``units`` as separate TUs
+    (objects cached by content) and link them. Used by the multi-slot
+    evaluator so a candidate recompiles only the slot it changed."""
+    assert _ARTIFACTS_DIR is not None, "artifacts_dir not initialised"
+    output_path = _ARTIFACTS_DIR / str(uuid.uuid4()) / "out" / f"tmp{uuid.uuid4().hex}"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    job = _CompileJob(
+        backend="cuda",
+        job_name=req.job_name,
+        main_file=req.main_file,
+        source_file=",".join(req.units),
+        backend_version=req.backend_version,
+        backend_flag=False,
+        output_path=output_path,
+        artifacts_dir=_ARTIFACTS_DIR,
+        board_host=_BOARD_HOST,
+        debug=False,
+        units=list(req.units),
+    )
+    completion_future: asyncio.Future = asyncio.Future()
+    await QUEUE.put((job, completion_future, time.time()))
     try:
         await completion_future
         return completion_future.result()
