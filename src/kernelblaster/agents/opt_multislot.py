@@ -390,6 +390,7 @@ class MultiSlotAgent:
         self.stall_decay = stall_decay
         self.steps_log: list[StepLog] = []
         self.llm_calls = 0
+        self.llm_usage = {"prompt_tokens": 0, "completion_tokens": 0, "cost_usd": 0.0}
         self._lock = asyncio.Lock()
 
     # ---- helpers
@@ -446,6 +447,12 @@ class MultiSlotAgent:
     async def _llm(self, messages, model) -> str:
         self.llm_calls += 1
         resp = await generate_code_retry(messages, model, self.log, n_tasks=1)
+        u = getattr(resp, "usage", None) or {}
+        if not isinstance(u, dict):
+            u = {k: getattr(u, k, 0) for k in ("prompt_tokens", "completion_tokens")}
+        for k in ("prompt_tokens", "completion_tokens"):
+            self.llm_usage[k] += int(u.get(k) or 0)
+        self.llm_usage["cost_usd"] += float(u.get("cost_usd") or 0.0)   # providers that report it
         return resp.generations[0] if resp.generations else ""
 
     def _record_outcome(self, **kw) -> Optional[OutcomeRecord]:
@@ -665,6 +672,7 @@ class MultiSlotAgent:
         res = {
             "problem": self.p.name, "problem_dir": str(self.p.root), "run_id": self.run_id,
             "arch": f"sm_{self.arch}", "model": self.model, "llm_calls": self.llm_calls,
+            "llm_usage": {**self.llm_usage, "cost_usd": round(self.llm_usage["cost_usd"], 4)},
             "baseline_partition_us": base.partition_us, "final_ok": final.ok,
             "final_partition_us": final.partition_us,
             "speedup": (base.partition_us / final.partition_us) if final.ok and final.partition_us else None,

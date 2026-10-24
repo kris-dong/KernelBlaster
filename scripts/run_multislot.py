@@ -116,13 +116,18 @@ async def _run(args) -> int:
                 continue
             res["seconds"] = round(time.time() - t0, 1)
             summary.append({k: res[k] for k in ("problem", "baseline_partition_us", "final_partition_us",
-                                                 "speedup", "final_ok", "llm_calls", "seconds")})
+                                                 "speedup", "final_ok", "llm_calls", "llm_usage", "seconds")})
             logger.info(f"{p.name}: {res['baseline_partition_us']:.1f} -> {res['final_partition_us']} us "
                         f"(speedup {res['speedup']}) in {res['seconds']}s, {res['llm_calls']} LLM calls")
     finally:
         for pr in procs:
             pr.terminate()
+    refl = dict(updater.total_usage) if updater is not None else {}
+    if refl:
+        summary.append({"reflection_usage": refl})
     (out / "summary.json").write_text(json.dumps(summary, indent=1))
+    tot = sum((s.get("llm_usage") or {}).get("cost_usd", 0.0) for s in summary) + float(refl.get("cost_usd", 0.0))
+    logger.info(f"LLM cost reported by providers (agent + reflection): ${tot:.4f}")
     if args.export_winners:
         p = store.export_winners(Path(args.export_winners), arch=f"sm_{args.arch}")
         logger.info(f"winners -> {p}")
