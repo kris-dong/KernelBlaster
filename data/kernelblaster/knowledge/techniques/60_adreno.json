@@ -1,0 +1,163 @@
+{
+ "_doc": "Curated technique seeds (knowledge_architecture.md section 5), one file per area. Fields: id, level + scope (a scope node or universal), aliases (v1 / technique-DB / footer names folded in), mechanism, preconditions (predicate DSL), predicts (canonical metric -> up|down|flat|up_or_flat|down_or_flat), risks (pitfalls), states / op_classes / op_kinds gates (empty = any), slot (offered by the multi-slot agent), prior {mean, n}: a seed prior with a low pseudo-count that evidence overrides, realizations by scope (target:<key> | target:<backend>:sm_NN+ | target:<backend> | node:<id> | universal). Loaded by Ontology.seed(); scripts/seed_knowledge.py builds a knowledge.db from these files.",
+ "techniques": [
+  {
+   "id": "image2d_texture_reads",
+   "level": "node",
+   "scope": "adreno",
+   "aliases": [
+    "image_vs_buffer",
+    "texture_path"
+   ],
+   "mechanism": "read-heavy 2D operands through image2d_t: the texture path has its own L1 and handles 2D locality and boundary clamping",
+   "predicts": {
+    "l1_hit": "up",
+    "bw_util": "up_or_flat"
+   },
+   "risks": [
+    "image formats (CL_RGBA, CL_FLOAT / CL_HALF_FLOAT) pack 4 channels per texel; width limits (16384)",
+    "the driver must create the image; slots that only get buffers can use cl_khr_image2d_from_buffer"
+   ],
+   "states": [],
+   "op_classes": [
+    "conv",
+    "gemm",
+    "elementwise"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.06,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:opencl",
+     "how": "Weights / activations as image2d_t (RGBA: 4 channels per texel) read with read_imagef(img, sampler, (int2)(x, y)); outputs stay buffers."
+    }
+   ]
+  },
+  {
+   "id": "register_tiling_over_local_memory",
+   "level": "node",
+   "scope": "adreno",
+   "aliases": [
+    "adreno_local_memory_cost"
+   ],
+   "mechanism": "on Adreno __local is not much faster than the L1/texture path and costs barriers: block in registers first and use local memory only for real cross-work-item reuse",
+   "predicts": {
+    "compute_util": "up",
+    "reg_pressure": "up"
+   },
+   "risks": [
+    "register pressure lowers the kernel's max work-group size"
+   ],
+   "states": [],
+   "op_classes": [
+    "gemm",
+    "conv"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.06,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:opencl",
+     "how": "Each work-item computes a 4x4 (float4 x 4) output block from vload4 rows read directly from global / image memory; add __local tiling only if profiling shows repeated global reads."
+    }
+   ]
+  },
+  {
+   "id": "adreno_subgroup_size",
+   "level": "node",
+   "scope": "adreno",
+   "aliases": [
+    "qcom_reqd_sub_group_size"
+   ],
+   "mechanism": "pin the subgroup to a full (or half) 64-wide wave so subgroup reductions and broadcasts map to one wave",
+   "predicts": {
+    "compute_util": "up_or_flat"
+   },
+   "risks": [],
+   "states": [],
+   "op_classes": [
+    "reduction",
+    "attention"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.02,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:opencl",
+     "how": "__attribute__((qcom_reqd_sub_group_size(\"full\"))) with cl_qcom_reqd_sub_group_size, then sub_group_reduce_* / sub_group_broadcast."
+    }
+   ]
+  },
+  {
+   "id": "adreno_half_compute",
+   "level": "node",
+   "scope": "adreno",
+   "aliases": [
+    "half_precision_adreno"
+   ],
+   "mechanism": "Adreno ALUs run half at twice the float rate: elementwise and activation math in half / half4 where the tolerance allows",
+   "predicts": {
+    "compute_util": "down"
+   },
+   "risks": [
+    "fp32 problems: half intermediate rounding (~1e-3) can exceed the bound; accumulate reductions in float"
+   ],
+   "states": [],
+   "op_classes": [
+    "elementwise",
+    "conv",
+    "gemm"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.03,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:opencl",
+     "how": "#pragma OPENCL EXTENSION cl_khr_fp16 : enable; vload_half4 / convert_half4 for the math, float accumulators for sums."
+    }
+   ]
+  },
+  {
+   "id": "mad_fma_usage",
+   "level": "node",
+   "scope": "simt_gpu",
+   "aliases": [
+    "fma_contraction"
+   ],
+   "mechanism": "fused multiply-add instructions instead of separate multiply and add",
+   "predicts": {
+    "compute_util": "down_or_flat"
+   },
+   "risks": [],
+   "states": [],
+   "op_classes": [],
+   "slot": true,
+   "prior": {
+    "mean": 0.01,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:opencl",
+     "how": "mad() / fma() (or -cl-mad-enable) in inner products."
+    },
+    {
+     "scope": "target:cuda",
+     "how": "fmaf / __fmaf_rn in inner products (nvcc contracts by default unless --fmad=false)."
+    }
+   ]
+  }
+ ]
+}
