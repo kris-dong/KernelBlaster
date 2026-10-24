@@ -297,21 +297,26 @@ def apply_edit(e: dict, claims: ClaimStore, *, source: str = "reflect") -> dict:
 
 def parse_json_response(text: str) -> Any:
     """Pull one JSON value out of a model response (tolerates fences / prose)."""
-    t = (text or "").strip()
-    m = re.search(r"```(?:json)?\s*(.*?)```", t, re.S)
+    full = (text or "").strip()
+    cands = [full]
+    # a fenced block -- but only a ```json / bare fence at a line start: claim texts may
+    # themselves mention ```cuda blocks, which a lazy fence regex would cut into
+    m = re.search(r"^```(?:json)?[ \t]*\n(.*?)^```", full, re.S | re.M)
     if m:
-        t = m.group(1).strip()
-    try:
-        return json.loads(t)
-    except json.JSONDecodeError:
-        pass
-    for open_, close in (("{", "}"), ("[", "]")):
-        i, j = t.find(open_), t.rfind(close)
-        if i != -1 and j > i:
-            try:
-                return json.loads(t[i:j + 1])
-            except json.JSONDecodeError:
-                continue
+        cands.append(m.group(1).strip())
+    for t in cands:
+        try:
+            return json.loads(t)
+        except json.JSONDecodeError:
+            pass
+    for t in cands:
+        for open_, close in (("{", "}"), ("[", "]")):
+            i, j = t.find(open_), t.rfind(close)
+            if i != -1 and j > i:
+                try:
+                    return json.loads(t[i:j + 1])
+                except json.JSONDecodeError:
+                    continue
     raise ValueError("no JSON object in response")
 
 
