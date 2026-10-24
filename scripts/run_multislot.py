@@ -44,17 +44,41 @@ def _start_servers(gpu_name: str, log_dir: Path):
     from kernelblaster.config import GPUType, config
     from kernelblaster.servers.management import initialize_compiler_server, initialize_gpu_server
 
+    import urllib.request
+
     gpu = GPUType(gpu_name)
     log_dir.mkdir(parents=True, exist_ok=True)
-    procs = []
-    lf = open(log_dir / "servers.log", "a")
-    if config.COMPILE_SERVER_URL is None:
-        proc, url = initialize_compiler_server(lf, None, log_dir / "compile_artifacts", None)
-        config.set_compile_server_url(url)
-        procs.append(proc)
-    p2, _ = initialize_gpu_server(lf, gpu, None)
-    procs.append(p2)
-    return gpu, [p for p in procs if p]
+    os.environ.setdefault("KERNELBLASTER_COMPILE_SERVER_NUM_WORKERS", "3")
+    cwd = os.getcwd()
+    os.chdir(ROOT)                    # servers are launched as ``python -m src.kernelblaster...``
+    try:
+        procs, urls = [], []
+        lf = open(log_dir / "servers.log", "a")
+        if config.COMPILE_SERVER_URL is None:
+            proc, url = initialize_compiler_server(lf, None, log_dir / "compile_artifacts", None)
+            config.set_compile_server_url(url)
+            procs.append(proc)
+            urls.append(url)
+        p2, url2 = initialize_gpu_server(lf, gpu, None)
+        procs.append(p2)
+        urls.append(url2)
+    finally:
+        os.chdir(cwd)
+    procs = [p for p in procs if p]
+    for url in urls:                  # wait until each answers HTTP at all
+        for _ in range(240):
+            try:
+                urllib.request.urlopen(url + "/docs", timeout=2)
+                break
+            except Exception as e:
+                if getattr(e, "code", None):
+                    break
+                time.sleep(0.5)
+        else:
+            for p in procs:           # don't leave half a server set behind
+                p.terminate()
+            raise RuntimeError(f"server at {url} did not start; see {log_dir / 'servers.log'}")
+    return gpu, procs
 
 
 async def _run(args) -> int:
