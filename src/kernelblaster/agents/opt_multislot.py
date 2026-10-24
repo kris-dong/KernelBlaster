@@ -101,13 +101,26 @@ def techniques_for(op_class: str, techniques: Optional[dict] = None) -> list[tup
 
 # ---------------------------------------------------------------- roofline
 
+# element bytes per manifest buffer dtype (fp16 problems move half the bytes)
+BUFFER_BYTES = {"f32": 4, "f16": 2, "i32": 4}
+
+
+def _nbytes(buf: dict) -> float:
+    return float(BUFFER_BYTES.get(buf.get("dtype", "f32"), 4) * buf["numel"])
+
+def primary_shape(shape: dict) -> dict:
+    """A fused op's shape is {"a": stage 0, "b": stage 1, ...}; its work is
+    the first stage's (the producer whose epilogue the others join)."""
+    return shape["a"] if isinstance(shape.get("a"), dict) else shape
+
+
 def _op_cost(problem: SlotProblem, op: dict) -> tuple[float, float]:
     """(bytes, flops) estimate for one op instance from the manifest."""
     bufs = problem.manifest["buffers"]
-    byt = 4.0 * sum(bufs[b]["numel"] for b in op["inputs"] + op["outputs"])
+    byt = sum(_nbytes(bufs[b]) for b in op["inputs"] + op["outputs"])
     slot = problem.slots[op["slot"]]
     inst = next((i for i in slot.instances if i["index"] == op["index"]), {})
-    sh = inst.get("shape", {})
+    sh = primary_shape(inst.get("shape", {}))
     out_n = sum(bufs[b]["numel"] for b in op["outputs"])
     flops = float(out_n)
     if slot.op_class == "gemm":
@@ -175,7 +188,7 @@ def propose_fusions(problem: SlotProblem, result: EvalResult, arch: str, min_gai
         sa, sb = problem.slots[ops[a]["slot"]], problem.slots[ops[b]["slot"]]
         if sb.op_class not in FUSABLE_CONSUMERS:
             continue
-        nbytes = 4 * next(x["numel"] for x in bufs if x["name"] == t)
+        nbytes = _nbytes(next(x for x in bufs if x["name"] == t))
         cands.append((per_inst[sb.id], a, b, t, sa.op, sb.op, nbytes))
     used, by_pattern = set(), {}
     for gain, a, b, t, ka, kb, nb in sorted(cands, reverse=True):
@@ -202,6 +215,70 @@ def propose_fusions(problem: SlotProblem, result: EvalResult, arch: str, min_gai
         })
     return {"format": "kb-proposal/1", "problem": problem.name, "problem_dir": str(problem.root),
             "arch": arch_label or f"sm_{arch}", "proposals": props}
+
+
+def _efficiency(problem: SlotProblem, ops: list[dict], us: float, arch: str) -> float:
+    """Achieved fraction of the binding roofline peak for a set of op instances."""
+    byt = fl = 0.0
+    for op in ops:
+        b, f = _op_cost(problem, op)
+        byt += b
+        fl += f
+    peak_f, peak_b = ARCH_PEAKS.get(arch, ARCH_PEAKS["75"])
+    t = max(us, 1e-3) * 1e-6
+    return max(byt / t / 1e9 / peak_b, fl / t / 1e9 / peak_f)
+
+
+def propose_splits(problem: SlotProblem, result: EvalResult, arch: str, min_gain_pct: float = 2.0) -> list[dict]:
+    """``kb-proposal/1`` "split" proposals: give a slot shape-specialised
+    variants when its instances fall into several shape buckets and the one
+    kernel serves them very unevenly.
+
+    Per bucket group g: measured time t_g (``op_us``) and roofline efficiency
+    e_g (achieved fraction of the binding peak). A kernel tuned for one shape
+    regime is typically efficient there and not elsewhere, so the estimated
+    gain is sum_g t_g * (1 - e_g / max e): every group brought to the best
+    group's efficiency by a kernel of its own. Needs per-op times; proposed
+    if the gain is ``min_gain_pct`` of the partition. ModelBlaster builds the
+    variant (one slot per group, each seeded with the current kernel) and
+    decides by measurement."""
+    if not result.op_us:
+        return []
+    part_us = result.partition_us or sum(result.slot_us.values()) or 1.0
+    by_slot: dict[str, list[dict]] = {}
+    for op in problem.manifest["ops"]:
+        by_slot.setdefault(op["slot"], []).append(op)
+    props = []
+    for sid, ops in by_slot.items():
+        slot = problem.slots[sid]
+        if len(ops) < 2 or "__v" in sid:
+            continue
+        groups: dict[str, list[dict]] = {}
+        for op in ops:
+            inst = next((i for i in slot.instances if i["index"] == op["index"]), {})
+            groups.setdefault(shape_bucket(slot.op_class, inst.get("shape", {})), []).append(op)
+        if len(groups) < 2:
+            continue
+        rows = []
+        for b, gops in groups.items():
+            t = sum(result.op_us.get(o["name"], 0.0) for o in gops)
+            rows.append({"bucket": b, "ops": [o["name"] for o in gops], "us": round(t, 3),
+                         "eff_pct": round(100 * _efficiency(problem, gops, t, arch), 2)})
+        best = max(r["eff_pct"] for r in rows) or 1e-9
+        gain = sum(r["us"] * (1 - r["eff_pct"] / best) for r in rows)
+        pct = 100.0 * gain / part_us
+        if pct < min_gain_pct:
+            continue
+        lo = min(rows, key=lambda r: r["eff_pct"])
+        props.append({
+            "kind": "split", "slot": sid, "op": slot.op, "groups": rows,
+            "evidence": {"est_gain_us": round(gain, 2), "est_gain_pct": round(pct, 2), "partition_us": part_us,
+                         "slot_us": result.slot_us.get(sid)},
+            "rationale": (f"`{sid}` serves {len(rows)} shape regimes with one kernel: {best:.1f}% of peak on its best "
+                          f"group but {lo['eff_pct']:.1f}% on {lo['bucket']} ({lo['us']:.0f} us); a kernel per regime "
+                          f"could save ~{pct:.1f}% of the partition."),
+        })
+    return sorted(props, key=lambda p: -p["evidence"]["est_gain_us"])
 
 
 # ---------------------------------------------------------------- bandit
@@ -255,7 +332,7 @@ class TechniqueBandit:
 
 # ---------------------------------------------------------------- prompts
 
-SYSTEM_PROMPT = """You optimise one CUDA kernel *slot* inside a larger graph partition that ModelBlaster \
+SYSTEM_PROMPT_TEMPLATE = """You optimise one CUDA kernel *slot* inside a larger graph partition that ModelBlaster \
 compiled. The partition calls this slot's entry function once per op instance listed below; other slots \
 are separate kernels you cannot change. Rewrite the slot to be faster while staying correct.
 
@@ -268,9 +345,32 @@ to/from the host, do not call cudaDeviceSynchronize, do not define main() or lau
 - The source is placed inside a C++ namespace: any helper kernels/functions are fine. #include lines \
 are hoisted out. Macros MB_THREADS (256), MB_GRID(n) and MB_TID are predefined; #undef anything you \
 #define.
-- fp32 in/out. Each op is checked alone against the reference: max error <= 1e-3 relative to the \
-largest input/output magnitude. Accumulate dot products in fp32 or better.
+{dtype_rules}
 - Return the COMPLETE slot source in a single ```cuda code block, nothing after it."""
+
+# Per storage dtype (the manifest's `dtype`); {slot_rel} is the manifest's isolated-op bound.
+DTYPE_RULES = {
+    "fp32": "- fp32 in/out. Each op is checked alone against the reference: max error <= {slot_rel} "
+            "relative to the largest input/output magnitude. Accumulate dot products in fp32 or better.",
+    "fp16": "- fp16 storage, fp32 math: every float pointer is `__half` (IEEE binary16; <cuda_fp16.h> is "
+            "included), integer pointers stay int. Widen on load (`__half2float`, or `__half22float2` on "
+            "aligned `half2` pairs), compute and accumulate in fp32, round once on store "
+            "(`__float2half_rn`); never accumulate or chain arithmetic in `__half`. Tensor cores "
+            "(`wmma` / `mma.sync` with fp16 inputs and fp32 accumulators) are allowed.\n"
+            "- Each op is checked alone against a reference that rounds the exact fp32 result to fp16 "
+            "once: max error <= {slot_rel} relative to the largest input/output magnitude (about two fp16 "
+            "ulps).",
+}
+
+
+def system_prompt(dtype: str = "fp32", tolerance: Optional[dict] = None) -> str:
+    rel = (tolerance or {}).get("slot_rel", 1e-3)
+    rel_s = f"{rel:.0e}".replace("e-0", "e-")                    # 1e-3, 2e-3
+    rules = DTYPE_RULES.get(dtype, DTYPE_RULES["fp32"]).format(slot_rel=rel_s)
+    return SYSTEM_PROMPT_TEMPLATE.format(dtype_rules=rules)
+
+
+SYSTEM_PROMPT = system_prompt("fp32")
 
 
 @dataclass(frozen=True)
@@ -284,6 +384,11 @@ class TargetProfile:
     peaks: dict
     slot_ext: str
     profiler: Any                     # module with render() / delta(): knowledge.ncu or knowledge.opencl_profile
+
+    def prompt_for(self, problem) -> str:
+        if self.name == "cuda":                       # dtype rules + the manifest's isolated bound
+            return system_prompt(problem.dtype, problem.tolerance)
+        return self.system_prompt
 
     def arch_label(self, arch: str) -> str:
         return f"sm_{arch}" if self.name == "cuda" else arch
@@ -343,7 +448,7 @@ def build_codegen_messages(*, problem: SlotProblem, sid: str, source: str, techn
         parts.append("Already tried on this slot (avoid repeating dead ends):\n" + already_tried)
     parts.append(f"## Technique to apply: {technique}\n{technique_desc}")
     parts.append(f"Current slot source:\n```{tp.fence}\n{source}\n```")
-    return [{"role": "system", "content": tp.system_prompt},
+    return [{"role": "system", "content": tp.prompt_for(problem)},
             {"role": "user", "content": "\n\n".join(p for p in parts if p)}]
 
 
@@ -352,7 +457,7 @@ def build_fix_messages(*, problem: SlotProblem, sid: str, source: str, error: st
     slot = problem.slots[sid]
     tp = target_profile(problem.target)
     known = f"Known pitfalls from earlier runs:\n{pitfalls}\n\n" if pitfalls else ""
-    return [{"role": "system", "content": tp.system_prompt},
+    return [{"role": "system", "content": tp.prompt_for(problem)},
             {"role": "user", "content":
              f"The slot `{sid}` (op `{slot.op}`, signature `{slot.signature}`) failed:\n```\n{error}\n```\n\n"
              f"Instances:\n{_fmt_instances(slot)}\n\n{known}Fix it (keep the optimisation if you can). "
@@ -515,7 +620,8 @@ class MultiSlotAgent:
             return {"seed": None, "adapt": None, "examples": []}
         s = self.p.slots[sid]
         return self.store.retrieve(target=self.p.target, arch=self.arch_label, op=s.op, op_class=s.op_class,
-                                   signature=s.signature, shapes=s.shapes(), exclude_problem=self.problem_id)
+                                   signature=s.signature, shapes=s.shapes(), exclude_problem=self.problem_id,
+                                   dtype=self.p.dtype)
 
     async def _llm(self, messages, model) -> str:
         self.llm_calls += 1
@@ -537,7 +643,7 @@ class MultiSlotAgent:
         rec = OutcomeRecord(target=self.p.target, arch=self.arch_label, problem_id=self.problem_id,
                             run_id=self.run_id, slot=sid, op_kind=s.op, op_class=s.op_class,
                             shape_bucket=shape_bucket(s.op_class, s.shapes()[0] if s.instances else {}),
-                            dtype="fp32", **kw)
+                            dtype=self.p.dtype, **kw)
         self.olog.append(rec)
         if self.claims is not None and hasattr(self.claims, "observe"):
             self.claims.observe(rec)          # "already tried" visible to parallel rollouts now
@@ -556,7 +662,7 @@ class MultiSlotAgent:
                              speedup=(baseline_us / slot_us) if baseline_us and slot_us else None,
                              seed_us=seed_us, speedup_vs_seed=(seed_us / slot_us) if seed_us and slot_us else None,
                              techniques=techniques, parent_id=parent, problem_id=self.problem_id,
-                             run_id=self.run_id, slot=sid, max_rel_err=rel_err)
+                             run_id=self.run_id, slot=sid, max_rel_err=rel_err, dtype=self.p.dtype)
         return rec.id
 
     # ---- initialise: baseline + store seeds
@@ -610,7 +716,10 @@ class MultiSlotAgent:
         if prof_before:
             state = prof_before.get("state") or state    # measured bound beats the roofline estimate
         techs = techniques_for(slot.op_class, self.tp.techniques)
-        key = f"{slot.op_class}|{state}"
+        # fp16 arms are their own keys (half2 / tensor-core techniques pay off
+        # differently); fp32 keys keep their names, and the cross-key prior
+        # still seeds an untried fp16 arm from its fp32 record
+        key = f"{slot.op_class}|{state}" + ("" if self.p.dtype == "fp32" else f"|{self.p.dtype}")
         tech = self.bandit.select(key, [t for t, _ in techs], self.rng)
         desc = dict(techs)[tech]
         r = self._retrieve(sid)
@@ -737,8 +846,10 @@ class MultiSlotAgent:
         result = self._write_result(final)
         if final.ok and self.propose:
             props = propose_fusions(self.p, final, self.arch, arch_label=self.arch_label)
+            props["proposals"] += propose_splits(self.p, final, self.arch)
             (self.out / "proposals.json").write_text(json.dumps(props, indent=1))
-            result["proposals"] = [{"pattern": x["pattern"], "pairs": len(x["pairs"]),
+            result["proposals"] = [{"kind": x["kind"], "pattern": x.get("pattern") or [x["slot"]],
+                                    "instances": len(x.get("pairs") or x.get("groups")),
                                     "est_gain_pct": x["evidence"]["est_gain_pct"]} for x in props["proposals"]]
             (self.out / "result.json").write_text(json.dumps(result, indent=1))
         if self.semantic is not None:
