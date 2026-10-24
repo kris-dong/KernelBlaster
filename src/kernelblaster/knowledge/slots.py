@@ -185,6 +185,8 @@ class EvalResult:
     outputs: dict = field(default_factory=dict)
     errors: list = field(default_factory=list)
     log: str = ""
+    kernel_us: dict = field(default_factory=dict)      # "slot/kernel" -> us (OpenCL driver MB_KERNEL_US)
+    device: Optional[str] = None                       # OpenCL driver MB_DEVICE
 
     def failing_slots(self) -> list[str]:
         return [s for s, c in self.slot_checks.items() if not c.get("ok")]
@@ -218,6 +220,11 @@ def parse_driver_output(text: str) -> EvalResult:
     m = re.search(r"^MB_PARTITION_US (\S+)", text, re.M)
     if m:
         r.partition_us = float(m.group(1))
+    for m in re.finditer(r"^MB_KERNEL_US (\S+) (\S+) (\S+)", text, re.M):
+        r.kernel_us[f"{m.group(1)}/{m.group(2)}"] = float(m.group(3))
+    m = re.search(r"^MB_DEVICE (.*)$", text, re.M)
+    if m:
+        r.device = m.group(1).strip()
     if r.errors and not passed:
         r.stage = "run"
     return r
@@ -536,3 +543,263 @@ def find_problems(root: Path) -> list[Path]:
     if (root / "manifest.json").exists():
         return [root]
     return sorted(p.parent for p in root.rglob("manifest.json"))
+
+
+# ---------------------------------------------------------------- OpenCL (Qualcomm Adreno) evaluators
+#
+# An OpenCL problem (manifest target "opencl", ModelBlaster kb_export_opencl) is
+# C++11 on ModelBlaster's OpenCL runtime: the kernels TU (head + slots + tail)
+# and driver.cpp build with ``g++ -std=c++11 ... -lOpenCL`` on the machine that
+# has the GPU -- the Adreno board itself (KernelBlaster's Adreno flow compiles
+# on the RB5) or a host with any OpenCL 2.0 GPU with coarse-grained SVM. The
+# driver reads data.bin at start-up (argv[1]). Concatenated, kernels TU and
+# driver are one self-contained main.cpp (``opencl_main``).
+
+OPENCL_CXXFLAGS = "-O2 -std=c++11 -w"
+OPENCL_LDFLAGS = "-lOpenCL -lm"
+# slots launch through mb_launch / mb_copy / mb_zero: the driver times every
+# command they enqueue; a direct enqueue would run untimed (and unchecked order)
+_CL_FORBIDDEN = re.compile(r"\b(clEnqueue\w+|clFinish|clFlush|clCreateCommandQueue\w*|clWaitForEvents)\s*\(")
+
+
+def opencl_main(problem: SlotProblem, sources: Mapping[str, str]) -> str:
+    """kernels TU + driver as one translation unit."""
+    return problem.assemble(sources) + "\n#define MB_SINGLE_TU 1\n" + problem.driver_path.read_text()
+
+
+def opencl_source_errors(problem: SlotProblem, sources: Mapping[str, str]) -> Optional[EvalResult]:
+    bad = [f"slot {sid} calls {m.group(1)}() directly; enqueue only through mb_launch / mb_copy / mb_zero"
+           for sid in problem.order for m in [_CL_FORBIDDEN.search(sources[sid])] if m]
+    return EvalResult(ok=False, stage="compile", errors=bad) if bad else None
+
+
+def _instances(problem: SlotProblem) -> dict:
+    return {sid: len(s.instances) for sid, s in problem.slots.items()}
+
+
+def _opencl_profile_result(problem: SlotProblem, text: Optional[str]):
+    from .opencl_profile import profile_by_slot
+
+    if text is None:
+        return {}, "OpenCL profile run timed out"
+    if "MB_PROFILE_DONE" not in text:
+        return {}, "OpenCL profile run failed: " + "; ".join(re.findall(r"^MB_ERROR (.*)$", text, re.M))[:300]
+    by = profile_by_slot(text, _instances(problem))
+    return (by, None) if by else ({}, "profile run reported no kernels")
+
+
+class OpenCLLocalEvaluator(LocalEvaluator):
+    """g++ + this host's OpenCL GPU (functional stand-in for the board: any
+    OpenCL 2.0 device with coarse-grained SVM; its times are not Adreno's)."""
+
+    def __init__(self, work_root: Optional[Path] = None, cxx: str = "g++", max_parallel: int = 2,
+                 timeout_s: int = 900, keep: bool = False, env: Optional[dict] = None):
+        super().__init__("opencl", work_root=work_root, max_parallel=max_parallel, timeout_s=timeout_s, keep=keep)
+        self.cxx, self.env = cxx, dict(env or {})
+
+    async def _build(self, problem, sources, work):
+        bad = opencl_source_errors(problem, sources)
+        if bad is not None:
+            return bad
+        (work / "kernels.cpp").write_text(problem.assemble(sources))
+        async with self._sem:
+            proc = await asyncio.create_subprocess_exec(
+                self.cxx, *OPENCL_CXXFLAGS.split(), "-o", str(work / "problem"), str(work / "kernels.cpp"),
+                str(problem.driver_path), *OPENCL_LDFLAGS.split(),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            out, _ = await asyncio.wait_for(proc.communicate(), self.timeout_s)
+        if proc.returncode != 0:
+            return EvalResult(ok=False, stage="compile", errors=[_compile_errors(out.decode())],
+                              log=out.decode()[-4000:])
+        return None
+
+    async def _exec(self, problem, sources, tag, env):
+        work = self._workdir(problem, tag)
+        try:
+            bad = await self._build(problem, sources, work)
+            if bad is not None:
+                return bad, None
+            data = problem.root / problem.manifest["data"]
+            async with self._gpu:
+                text = await self._run(work / "problem", {**self.env, **env, "MB_DATA_PATH": str(data)})
+            return None, text
+        finally:
+            if not self.keep:
+                shutil.rmtree(work, ignore_errors=True)
+
+    async def evaluate(self, problem, sources, tag):
+        bad, text = await self._exec(problem, sources, tag, {})
+        if bad is not None:
+            return bad
+        if text is None:
+            return EvalResult(ok=False, stage="run", errors=[f"timeout after {self.timeout_s}s"])
+        return parse_driver_output(text)
+
+    async def profile(self, problem, sources, tag, slots=None):    # one run profiles every slot
+        bad, text = await self._exec(problem, sources, tag + "_prof", {"MB_MODE": "profile"})
+        if bad is not None:
+            return {}, "build failed: " + bad.error_text(300)
+        return _opencl_profile_result(problem, text)
+
+
+class AdrenoEvaluator(Evaluator):
+    """Build and run on the Adreno board over ssh, as KernelBlaster's Adreno flow
+    does (servers/compile_opencl.py: scp sources, compile on the board, run,
+    clean up): one main.cpp per candidate is copied into a per-candidate
+    directory, compiled with the board's g++ against its libOpenCL, run, and
+    the directory is removed. data.bin is copied once per problem into
+    ``remote_dir``; ``close()`` removes ``remote_dir``."""
+
+    def __init__(self, host: Optional[str] = None, *, remote_dir: str = "/tmp/kernelblaster_multislot",
+                 ssh_key: Optional[str] = None, cxx: str = "g++", timeout_s: int = 1800,
+                 work_root: Optional[Path] = None, keep: bool = False):
+        from ..backends.opencl import default_board_host
+
+        self.host = host or default_board_host()
+        self.remote_dir, self.key, self.cxx = remote_dir.rstrip("/"), ssh_key, cxx
+        self.timeout_s, self.keep = timeout_s, keep
+        self.work_root = Path(work_root) if work_root else None
+        self._board = asyncio.Lock()            # one compile+run on the board at a time
+        self._data: dict[str, str] = {}         # data_sha1 -> remote data.bin
+
+    def _opts(self) -> list[str]:
+        return ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"] + (["-i", self.key] if self.key else [])
+
+    async def _cmd(self, *argv, timeout=None, stdin: Optional[bytes] = None) -> tuple[int, str]:
+        proc = await asyncio.create_subprocess_exec(*argv, stdin=asyncio.subprocess.PIPE if stdin else None,
+                                                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(stdin), timeout or self.timeout_s)
+        except asyncio.TimeoutError:
+            proc.kill()
+            return -1, "timeout"
+        return proc.returncode, out.decode(errors="replace")
+
+    async def _ssh(self, script: str, timeout=None) -> tuple[int, str]:
+        return await self._cmd("ssh", *self._opts(), self.host, script, timeout=timeout)
+
+    async def _remote_data(self, problem: SlotProblem) -> str:
+        sha = problem.manifest.get("data_sha1") or uuid.uuid4().hex
+        if sha not in self._data:
+            d = f"{self.remote_dir}/data_{sha[:12]}"
+            rc, out = await self._ssh(f"mkdir -p {shlex.quote(d)}", timeout=60)
+            if rc == 0:
+                rc, out = await self._cmd("scp", "-q", *self._opts(), str(problem.root / problem.manifest["data"]),
+                                          f"{self.host}:{d}/data.bin", timeout=1800)
+            if rc != 0:
+                raise RuntimeError(f"copying data.bin to {self.host} failed: {out[-300:]}")
+            self._data[sha] = f"{d}/data.bin"
+        return self._data[sha]
+
+    async def _exec(self, problem, sources, tag, env: dict) -> tuple[Optional[EvalResult], Optional[str]]:
+        bad = opencl_source_errors(problem, sources)
+        if bad is not None:
+            return bad, None
+        try:
+            data = await self._remote_data(problem)
+        except RuntimeError as e:
+            return EvalResult(ok=False, stage="run", errors=[str(e)]), None
+        name = f"{re.sub(r'[^A-Za-z0-9_]+', '_', tag)}_{uuid.uuid4().hex[:6]}"
+        d = f"{self.remote_dir}/{name}"
+        local = (self.work_root or problem.root / "kb_work") / name
+        local.mkdir(parents=True, exist_ok=True)
+        (local / "main.cpp").write_text(opencl_main(problem, sources))
+        envs = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env.items())
+        script = (f"cd {shlex.quote(d)} || exit 1; "
+                  f"if {self.cxx} {OPENCL_CXXFLAGS} -o main main.cpp {OPENCL_LDFLAGS} > build.log 2>&1; then "
+                  f"env {envs} ./main {shlex.quote(data)}; else echo MB_BUILD_FAILED; tail -c 6000 build.log; fi; "
+                  f"cd / && rm -rf {shlex.quote(d)}")
+        try:
+            async with self._board:
+                rc, out = await self._ssh(f"mkdir -p {shlex.quote(d)}", timeout=60)
+                if rc == 0:
+                    rc, out = await self._cmd("scp", "-q", *self._opts(), str(local / "main.cpp"),
+                                              f"{self.host}:{d}/main.cpp", timeout=300)
+                if rc != 0:
+                    return EvalResult(ok=False, stage="run", errors=[f"ssh/scp to {self.host} failed: {out[-300:]}"]), None
+                rc, out = await self._ssh(script)
+        finally:
+            if not self.keep:
+                shutil.rmtree(local, ignore_errors=True)
+        if rc == -1:
+            await self._ssh(f"rm -rf {shlex.quote(d)}", timeout=60)
+            return None, None
+        if "MB_BUILD_FAILED" in out:
+            log = out.split("MB_BUILD_FAILED", 1)[1]
+            return EvalResult(ok=False, stage="compile", errors=[_compile_errors(log)], log=log[-4000:]), None
+        return None, out
+
+    async def evaluate(self, problem, sources, tag):
+        bad, text = await self._exec(problem, sources, tag, {})
+        if bad is not None:
+            return bad
+        if text is None:
+            return EvalResult(ok=False, stage="run", errors=[f"timeout after {self.timeout_s}s"])
+        return parse_driver_output(text)
+
+    async def profile(self, problem, sources, tag, slots=None):    # one run profiles every slot
+        bad, text = await self._exec(problem, sources, tag + "_prof", {"MB_MODE": "profile"})
+        if bad is not None:
+            return {}, "build failed: " + bad.error_text(300)
+        return _opencl_profile_result(problem, text)
+
+    async def close(self):
+        await self._ssh(f"rm -rf {shlex.quote(self.remote_dir)}", timeout=120)
+        self._data.clear()
+
+
+class OpenCLServerEvaluator(Evaluator):
+    """KernelBlaster's OpenCL compile server + Adreno exec server
+    (``compile_opencl`` / ``run_adreno_executable``): main.cpp is compiled on the
+    board (or locally without one), data.bin travels as a kernel file and the
+    driver finds it in the run directory."""
+
+    def __init__(self, gpu, work_root: Path, timeout_s: int = 1800, remote: bool = True):
+        self.gpu, self.work_root, self.timeout_s, self.remote = gpu, Path(work_root), timeout_s, remote
+
+    async def _compile(self, problem, sources, tag):
+        from ..agents.utils import FeedbackError
+        from ..agents.utils.commands import compile_opencl
+
+        bad = opencl_source_errors(problem, sources)
+        if bad is not None:
+            return None, None, bad
+        work = self.work_root / f"{re.sub(r'[^A-Za-z0-9_]+', '_', tag)}_{uuid.uuid4().hex[:6]}"
+        work.mkdir(parents=True, exist_ok=True)
+        main = work / "main.cpp"
+        main.write_text(opencl_main(problem, sources))
+        kernel = work / "kernel.cl"           # the strategy's slot for a .cl file; programs live in main.cpp
+        kernel.write_text("// OpenCL programs are embedded in main.cpp\n")
+        try:
+            exe = await compile_opencl(main, kernel, self.gpu, timeout=self.timeout_s, job_name=str(main),
+                                       remote=self.remote)
+            return main, Path(exe), None
+        except FeedbackError as e:
+            return main, None, EvalResult(ok=False, stage="compile", errors=[_compile_errors(str(e))],
+                                          log=str(e)[-4000:])
+
+    async def _exec(self, problem, sources, tag, profile_mode: bool):
+        from ..agents.utils import FeedbackError
+        from ..agents.utils.commands import run_adreno_executable
+
+        main, exe, bad = await self._compile(problem, sources, tag)
+        if bad is not None:
+            return bad, None
+        try:
+            stdout, stderr = await run_adreno_executable(
+                exe, self.gpu, self.timeout_s, job_name=str(main),
+                kernel_files=[str(problem.root / problem.manifest["data"])],
+                extra_args="data.bin" + (" profile" if profile_mode else ""))
+        except FeedbackError as e:
+            return EvalResult(ok=False, stage="run", errors=[str(e)[-2000:]], log=str(e)[-4000:]), None
+        return None, stdout + "\n" + stderr
+
+    async def evaluate(self, problem, sources, tag):
+        bad, text = await self._exec(problem, sources, tag, False)
+        return bad if bad is not None else parse_driver_output(text)
+
+    async def profile(self, problem, sources, tag, slots=None):    # one run profiles every slot
+        bad, text = await self._exec(problem, sources, tag + "_prof", True)
+        if bad is not None:
+            return {}, "build failed: " + bad.error_text(300)
+        return _opencl_profile_result(problem, text)
