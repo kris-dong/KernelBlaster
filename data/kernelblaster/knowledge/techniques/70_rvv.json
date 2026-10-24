@@ -1,0 +1,142 @@
+{
+ "_doc": "Curated technique seeds (knowledge_architecture.md section 5), one file per area. Fields: id, level + scope (a scope node or universal), aliases (v1 / technique-DB / footer names folded in), mechanism, preconditions (predicate DSL), predicts (canonical metric -> up|down|flat|up_or_flat|down_or_flat), risks (pitfalls), states / op_classes / op_kinds gates (empty = any), slot (offered by the multi-slot agent), prior {mean, n}: a seed prior with a low pseudo-count that evidence overrides, realizations by scope (target:<key> | target:<backend>:sm_NN+ | target:<backend> | node:<id> | universal). Loaded by Ontology.seed(); scripts/seed_knowledge.py builds a knowledge.db from these files.",
+ "techniques": [
+  {
+   "id": "rvv_strip_mining_lmul",
+   "level": "node",
+   "scope": "rvv",
+   "aliases": [
+    "lmul_selection",
+    "strip_mining"
+   ],
+   "mechanism": "VLEN-agnostic strip-mining with vsetvli, choosing LMUL so the loop moves VLEN*LMUL bits per instruction without spilling vector registers",
+   "predicts": {
+    "compute_util": "up",
+    "bw_util": "up_or_flat"
+   },
+   "risks": [
+    "LMUL=m8 leaves 4 register groups: spills in kernels with many live vectors"
+   ],
+   "params": {
+    "lmul": [
+     "m1",
+     "m2",
+     "m4",
+     "m8"
+    ]
+   },
+   "states": [],
+   "op_classes": [],
+   "slot": true,
+   "prior": {
+    "mean": 0.1,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "node:rvv",
+     "how": "for (; n > 0; n -= vl) { vl = __riscv_vsetvl_e32m4(n); ... } with LMUL m4/m8 for streaming loops, m1/m2 for kernels with many live vectors."
+    }
+   ]
+  },
+  {
+   "id": "rvv_segment_loads",
+   "level": "node",
+   "scope": "rvv",
+   "aliases": [
+    "vlseg",
+    "segment_access"
+   ],
+   "mechanism": "segment loads de-interleave AoS / channel-interleaved data into separate vector registers in one instruction",
+   "predicts": {
+    "bw_util": "up",
+    "uncoalesced": "down"
+   },
+   "risks": [],
+   "states": [],
+   "op_classes": [
+    "data_movement",
+    "elementwise",
+    "conv"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.05,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "node:rvv",
+     "how": "__riscv_vlseg2e32_v_f32m2x2 / vlseg3 / vlseg4 for interleaved fields (complex, RGB, NHWC channel groups); vsseg to store back."
+    }
+   ]
+  },
+  {
+   "id": "rvv_widening_accumulate",
+   "level": "node",
+   "scope": "rvv",
+   "aliases": [
+    "vfwmacc"
+   ],
+   "mechanism": "widening multiply-accumulate keeps fp16 / int8 products in wider accumulators without separate converts",
+   "preconditions": {
+    "dtype": "in",
+    "v": [
+     "fp16"
+    ]
+   },
+   "predicts": {
+    "compute_util": "down"
+   },
+   "risks": [],
+   "states": [],
+   "op_classes": [
+    "gemm",
+    "conv",
+    "reduction"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.04,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "node:rvv",
+     "how": "vfwmacc.vv (fp16 -> fp32) / vwmacc.vv (int8 -> int16) in the inner product; narrow once at the end."
+    }
+   ]
+  },
+  {
+   "id": "rvv_reduction_instructions",
+   "level": "node",
+   "scope": "rvv",
+   "aliases": [
+    "vfredosum",
+    "vector_reduction"
+   ],
+   "mechanism": "in-register vector reductions (vfredusum / vfredmax) over independent partial vectors instead of a scalar loop",
+   "predicts": {
+    "compute_util": "up"
+   },
+   "risks": [
+    "vfredusum is unordered: differs from a sequential sum in the last bits; vfredosum is ordered but slow"
+   ],
+   "states": [],
+   "op_classes": [
+    "reduction"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.08,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "node:rvv",
+     "how": "Accumulate element-wise into a vector partial (vfadd.vv) across the strip-mined loop, one vfredusum.vs at the end."
+    }
+   ]
+  }
+ ]
+}

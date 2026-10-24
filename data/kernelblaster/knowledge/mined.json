@@ -1,0 +1,9134 @@
+{
+ "_doc": "Mined from recorded runs by scripts/mine_knowledge.py (do not hand-edit). outcomes: technique outcomes (evidence for the hierarchical statistics); claims: aggregated applicability claims citing the mined record / impl ids, scoped to the lowest common ancestor of their targets.",
+ "sources": {
+  "dbs": 17,
+  "v1_logs": 7,
+  "impl_stores": 25,
+  "winners": 384,
+  "dropped_unknown_techniques": {
+   "h_a8ded1d54b": 7,
+   "inline_affine_index_instead_of_index_tensor_load": 5,
+   "h_3a2f153ead": 2,
+   "h_ac17dbe387": 2,
+   "cuda_streaming_cs_stores_for_elementwise": 1,
+   "h_445dfd64d0": 1,
+   "h_fea966f942": 1
+  }
+ },
+ "outcomes": [
+  {
+   "id": "f0fff198e456",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.90059,
+   "status": "improved"
+  },
+  {
+   "id": "8513ccd23ee9",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.90511,
+   "status": "improved"
+  },
+  {
+   "id": "7daf9154d2ae",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.93196,
+   "status": "improved"
+  },
+  {
+   "id": "cd05116957b2",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_75",
+   "op_class": "elementwise",
+   "op_kind": "relu",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_memory"
+   ],
+   "reward": 0.14613,
+   "status": "improved"
+  },
+  {
+   "id": "b90712230a9e",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_75",
+   "op_class": "elementwise",
+   "op_kind": "relu",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_memory"
+   ],
+   "reward": 0.21255,
+   "status": "improved"
+  },
+  {
+   "id": "6e6af88feaa8",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.17766,
+   "status": "improved"
+  },
+  {
+   "id": "a079f0519135",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.1243,
+   "status": "improved"
+  },
+  {
+   "id": "8647b8d57f34",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.21735,
+   "status": "improved"
+  },
+  {
+   "id": "e18292eb5b73",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_75",
+   "op_class": "elementwise",
+   "op_kind": "ewise2",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_memory"
+   ],
+   "reward": 0.26241,
+   "status": "improved"
+  },
+  {
+   "id": "834ee691e0b6",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.30455,
+   "status": "improved"
+  },
+  {
+   "id": "72eca832041e",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.18351,
+   "status": "regressed"
+  },
+  {
+   "id": "de8e4b6a550d",
+   "item": "grid_stride_vectorized",
+   "target": "cuda:sm_75",
+   "op_class": "elementwise",
+   "op_kind": "ewise2",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_memory"
+   ],
+   "reward": 0.41041,
+   "status": "improved"
+  },
+  {
+   "id": "b503eb4124c1",
+   "item": "branch_reduction",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.05,
+   "status": "compile_error"
+  },
+  {
+   "id": "8acc34877417",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.99485,
+   "status": "improved"
+  },
+  {
+   "id": "7ef0e5b9440a",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.99393,
+   "status": "improved"
+  },
+  {
+   "id": "47757c4967dc",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.99243,
+   "status": "improved"
+  },
+  {
+   "id": "3fdaad487c62",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.12779,
+   "status": "regressed"
+  },
+  {
+   "id": "f602efd81a3c",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.24762,
+   "status": "improved"
+  },
+  {
+   "id": "8d57b7b22092",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.34504,
+   "status": "improved"
+  },
+  {
+   "id": "0ee1f887fb57",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.02219,
+   "status": "improved"
+  },
+  {
+   "id": "66d5820d0d10",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.45974,
+   "status": "regressed"
+  },
+  {
+   "id": "e19f95bb6682",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.20015,
+   "status": "improved"
+  },
+  {
+   "id": "c4fd67424e28",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.43437,
+   "status": "regressed"
+  },
+  {
+   "id": "f6a30df046fd",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.06875,
+   "status": "regressed"
+  },
+  {
+   "id": "714e517a1f91",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.20456,
+   "status": "regressed"
+  },
+  {
+   "id": "daa50794e652",
+   "item": "shared_memory_tiling",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.2868,
+   "status": "regressed"
+  },
+  {
+   "id": "ea5dff3f9a2a",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_75",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_memory"
+   ],
+   "reward": 0.11332,
+   "status": "improved"
+  },
+  {
+   "id": "34181f01d563",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.32436,
+   "status": "regressed"
+  },
+  {
+   "id": "a6961007ec17",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.16228,
+   "status": "improved"
+  },
+  {
+   "id": "7362779f1570",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_75",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_memory"
+   ],
+   "reward": 0.1026,
+   "status": "improved"
+  },
+  {
+   "id": "d6de294ec513",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.1196,
+   "status": "regressed"
+  },
+  {
+   "id": "90e96cfd0cde",
+   "item": "algorithmic_changes",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.05,
+   "status": "compile_error"
+  },
+  {
+   "id": "e827870d49a8",
+   "item": "grid_stride_vectorized",
+   "target": "cuda:sm_75",
+   "op_class": "elementwise",
+   "op_kind": "ewise_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": -0.00358,
+   "status": "regressed"
+  },
+  {
+   "id": "a2e806b5f5cc",
+   "item": "register_blocking",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.04596,
+   "status": "regressed"
+  },
+  {
+   "id": "0d651da97012",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_75",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00856,
+   "status": "improved"
+  },
+  {
+   "id": "28488f6803f0",
+   "item": "implicit_gemm",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.10329,
+   "status": "regressed"
+  },
+  {
+   "id": "4c206748dd01",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_75",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": -0.00725,
+   "status": "regressed"
+  },
+  {
+   "id": "c847c1f55e6a",
+   "item": "double_buffering",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.10484,
+   "status": "regressed"
+  },
+  {
+   "id": "9642e962fd31",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_75",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00557,
+   "status": "improved"
+  },
+  {
+   "id": "cc661692b740",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.08852,
+   "status": "improved"
+  },
+  {
+   "id": "5dd0ab9aaac9",
+   "item": "single_pass_fusion",
+   "target": "cuda:sm_75",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.01382,
+   "status": "improved"
+  },
+  {
+   "id": "7ea1f2758543",
+   "item": "shared_memory_tiling",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.10689,
+   "status": "regressed"
+  },
+  {
+   "id": "acfab860c09f",
+   "item": "shared_memory_tiling",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.03425,
+   "status": "improved"
+  },
+  {
+   "id": "83179097c3ba",
+   "item": "shared_memory_tiling",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.14522,
+   "status": "regressed"
+  },
+  {
+   "id": "5b7352a2c730",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_75",
+   "op_class": "elementwise",
+   "op_kind": "relu",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00357,
+   "status": "improved"
+  },
+  {
+   "id": "971387f24f4e",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_75",
+   "op_class": "elementwise",
+   "op_kind": "ewise2",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_memory"
+   ],
+   "reward": 0.0773,
+   "status": "improved"
+  },
+  {
+   "id": "c18c4f937d81",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.0661,
+   "status": "regressed"
+  },
+  {
+   "id": "8706ae77d8e6",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.03277,
+   "status": "improved"
+  },
+  {
+   "id": "f902b7bd33f4",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_75",
+   "op_class": "elementwise",
+   "op_kind": "ewise2",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00504,
+   "status": "improved"
+  },
+  {
+   "id": "9dce64d78358",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_75",
+   "op_class": "elementwise",
+   "op_kind": "relu",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00036,
+   "status": "neutral"
+  },
+  {
+   "id": "7b90db8d17f1",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_75",
+   "op_class": "elementwise",
+   "op_kind": "relu",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": -0.00086,
+   "status": "neutral"
+  },
+  {
+   "id": "df5626ebe379",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_75",
+   "op_class": "elementwise",
+   "op_kind": "relu",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00648,
+   "status": "improved"
+  },
+  {
+   "id": "746be67a265d",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.05727,
+   "status": "improved"
+  },
+  {
+   "id": "0d2b1fc1776a",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_75",
+   "op_class": "elementwise",
+   "op_kind": "relu",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00716,
+   "status": "improved"
+  },
+  {
+   "id": "d8d81619fcbd",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.05538,
+   "status": "improved"
+  },
+  {
+   "id": "65b004c9b1ed",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute",
+    "underutilized_compute_near_idle"
+   ],
+   "reward": 0.99078,
+   "status": "improved"
+  },
+  {
+   "id": "ea44b6bcfa39",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute",
+    "underutilized_compute_near_idle"
+   ],
+   "reward": 0.9927,
+   "status": "improved"
+  },
+  {
+   "id": "edae03f9b95a",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.35377,
+   "status": "improved"
+  },
+  {
+   "id": "02755aab4f5b",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.04296,
+   "status": "improved"
+  },
+  {
+   "id": "23736edf467d",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.0429,
+   "status": "improved"
+  },
+  {
+   "id": "ea7a939253f7",
+   "item": "register_blocking",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.70096,
+   "status": "regressed"
+  },
+  {
+   "id": "6ea40c06f096",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_75",
+   "op_class": "elementwise",
+   "op_kind": "leaky_relu",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00602,
+   "status": "improved"
+  },
+  {
+   "id": "53786e8d2df0",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_75",
+   "op_class": "elementwise",
+   "op_kind": "mul_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00457,
+   "status": "improved"
+  },
+  {
+   "id": "46d8048be0c6",
+   "item": "register_blocking",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.22762,
+   "status": "improved"
+  },
+  {
+   "id": "5b148bcc924e",
+   "item": "branch_reduction",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.02047,
+   "status": "regressed"
+  },
+  {
+   "id": "4571f2d83891",
+   "item": "branch_reduction",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.28359,
+   "status": "regressed"
+  },
+  {
+   "id": "1672216509b3",
+   "item": "algorithmic_changes",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.05767,
+   "status": "improved"
+  },
+  {
+   "id": "9dfc36a06e8f",
+   "item": "algorithmic_changes",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.05,
+   "status": "compile_error"
+  },
+  {
+   "id": "28bab583c9cc",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.04061,
+   "status": "improved"
+  },
+  {
+   "id": "fe72e3e56fb5",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.01625,
+   "status": "improved"
+  },
+  {
+   "id": "52c9679d5809",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.02106,
+   "status": "improved"
+  },
+  {
+   "id": "eaedb9c63b91",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.01889,
+   "status": "improved"
+  },
+  {
+   "id": "b7104b9f9f96",
+   "item": "grid_stride_vectorized",
+   "target": "cuda:sm_75",
+   "op_class": "elementwise",
+   "op_kind": "ewise_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": -0.00362,
+   "status": "regressed"
+  },
+  {
+   "id": "0cfad0524a74",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_75",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_memory"
+   ],
+   "reward": 0.14035,
+   "status": "improved"
+  },
+  {
+   "id": "f2be7733e6c8",
+   "item": "algorithmic_changes",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.05,
+   "status": "compile_error"
+  },
+  {
+   "id": "77727f60d37f",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_75",
+   "op_class": "elementwise",
+   "op_kind": "ewise_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00807,
+   "status": "improved"
+  },
+  {
+   "id": "eb18e71c1e82",
+   "item": "algorithmic_changes",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.05,
+   "status": "compile_error"
+  },
+  {
+   "id": "ea702f0a2df3",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_75",
+   "op_class": "elementwise",
+   "op_kind": "ewise_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00492,
+   "status": "improved"
+  },
+  {
+   "id": "e3dac003e577",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.19667,
+   "status": "regressed"
+  },
+  {
+   "id": "ddbbfff60c95",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_75",
+   "op_class": "elementwise",
+   "op_kind": "ewise_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": -0.00415,
+   "status": "regressed"
+  },
+  {
+   "id": "d160435467a8",
+   "item": "branch_reduction",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.03131,
+   "status": "regressed"
+  },
+  {
+   "id": "cd996c789625",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_75",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": -0.00413,
+   "status": "regressed"
+  },
+  {
+   "id": "2631fc9111df",
+   "item": "branch_reduction",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.02474,
+   "status": "regressed"
+  },
+  {
+   "id": "2040b96cfdde",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_75",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_memory"
+   ],
+   "reward": 0.13377,
+   "status": "improved"
+  },
+  {
+   "id": "c8f3cf39d5c5",
+   "item": "register_blocking",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.06818,
+   "status": "regressed"
+  },
+  {
+   "id": "3040ead64c52",
+   "item": "register_blocking",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.19257,
+   "status": "regressed"
+  },
+  {
+   "id": "07b7f74c3128",
+   "item": "implicit_gemm",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.06269,
+   "status": "improved"
+  },
+  {
+   "id": "610e94841002",
+   "item": "implicit_gemm",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.07195,
+   "status": "improved"
+  },
+  {
+   "id": "42a1ccb09f8b",
+   "item": "double_buffering",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.07519,
+   "status": "regressed"
+  },
+  {
+   "id": "22f8dfdb25ae",
+   "item": "double_buffering",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.25228,
+   "status": "regressed"
+  },
+  {
+   "id": "5a6a76aacd4d",
+   "item": "grid_stride_vectorized",
+   "target": "cuda:sm_75",
+   "op_class": "elementwise",
+   "op_kind": "relu",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00147,
+   "status": "improved"
+  },
+  {
+   "id": "b6a8a0c79bac",
+   "item": "double_buffering",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.0932,
+   "status": "regressed"
+  },
+  {
+   "id": "544db40a07c9",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.15939,
+   "status": "regressed"
+  },
+  {
+   "id": "7a04f14c3d8f",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.03486,
+   "status": "regressed"
+  },
+  {
+   "id": "fb86346237e0",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.11832,
+   "status": "regressed"
+  },
+  {
+   "id": "13e422dc1877",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.00823,
+   "status": "neutral"
+  },
+  {
+   "id": "6ac81e53816e",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute",
+    "underutilized_compute_near_idle"
+   ],
+   "reward": 0.98201,
+   "status": "improved"
+  },
+  {
+   "id": "b7a899b37d09",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute",
+    "underutilized_compute_near_idle"
+   ],
+   "reward": 0.98154,
+   "status": "improved"
+  },
+  {
+   "id": "8e5727f448ae",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute",
+    "underutilized_compute_near_idle"
+   ],
+   "reward": 0.97633,
+   "status": "improved"
+  },
+  {
+   "id": "121a02ace205",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.23523,
+   "status": "improved"
+  },
+  {
+   "id": "9c6d60497826",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.45493,
+   "status": "improved"
+  },
+  {
+   "id": "e96bb9cf14f6",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.38108,
+   "status": "improved"
+  },
+  {
+   "id": "18a2e4cea254",
+   "item": "double_buffering",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.01173,
+   "status": "neutral"
+  },
+  {
+   "id": "5fe4e80ece43",
+   "item": "double_buffering",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.1779,
+   "status": "regressed"
+  },
+  {
+   "id": "d2ed32a25216",
+   "item": "double_buffering",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.054,
+   "status": "improved"
+  },
+  {
+   "id": "c7bb7ec06ff6",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.00543,
+   "status": "neutral"
+  },
+  {
+   "id": "fffdb043cb92",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_75",
+   "op_class": "elementwise",
+   "op_kind": "leaky_relu",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00845,
+   "status": "improved"
+  },
+  {
+   "id": "aba98cbcecd7",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.01436,
+   "status": "neutral"
+  },
+  {
+   "id": "07ab89681949",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.27163,
+   "status": "improved"
+  },
+  {
+   "id": "750f86209501",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.27598,
+   "status": "regressed"
+  },
+  {
+   "id": "9eeabb28cc21",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.49164,
+   "status": "regressed"
+  },
+  {
+   "id": "4b2d13c5d8da",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_75",
+   "op_class": "elementwise",
+   "op_kind": "ewise_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00417,
+   "status": "improved"
+  },
+  {
+   "id": "791d4cded728",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_75",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_memory"
+   ],
+   "reward": 0.28834,
+   "status": "improved"
+  },
+  {
+   "id": "d19fc692db1b",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.06151,
+   "status": "regressed"
+  },
+  {
+   "id": "b751064b5977",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_75",
+   "op_class": "elementwise",
+   "op_kind": "ewise_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": -0.00048,
+   "status": "neutral"
+  },
+  {
+   "id": "43006ba7289c",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_75",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_memory"
+   ],
+   "reward": 0.28856,
+   "status": "improved"
+  },
+  {
+   "id": "9afc517a165b",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.32655,
+   "status": "regressed"
+  },
+  {
+   "id": "4bd201e2856e",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_75",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_memory"
+   ],
+   "reward": 0.26997,
+   "status": "improved"
+  },
+  {
+   "id": "3cdc4036e033",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.03942,
+   "status": "regressed"
+  },
+  {
+   "id": "797db63c3832",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.03553,
+   "status": "regressed"
+  },
+  {
+   "id": "a88df3c6d31c",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.11937,
+   "status": "improved"
+  },
+  {
+   "id": "9ddef139316b",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_75",
+   "op_class": "elementwise",
+   "op_kind": "ewise_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00813,
+   "status": "improved"
+  },
+  {
+   "id": "f3db2a7beeee",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.04681,
+   "status": "regressed"
+  },
+  {
+   "id": "290285b5b443",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.16484,
+   "status": "improved"
+  },
+  {
+   "id": "5eb2666bc75a",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.0082,
+   "status": "neutral"
+  },
+  {
+   "id": "fb464084115a",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.48611,
+   "status": "regressed"
+  },
+  {
+   "id": "d693c5aa17b7",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.87858,
+   "status": "improved"
+  },
+  {
+   "id": "fa64e26d3fa1",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.95247,
+   "status": "improved"
+  },
+  {
+   "id": "3f25ed6b486d",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.93185,
+   "status": "improved"
+  },
+  {
+   "id": "57474dfb98cf",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.62722,
+   "status": "improved"
+  },
+  {
+   "id": "5d0216efdd6c",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.28721,
+   "status": "improved"
+  },
+  {
+   "id": "1ce76f656481",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "on_chip_memory_bound"
+   ],
+   "reward": -0.05,
+   "status": "compile_error"
+  },
+  {
+   "id": "3a683328c634",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": -0.06265,
+   "status": "regressed"
+  },
+  {
+   "id": "4bc220e031d6",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": -0.43682,
+   "status": "regressed"
+  },
+  {
+   "id": "ad7af3672b02",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise2",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound"
+   ],
+   "reward": 0.00099,
+   "status": "neutral"
+  },
+  {
+   "id": "3c4317caf002",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise2",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound"
+   ],
+   "reward": 0.05489,
+   "status": "improved"
+  },
+  {
+   "id": "90eb6d3300f5",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": -0.21758,
+   "status": "regressed"
+  },
+  {
+   "id": "9c062ced6188",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": -0.05,
+   "status": "compile_error"
+  },
+  {
+   "id": "cbe113504f9c",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "on_chip_memory_bound"
+   ],
+   "reward": 0.36335,
+   "status": "improved"
+  },
+  {
+   "id": "6aebf1878e16",
+   "item": "grid_stride_vectorized",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise2",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound"
+   ],
+   "reward": 0.08491,
+   "status": "improved"
+  },
+  {
+   "id": "5cbc9a25ee3e",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "relu",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00655,
+   "status": "improved"
+  },
+  {
+   "id": "792afb43b13a",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.97585,
+   "status": "improved"
+  },
+  {
+   "id": "66cc84fcab92",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.97556,
+   "status": "improved"
+  },
+  {
+   "id": "1741f0b2d9ef",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.97403,
+   "status": "improved"
+  },
+  {
+   "id": "87af148e8364",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": -0.02606,
+   "status": "regressed"
+  },
+  {
+   "id": "e0cbea7f4e4b",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": -0.61886,
+   "status": "regressed"
+  },
+  {
+   "id": "9459de238f43",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": 0.02332,
+   "status": "improved"
+  },
+  {
+   "id": "e2fc3715333c",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": -0.10804,
+   "status": "regressed"
+  },
+  {
+   "id": "6afc496e52d4",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": 0.17245,
+   "status": "improved"
+  },
+  {
+   "id": "03c0499d7945",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.0684,
+   "status": "improved"
+  },
+  {
+   "id": "77be074f7880",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "leaky_relu",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00383,
+   "status": "improved"
+  },
+  {
+   "id": "8c8ed81019b0",
+   "item": "bank_conflict_padding",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": -0.11985,
+   "status": "regressed"
+  },
+  {
+   "id": "f0989ab200a2",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": -0.08558,
+   "status": "regressed"
+  },
+  {
+   "id": "2463dbd45116",
+   "item": "cache_aware_rasterization",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": 0.01982,
+   "status": "improved"
+  },
+  {
+   "id": "fc4392a0def9",
+   "item": "cache_aware_rasterization",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": -0.14088,
+   "status": "regressed"
+  },
+  {
+   "id": "aa89f3d50fc3",
+   "item": "register_blocking",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": -0.13847,
+   "status": "regressed"
+  },
+  {
+   "id": "9adb949a97f2",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "reduction",
+   "op_kind": "softmax",
+   "dtype": "fp32",
+   "chain": [
+    "latency_bound",
+    "low_parallelism"
+   ],
+   "reward": 0.9425,
+   "status": "improved"
+  },
+  {
+   "id": "4704ddf3f56b",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "reduction",
+   "op_kind": "softmax",
+   "dtype": "fp32",
+   "chain": [
+    "latency_bound",
+    "low_parallelism"
+   ],
+   "reward": 0.94256,
+   "status": "improved"
+  },
+  {
+   "id": "9eb342565361",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "reduction",
+   "op_kind": "softmax",
+   "dtype": "fp32",
+   "chain": [
+    "latency_bound",
+    "low_parallelism"
+   ],
+   "reward": 0.94303,
+   "status": "improved"
+  },
+  {
+   "id": "000e10f87538",
+   "item": "double_buffering",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": -0.0083,
+   "status": "neutral"
+  },
+  {
+   "id": "985020c12f48",
+   "item": "double_buffering",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": -0.75736,
+   "status": "regressed"
+  },
+  {
+   "id": "387458cefae6",
+   "item": "double_buffering",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": -0.82963,
+   "status": "regressed"
+  },
+  {
+   "id": "d9fc4c47b427",
+   "item": "algorithmic_changes",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": -0.09276,
+   "status": "regressed"
+  },
+  {
+   "id": "1865479318ef",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": -0.16371,
+   "status": "regressed"
+  },
+  {
+   "id": "dff96a3eeb9f",
+   "item": "grid_stride_vectorized",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "gelu",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00301,
+   "status": "improved"
+  },
+  {
+   "id": "95bd64dcd6b5",
+   "item": "grid_stride_vectorized",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "gelu",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00427,
+   "status": "improved"
+  },
+  {
+   "id": "f4068e1dd71a",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": -0.20149,
+   "status": "regressed"
+  },
+  {
+   "id": "ae6130f65834",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "gelu",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00168,
+   "status": "improved"
+  },
+  {
+   "id": "a181d35b42c0",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "gelu",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00299,
+   "status": "improved"
+  },
+  {
+   "id": "46067b860b19",
+   "item": "register_blocking",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": -0.12043,
+   "status": "regressed"
+  },
+  {
+   "id": "cb66856a1bcd",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "gelu",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.002,
+   "status": "improved"
+  },
+  {
+   "id": "e2bf58784ac5",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.95564,
+   "status": "improved"
+  },
+  {
+   "id": "8bdb67a226ec",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.95212,
+   "status": "improved"
+  },
+  {
+   "id": "18a5ccd5e8cb",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.95409,
+   "status": "improved"
+  },
+  {
+   "id": "424097e9ba9e",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "relu",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.0073,
+   "status": "improved"
+  },
+  {
+   "id": "e2341f634d7a",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.01822,
+   "status": "improved"
+  },
+  {
+   "id": "a1008b5ac0ab",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.22,
+   "status": "improved"
+  },
+  {
+   "id": "6acffd02c62a",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "relu",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00688,
+   "status": "improved"
+  },
+  {
+   "id": "bf47995cbc4a",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.06739,
+   "status": "improved"
+  },
+  {
+   "id": "987378d63f00",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise2",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound"
+   ],
+   "reward": 0.05344,
+   "status": "improved"
+  },
+  {
+   "id": "1c9c9cd4d3c9",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise2",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound"
+   ],
+   "reward": 0.03224,
+   "status": "improved"
+  },
+  {
+   "id": "4bf46ee35a0e",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.17832,
+   "status": "improved"
+  },
+  {
+   "id": "0504bc542587",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise2",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.02366,
+   "status": "improved"
+  },
+  {
+   "id": "ec59c306cce8",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.97111,
+   "status": "improved"
+  },
+  {
+   "id": "6bcc2a83b268",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.96666,
+   "status": "improved"
+  },
+  {
+   "id": "e3b013cf9753",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.97321,
+   "status": "improved"
+  },
+  {
+   "id": "9ec019d42918",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": -0.07501,
+   "status": "regressed"
+  },
+  {
+   "id": "a0a8814979b8",
+   "item": "grid_stride_vectorized",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "leaky_relu",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00112,
+   "status": "improved"
+  },
+  {
+   "id": "0928d63973bc",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": 0.08888,
+   "status": "improved"
+  },
+  {
+   "id": "b16365157210",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.11339,
+   "status": "improved"
+  },
+  {
+   "id": "a3b85a8dbb6e",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_memory"
+   ],
+   "reward": -0.14497,
+   "status": "regressed"
+  },
+  {
+   "id": "c52555d7a014",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": 0.00969,
+   "status": "neutral"
+  },
+  {
+   "id": "a1a06790e36e",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.0869,
+   "status": "regressed"
+  },
+  {
+   "id": "3f29dc0bc099",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.00397,
+   "status": "neutral"
+  },
+  {
+   "id": "cde1d36036f1",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "leaky_relu",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00155,
+   "status": "improved"
+  },
+  {
+   "id": "b32e2f996bfc",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00226,
+   "status": "improved"
+  },
+  {
+   "id": "2706067b9d35",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "latency_bound",
+    "low_parallelism"
+   ],
+   "reward": -0.0056,
+   "status": "regressed"
+  },
+  {
+   "id": "7e59c0a728f0",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": -0.244,
+   "status": "regressed"
+  },
+  {
+   "id": "9577c2f6780a",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": -0.08201,
+   "status": "regressed"
+  },
+  {
+   "id": "0d5f9ebda91c",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.11037,
+   "status": "improved"
+  },
+  {
+   "id": "a324dcf9068a",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": -0.21298,
+   "status": "regressed"
+  },
+  {
+   "id": "8e39f43d9ff8",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "latency_bound",
+    "low_parallelism"
+   ],
+   "reward": -0.0086,
+   "status": "regressed"
+  },
+  {
+   "id": "8df63b9a3f4d",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": -0.21593,
+   "status": "regressed"
+  },
+  {
+   "id": "940deaa8d7e9",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00557,
+   "status": "improved"
+  },
+  {
+   "id": "cf40d04f1726",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": -0.05,
+   "status": "compile_error"
+  },
+  {
+   "id": "906b4b6fbd52",
+   "item": "shared_memory_tiling",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": -0.1943,
+   "status": "regressed"
+  },
+  {
+   "id": "6d9711426d9d",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_memory"
+   ],
+   "reward": 0.00878,
+   "status": "improved"
+  },
+  {
+   "id": "9301f4cf430d",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.95102,
+   "status": "improved"
+  },
+  {
+   "id": "e045e62efb58",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.95186,
+   "status": "improved"
+  },
+  {
+   "id": "856ac6944591",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.95218,
+   "status": "improved"
+  },
+  {
+   "id": "c54cc3b046ce",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "relu",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00468,
+   "status": "improved"
+  },
+  {
+   "id": "3b6117722ca4",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.12828,
+   "status": "improved"
+  },
+  {
+   "id": "fee65c3001d4",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.04625,
+   "status": "improved"
+  },
+  {
+   "id": "6dc97fe561ab",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.22683,
+   "status": "improved"
+  },
+  {
+   "id": "2722350780ba",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.02571,
+   "status": "improved"
+  },
+  {
+   "id": "8e0df9272366",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": -0.28586,
+   "status": "regressed"
+  },
+  {
+   "id": "e18dfdafa4c0",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise2",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound"
+   ],
+   "reward": 0.05915,
+   "status": "improved"
+  },
+  {
+   "id": "f9ae72acaafe",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.05309,
+   "status": "improved"
+  },
+  {
+   "id": "1902b2fbe62f",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "on_chip_memory_bound"
+   ],
+   "reward": 0.20836,
+   "status": "improved"
+  },
+  {
+   "id": "712335d26a3d",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.96692,
+   "status": "improved"
+  },
+  {
+   "id": "9f0766c42620",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.9736,
+   "status": "improved"
+  },
+  {
+   "id": "29e7221be1a6",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.97545,
+   "status": "improved"
+  },
+  {
+   "id": "6e5debfabc50",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": 0.24458,
+   "status": "improved"
+  },
+  {
+   "id": "094bfe47747c",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": -0.04851,
+   "status": "regressed"
+  },
+  {
+   "id": "a77cf4337e10",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": -0.6465,
+   "status": "regressed"
+  },
+  {
+   "id": "3f5905037561",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.01155,
+   "status": "neutral"
+  },
+  {
+   "id": "a149998d3007",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": 0.00453,
+   "status": "neutral"
+  },
+  {
+   "id": "cb1cf68550e6",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": -0.09944,
+   "status": "regressed"
+  },
+  {
+   "id": "c8bed6aac12f",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.01167,
+   "status": "neutral"
+  },
+  {
+   "id": "fda607bbf686",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "leaky_relu",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00362,
+   "status": "improved"
+  },
+  {
+   "id": "3646377cc86a",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "mul_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00364,
+   "status": "improved"
+  },
+  {
+   "id": "a1d4600ecddc",
+   "item": "grid_stride_vectorized",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00247,
+   "status": "improved"
+  },
+  {
+   "id": "612a98493ba5",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.11818,
+   "status": "improved"
+  },
+  {
+   "id": "de805d60d7c1",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.03961,
+   "status": "improved"
+  },
+  {
+   "id": "8728af82d61f",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00201,
+   "status": "improved"
+  },
+  {
+   "id": "39f2d6c70d03",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.12093,
+   "status": "improved"
+  },
+  {
+   "id": "565837d4edac",
+   "item": "register_blocking",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": -0.07109,
+   "status": "regressed"
+  },
+  {
+   "id": "65ea157877a8",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "latency_bound",
+    "low_parallelism"
+   ],
+   "reward": -0.05,
+   "status": "compile_error"
+  },
+  {
+   "id": "e8d378fb358f",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "latency_bound",
+    "low_parallelism"
+   ],
+   "reward": 0.119,
+   "status": "improved"
+  },
+  {
+   "id": "0c83bbe1bc92",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "latency_bound",
+    "low_parallelism"
+   ],
+   "reward": 0.10902,
+   "status": "improved"
+  },
+  {
+   "id": "07241141f1eb",
+   "item": "algorithmic_changes",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": -0.13971,
+   "status": "regressed"
+  },
+  {
+   "id": "7ca3194520ef",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_memory"
+   ],
+   "reward": -0.12044,
+   "status": "regressed"
+  },
+  {
+   "id": "6113ab3dd1bc",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.04578,
+   "status": "improved"
+  },
+  {
+   "id": "ea781ae417ff",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute",
+    "underutilized_compute_near_idle"
+   ],
+   "reward": 0.94098,
+   "status": "improved"
+  },
+  {
+   "id": "5085dffb7e42",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute",
+    "underutilized_compute_near_idle"
+   ],
+   "reward": 0.93805,
+   "status": "improved"
+  },
+  {
+   "id": "e0f8e6c77298",
+   "item": "implicit_gemm",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.20295,
+   "status": "improved"
+  },
+  {
+   "id": "167516adc096",
+   "item": "implicit_gemm",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.35062,
+   "status": "improved"
+  },
+  {
+   "id": "b6e95b05666d",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.14424,
+   "status": "improved"
+  },
+  {
+   "id": "397061a9dc98",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_75",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.50091,
+   "status": "regressed"
+  },
+  {
+   "id": "02af5d57a8e2",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute",
+    "underutilized_compute_gemm_high_ai"
+   ],
+   "reward": 0.97469,
+   "status": "improved"
+  },
+  {
+   "id": "1c9451705d7c",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute",
+    "underutilized_compute_gemm_high_ai"
+   ],
+   "reward": 0.97829,
+   "status": "improved"
+  },
+  {
+   "id": "69bd0590d76f",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute",
+    "underutilized_compute_gemm_high_ai"
+   ],
+   "reward": -0.2479,
+   "status": "regressed"
+  },
+  {
+   "id": "14384ed826f8",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute",
+    "underutilized_compute_gemm_high_ai"
+   ],
+   "reward": 0.27028,
+   "status": "improved"
+  },
+  {
+   "id": "87d17f34f423",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute",
+    "underutilized_compute_gemm_high_ai"
+   ],
+   "reward": -0.04945,
+   "status": "regressed"
+  },
+  {
+   "id": "78e77324a127",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute",
+    "underutilized_compute_gemm_high_ai"
+   ],
+   "reward": -0.14693,
+   "status": "regressed"
+  },
+  {
+   "id": "0bd5685f1027",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute",
+    "underutilized_compute_gemm_high_ai"
+   ],
+   "reward": -0.36054,
+   "status": "regressed"
+  },
+  {
+   "id": "22026ded55ac",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_75",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute",
+    "underutilized_compute_gemm_high_ai"
+   ],
+   "reward": -0.1388,
+   "status": "regressed"
+  },
+  {
+   "id": "4d870d00669a",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.94992,
+   "status": "improved"
+  },
+  {
+   "id": "3629724c8d83",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.95701,
+   "status": "improved"
+  },
+  {
+   "id": "b57efdd0bec0",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.9544,
+   "status": "improved"
+  },
+  {
+   "id": "8fd8b07f84ff",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "relu",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00566,
+   "status": "improved"
+  },
+  {
+   "id": "78a8185e626f",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.00943,
+   "status": "neutral"
+  },
+  {
+   "id": "5eb9c73c8650",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.05715,
+   "status": "improved"
+  },
+  {
+   "id": "5a413762226b",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.05559,
+   "status": "improved"
+  },
+  {
+   "id": "00fa6370c810",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.18039,
+   "status": "improved"
+  },
+  {
+   "id": "1d762a0935ee",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.1696,
+   "status": "improved"
+  },
+  {
+   "id": "235fe1150bed",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise2",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound"
+   ],
+   "reward": 0.06145,
+   "status": "improved"
+  },
+  {
+   "id": "eafbbf08b752",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.05,
+   "status": "compile_error"
+  },
+  {
+   "id": "f5469d738634",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise2",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound"
+   ],
+   "reward": 0.03599,
+   "status": "improved"
+  },
+  {
+   "id": "bb6310a54dc6",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.97512,
+   "status": "improved"
+  },
+  {
+   "id": "5998444b146a",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.9698,
+   "status": "improved"
+  },
+  {
+   "id": "76bafb54f5f9",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.96884,
+   "status": "improved"
+  },
+  {
+   "id": "abd5639c6555",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.18981,
+   "status": "improved"
+  },
+  {
+   "id": "9293e4ef67f0",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": 0.14536,
+   "status": "improved"
+  },
+  {
+   "id": "12bbd41a60ec",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": 0.22402,
+   "status": "improved"
+  },
+  {
+   "id": "0ceb52e7020a",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "mul_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00272,
+   "status": "improved"
+  },
+  {
+   "id": "1f3180568dec",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": -0.13287,
+   "status": "regressed"
+  },
+  {
+   "id": "a6bdd46e78d0",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "leaky_relu",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00183,
+   "status": "improved"
+  },
+  {
+   "id": "0b6cf763eb25",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "latency_bound",
+    "low_parallelism"
+   ],
+   "reward": -0.08002,
+   "status": "regressed"
+  },
+  {
+   "id": "7912d7d6bcd7",
+   "item": "grid_stride_vectorized",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "mul_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00276,
+   "status": "improved"
+  },
+  {
+   "id": "acd0832de24c",
+   "item": "shared_memory_tiling",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": -0.20243,
+   "status": "regressed"
+  },
+  {
+   "id": "657d43707984",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_memory"
+   ],
+   "reward": -0.14523,
+   "status": "regressed"
+  },
+  {
+   "id": "002e976ae284",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_memory"
+   ],
+   "reward": -0.01958,
+   "status": "regressed"
+  },
+  {
+   "id": "f04f207a560c",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_memory"
+   ],
+   "reward": -0.00369,
+   "status": "neutral"
+  },
+  {
+   "id": "1d2ba08528c4",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_memory"
+   ],
+   "reward": -0.20251,
+   "status": "regressed"
+  },
+  {
+   "id": "d46a480be397",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "latency_bound",
+    "low_parallelism"
+   ],
+   "reward": -0.01435,
+   "status": "regressed"
+  },
+  {
+   "id": "402986c05015",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.09206,
+   "status": "improved"
+  },
+  {
+   "id": "b9b996b1f7bc",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00627,
+   "status": "improved"
+  },
+  {
+   "id": "6a82e6c5c3fa",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "latency_bound",
+    "low_parallelism"
+   ],
+   "reward": -0.12849,
+   "status": "regressed"
+  },
+  {
+   "id": "3b0bf2a6a99f",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "latency_bound",
+    "low_parallelism"
+   ],
+   "reward": 0.00519,
+   "status": "improved"
+  },
+  {
+   "id": "87e8a55c8c65",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_memory"
+   ],
+   "reward": -0.01525,
+   "status": "neutral"
+  },
+  {
+   "id": "9258d89f5a94",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "on_chip_memory_bound"
+   ],
+   "reward": -0.19341,
+   "status": "regressed"
+  },
+  {
+   "id": "7419c2b72975",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.23048,
+   "status": "regressed"
+  },
+  {
+   "id": "7b970f1c7354",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.94556,
+   "status": "improved"
+  },
+  {
+   "id": "1199e01225ac",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.9555,
+   "status": "improved"
+  },
+  {
+   "id": "70c181e526fc",
+   "item": "implicit_gemm",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.94445,
+   "status": "improved"
+  },
+  {
+   "id": "c734f1f71200",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise2",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound"
+   ],
+   "reward": 0.01959,
+   "status": "improved"
+  },
+  {
+   "id": "4f4c7a783264",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise2",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound"
+   ],
+   "reward": 0.0017,
+   "status": "neutral"
+  },
+  {
+   "id": "2310a4d370e6",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.22119,
+   "status": "improved"
+  },
+  {
+   "id": "5dd01d83db25",
+   "item": "implicit_gemm",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": -0.22205,
+   "status": "regressed"
+  },
+  {
+   "id": "0fe202fb0c39",
+   "item": "implicit_gemm",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": -0.05,
+   "status": "compile_error"
+  },
+  {
+   "id": "86570854d169",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.35289,
+   "status": "improved"
+  },
+  {
+   "id": "d0d04fa493ee",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": -0.22089,
+   "status": "regressed"
+  },
+  {
+   "id": "2a60be58ec1d",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.33231,
+   "status": "regressed"
+  },
+  {
+   "id": "4270c55a34dd",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.1081,
+   "status": "improved"
+  },
+  {
+   "id": "d0d8e62dbf51",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.96649,
+   "status": "improved"
+  },
+  {
+   "id": "0ac70c250e8a",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.96619,
+   "status": "improved"
+  },
+  {
+   "id": "c4aefe3d4b4c",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.9746,
+   "status": "improved"
+  },
+  {
+   "id": "1d7d3d061bbc",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_memory"
+   ],
+   "reward": -0.11984,
+   "status": "regressed"
+  },
+  {
+   "id": "25b6e713b151",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": -0.25888,
+   "status": "regressed"
+  },
+  {
+   "id": "6ab918d02d01",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "leaky_relu",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00176,
+   "status": "improved"
+  },
+  {
+   "id": "cf7461b7a7ae",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": -0.08619,
+   "status": "regressed"
+  },
+  {
+   "id": "fdd73f3b3bbe",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_memory"
+   ],
+   "reward": 0.20768,
+   "status": "improved"
+  },
+  {
+   "id": "d5d611c59b96",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.25876,
+   "status": "improved"
+  },
+  {
+   "id": "fabe70a3cadb",
+   "item": "cache_aware_rasterization",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": 0.04747,
+   "status": "improved"
+  },
+  {
+   "id": "d9eb02f96ad7",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.11197,
+   "status": "regressed"
+  },
+  {
+   "id": "adc609ec25b4",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.03311,
+   "status": "improved"
+  },
+  {
+   "id": "3e537869d9f0",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00696,
+   "status": "improved"
+  },
+  {
+   "id": "ed795b3ece2e",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": -0.15123,
+   "status": "regressed"
+  },
+  {
+   "id": "90724c981503",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.03515,
+   "status": "improved"
+  },
+  {
+   "id": "6b7fdd0133c4",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": -0.25443,
+   "status": "regressed"
+  },
+  {
+   "id": "317f7a332371",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00256,
+   "status": "improved"
+  },
+  {
+   "id": "a97dba9b525a",
+   "item": "double_buffering",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": -0.01438,
+   "status": "neutral"
+  },
+  {
+   "id": "40eb89bebc80",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "on_chip_memory_bound"
+   ],
+   "reward": 0.01137,
+   "status": "neutral"
+  },
+  {
+   "id": "d06b67c1e0a7",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "latency_bound",
+    "low_parallelism"
+   ],
+   "reward": 0.10573,
+   "status": "improved"
+  },
+  {
+   "id": "fea31aa2c787",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "latency_bound",
+    "low_parallelism"
+   ],
+   "reward": 0.10287,
+   "status": "improved"
+  },
+  {
+   "id": "91da2293c3ae",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "latency_bound",
+    "low_parallelism"
+   ],
+   "reward": 0.03071,
+   "status": "improved"
+  },
+  {
+   "id": "834f9360d495",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00792,
+   "status": "improved"
+  },
+  {
+   "id": "48645b34206b",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.0628,
+   "status": "improved"
+  },
+  {
+   "id": "9ab847c9df9c",
+   "item": "tensor_core_mma",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.95133,
+   "status": "improved"
+  },
+  {
+   "id": "ef2ff0b926b6",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.95164,
+   "status": "improved"
+  },
+  {
+   "id": "93d1bcc8553c",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.95231,
+   "status": "improved"
+  },
+  {
+   "id": "d267ac9bd949",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.01145,
+   "status": "neutral"
+  },
+  {
+   "id": "af59fa958fe7",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise2",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound"
+   ],
+   "reward": 0.00226,
+   "status": "improved"
+  },
+  {
+   "id": "ac181d9ea72b",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise2",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound"
+   ],
+   "reward": 0.04882,
+   "status": "improved"
+  },
+  {
+   "id": "fa26ca152509",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise2",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound"
+   ],
+   "reward": 0.0096,
+   "status": "improved"
+  },
+  {
+   "id": "4281329fe996",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.01391,
+   "status": "neutral"
+  },
+  {
+   "id": "82ce86c8d761",
+   "item": "tensor_core_mma",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.19306,
+   "status": "improved"
+  },
+  {
+   "id": "d09a8654a290",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.26005,
+   "status": "improved"
+  },
+  {
+   "id": "36e3f12f6ae0",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute",
+    "stalled_low_occupancy"
+   ],
+   "reward": 0.07827,
+   "status": "improved"
+  },
+  {
+   "id": "1a51ff8fcf68",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.36863,
+   "status": "improved"
+  },
+  {
+   "id": "09378fcd31a5",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.97282,
+   "status": "improved"
+  },
+  {
+   "id": "7c998cf7b1c6",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.97362,
+   "status": "improved"
+  },
+  {
+   "id": "00fc4f880cc4",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.97331,
+   "status": "improved"
+  },
+  {
+   "id": "dd28605df0a7",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": 0.01361,
+   "status": "neutral"
+  },
+  {
+   "id": "40e73e876b2d",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": 0.00194,
+   "status": "neutral"
+  },
+  {
+   "id": "c0abd1ba6782",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_memory"
+   ],
+   "reward": 0.03084,
+   "status": "improved"
+  },
+  {
+   "id": "ad2655a3740c",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.05131,
+   "status": "improved"
+  },
+  {
+   "id": "26c6535a1870",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.05275,
+   "status": "improved"
+  },
+  {
+   "id": "1e4977c0b0cf",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": -0.03065,
+   "status": "regressed"
+  },
+  {
+   "id": "c339fa7443a8",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.01424,
+   "status": "neutral"
+  },
+  {
+   "id": "02aeff02afff",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "mul_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00309,
+   "status": "improved"
+  },
+  {
+   "id": "892fdf854ed1",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.1439,
+   "status": "improved"
+  },
+  {
+   "id": "5723f6f0f35d",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": -0.16103,
+   "status": "regressed"
+  },
+  {
+   "id": "4cb1c0c5a5e4",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": -0.05,
+   "status": "compile_error"
+  },
+  {
+   "id": "d8b413364713",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "latency_bound",
+    "low_parallelism"
+   ],
+   "reward": 0.03904,
+   "status": "improved"
+  },
+  {
+   "id": "ee26b665cf41",
+   "item": "double_buffering",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": -0.04199,
+   "status": "regressed"
+  },
+  {
+   "id": "5d65686273a4",
+   "item": "algorithmic_changes",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": -0.05,
+   "status": "compile_error"
+  },
+  {
+   "id": "652c69d61cb8",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "dram_streaming"
+   ],
+   "reward": 0.1158,
+   "status": "improved"
+  },
+  {
+   "id": "1cb8c16ba838",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "latency_bound",
+    "low_parallelism"
+   ],
+   "reward": 0.14397,
+   "status": "improved"
+  },
+  {
+   "id": "96ea1124a031",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.01027,
+   "status": "improved"
+  },
+  {
+   "id": "66e3be677700",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.01208,
+   "status": "improved"
+  },
+  {
+   "id": "cf8cda8ebf73",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": -0.0017,
+   "status": "neutral"
+  },
+  {
+   "id": "46d866a51404",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": -0.04766,
+   "status": "regressed"
+  },
+  {
+   "id": "90342a2e9706",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.03945,
+   "status": "improved"
+  },
+  {
+   "id": "517b78688157",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.90332,
+   "status": "improved"
+  },
+  {
+   "id": "4c20cf149d7c",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": -0.05,
+   "status": "compile_error"
+  },
+  {
+   "id": "a1d1996ba0e4",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.54312,
+   "status": "improved"
+  },
+  {
+   "id": "f53f6509bad3",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": -0.05,
+   "status": "compile_error"
+  },
+  {
+   "id": "21d15e92a789",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.51535,
+   "status": "improved"
+  },
+  {
+   "id": "19af044ad4d3",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "on_chip_memory_bound"
+   ],
+   "reward": 0.90421,
+   "status": "improved"
+  },
+  {
+   "id": "bfa6abf3dda4",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": -0.10084,
+   "status": "regressed"
+  },
+  {
+   "id": "a4306d2d6212",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.95062,
+   "status": "improved"
+  },
+  {
+   "id": "3737685f9872",
+   "item": "grid_stride_vectorized",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "relu",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00554,
+   "status": "improved"
+  },
+  {
+   "id": "bf6a0d92ad9d",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": -0.17228,
+   "status": "regressed"
+  },
+  {
+   "id": "2e8aaa7620ef",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "relu",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": -0.00185,
+   "status": "regressed"
+  },
+  {
+   "id": "5c3c78e07984",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "relu",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00301,
+   "status": "improved"
+  },
+  {
+   "id": "6b029403cd3a",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.97529,
+   "status": "improved"
+  },
+  {
+   "id": "967c9543e07a",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.96077,
+   "status": "improved"
+  },
+  {
+   "id": "7636a00223d8",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.97463,
+   "status": "improved"
+  },
+  {
+   "id": "c6851f9739f9",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": -0.04612,
+   "status": "regressed"
+  },
+  {
+   "id": "768dd9289e9f",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "latency_bound",
+    "low_parallelism"
+   ],
+   "reward": 0.3763,
+   "status": "improved"
+  },
+  {
+   "id": "503af91c7ff9",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": 0.03302,
+   "status": "improved"
+  },
+  {
+   "id": "efd4ca0bac11",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "mul_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00229,
+   "status": "improved"
+  },
+  {
+   "id": "8b963b377dce",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.02422,
+   "status": "regressed"
+  },
+  {
+   "id": "7ead96860585",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "mul_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00181,
+   "status": "improved"
+  },
+  {
+   "id": "f9ea4ebfa318",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.06285,
+   "status": "improved"
+  },
+  {
+   "id": "5cb4d3974a36",
+   "item": "grid_stride_vectorized",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "mul_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "latency_bound",
+    "launch_overhead"
+   ],
+   "reward": -0.00151,
+   "status": "regressed"
+  },
+  {
+   "id": "400276fccee7",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "mul_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00207,
+   "status": "improved"
+  },
+  {
+   "id": "17aeb0460389",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "latency_bound",
+    "low_parallelism"
+   ],
+   "reward": -0.10095,
+   "status": "regressed"
+  },
+  {
+   "id": "246179bdd38b",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.00298,
+   "status": "neutral"
+  },
+  {
+   "id": "e8c5d351a387",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.18677,
+   "status": "improved"
+  },
+  {
+   "id": "1e5bd4f246a4",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.03363,
+   "status": "regressed"
+  },
+  {
+   "id": "9a5779dc90ae",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.18588,
+   "status": "improved"
+  },
+  {
+   "id": "3bfea531b3d2",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "on_chip_memory_bound"
+   ],
+   "reward": -0.06865,
+   "status": "regressed"
+  },
+  {
+   "id": "ac898125dc66",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.00582,
+   "status": "neutral"
+  },
+  {
+   "id": "193845ab3554",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.09531,
+   "status": "improved"
+  },
+  {
+   "id": "856fcb2848be",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00657,
+   "status": "improved"
+  },
+  {
+   "id": "f7054be49801",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00649,
+   "status": "improved"
+  },
+  {
+   "id": "fce0be49968c",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00146,
+   "status": "improved"
+  },
+  {
+   "id": "0f2493752cc6",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "latency_bound",
+    "low_parallelism"
+   ],
+   "reward": -0.03533,
+   "status": "regressed"
+  },
+  {
+   "id": "ec13551c7241",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.8863,
+   "status": "improved"
+  },
+  {
+   "id": "9d8ea230117c",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.95149,
+   "status": "improved"
+  },
+  {
+   "id": "57b6d3f0e503",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.94803,
+   "status": "improved"
+  },
+  {
+   "id": "5ad63e3f0983",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise2",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound"
+   ],
+   "reward": -0.00051,
+   "status": "neutral"
+  },
+  {
+   "id": "e44cd5ec53ef",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.56681,
+   "status": "improved"
+  },
+  {
+   "id": "f4f31ff5bbeb",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.25195,
+   "status": "improved"
+  },
+  {
+   "id": "5cb94b86b478",
+   "item": "grid_stride_vectorized",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise2",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.04909,
+   "status": "improved"
+  },
+  {
+   "id": "09ad9b740b18",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.2665,
+   "status": "improved"
+  },
+  {
+   "id": "264ac9122acc",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": -0.16113,
+   "status": "regressed"
+  },
+  {
+   "id": "5bde74946bcb",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": -0.28809,
+   "status": "regressed"
+  },
+  {
+   "id": "64d282721190",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.02238,
+   "status": "improved"
+  },
+  {
+   "id": "934161d76477",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.15023,
+   "status": "regressed"
+  },
+  {
+   "id": "91b53db5f399",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.97512,
+   "status": "improved"
+  },
+  {
+   "id": "397770f9fd91",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.95735,
+   "status": "improved"
+  },
+  {
+   "id": "fada3dd9cac6",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.9756,
+   "status": "improved"
+  },
+  {
+   "id": "7ebde18b1dc1",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "latency_bound",
+    "low_parallelism"
+   ],
+   "reward": 0.3924,
+   "status": "improved"
+  },
+  {
+   "id": "5f1b4980d51c",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": 0.22821,
+   "status": "improved"
+  },
+  {
+   "id": "bc5cf8400f51",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "leaky_relu",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00152,
+   "status": "improved"
+  },
+  {
+   "id": "3c0381436634",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.17228,
+   "status": "regressed"
+  },
+  {
+   "id": "8fcb4c782e3c",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "leaky_relu",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00337,
+   "status": "improved"
+  },
+  {
+   "id": "e14e6d9fab8e",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": -0.05924,
+   "status": "regressed"
+  },
+  {
+   "id": "17f5aa7d01a5",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.17138,
+   "status": "regressed"
+  },
+  {
+   "id": "05637f75016c",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": -0.25994,
+   "status": "regressed"
+  },
+  {
+   "id": "5f716bccae03",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": -0.10994,
+   "status": "regressed"
+  },
+  {
+   "id": "7e54e3e5b2ac",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "on_chip_memory_bound"
+   ],
+   "reward": -0.1385,
+   "status": "regressed"
+  },
+  {
+   "id": "cc57f0d0b5d4",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "on_chip_memory_bound"
+   ],
+   "reward": 0.01998,
+   "status": "improved"
+  },
+  {
+   "id": "e292a357c45c",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.0075,
+   "status": "improved"
+  },
+  {
+   "id": "c5da98031f02",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": -0.01567,
+   "status": "regressed"
+  },
+  {
+   "id": "6b329767d851",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "on_chip_memory_bound"
+   ],
+   "reward": -0.18239,
+   "status": "regressed"
+  },
+  {
+   "id": "452a66a2ac25",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "on_chip_memory_bound"
+   ],
+   "reward": -0.18554,
+   "status": "regressed"
+  },
+  {
+   "id": "ed1b9794dd66",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.18318,
+   "status": "regressed"
+  },
+  {
+   "id": "74dbc8f98cc4",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "on_chip_memory_bound"
+   ],
+   "reward": -0.18378,
+   "status": "regressed"
+  },
+  {
+   "id": "1ffade6a3af2",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "latency_bound",
+    "low_parallelism"
+   ],
+   "reward": -0.05,
+   "status": "compile_error"
+  },
+  {
+   "id": "f26fa5e2e6fc",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "latency_bound",
+    "low_parallelism"
+   ],
+   "reward": 0.02426,
+   "status": "improved"
+  },
+  {
+   "id": "6d2b25f16f02",
+   "item": "cache_aware_rasterization",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "on_chip_memory_bound"
+   ],
+   "reward": 0.01974,
+   "status": "improved"
+  },
+  {
+   "id": "b9cef19af06d",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "latency_bound",
+    "low_parallelism"
+   ],
+   "reward": -0.04497,
+   "status": "regressed"
+  },
+  {
+   "id": "11a2df0178a8",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.93732,
+   "status": "improved"
+  },
+  {
+   "id": "b8c6747bf57c",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.95747,
+   "status": "improved"
+  },
+  {
+   "id": "3fb83645c024",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.96867,
+   "status": "improved"
+  },
+  {
+   "id": "f7449459373f",
+   "item": "grid_stride_vectorized",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "relu",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00432,
+   "status": "improved"
+  },
+  {
+   "id": "4bf112d4ddf5",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": -0.19423,
+   "status": "regressed"
+  },
+  {
+   "id": "8d46a90a9501",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.05609,
+   "status": "improved"
+  },
+  {
+   "id": "d388a00ae261",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute",
+    "stalled_low_occupancy"
+   ],
+   "reward": 0.44287,
+   "status": "improved"
+  },
+  {
+   "id": "84006786bbd2",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise2",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound"
+   ],
+   "reward": 0.06258,
+   "status": "improved"
+  },
+  {
+   "id": "c054287f26e4",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": -0.1795,
+   "status": "regressed"
+  },
+  {
+   "id": "1cae99b223b7",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.31143,
+   "status": "regressed"
+  },
+  {
+   "id": "f9bf5c783733",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": -0.03015,
+   "status": "regressed"
+  },
+  {
+   "id": "b371a8c4e05a",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": -0.11311,
+   "status": "regressed"
+  },
+  {
+   "id": "829ff59ed9ee",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.97605,
+   "status": "improved"
+  },
+  {
+   "id": "cfcaf6d17c00",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.95658,
+   "status": "improved"
+  },
+  {
+   "id": "6a25245d5b47",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.97507,
+   "status": "improved"
+  },
+  {
+   "id": "0c4d7f346ba1",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": -0.03505,
+   "status": "regressed"
+  },
+  {
+   "id": "c2e7ffc3d0f8",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": 0.42534,
+   "status": "improved"
+  },
+  {
+   "id": "ca0374c79a75",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "mul_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00385,
+   "status": "improved"
+  },
+  {
+   "id": "7f4d86435695",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.2153,
+   "status": "improved"
+  },
+  {
+   "id": "8193a8b8a76f",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.12578,
+   "status": "improved"
+  },
+  {
+   "id": "66214e531a61",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": -0.24658,
+   "status": "regressed"
+  },
+  {
+   "id": "3a329acab7de",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "leaky_relu",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00447,
+   "status": "improved"
+  },
+  {
+   "id": "115cee621c5f",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.19412,
+   "status": "regressed"
+  },
+  {
+   "id": "517329d37517",
+   "item": "cache_aware_rasterization",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": 0.14282,
+   "status": "improved"
+  },
+  {
+   "id": "2b515f033a44",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.01314,
+   "status": "neutral"
+  },
+  {
+   "id": "f86ea6fa6491",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "latency_bound",
+    "low_parallelism"
+   ],
+   "reward": -0.05,
+   "status": "compile_error"
+  },
+  {
+   "id": "8e7d151943c7",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "latency_bound",
+    "low_parallelism"
+   ],
+   "reward": 0.12912,
+   "status": "improved"
+  },
+  {
+   "id": "18705b5c8564",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.08053,
+   "status": "regressed"
+  },
+  {
+   "id": "c8a1af89f24f",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00495,
+   "status": "improved"
+  },
+  {
+   "id": "0d47b838135a",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.04997,
+   "status": "improved"
+  },
+  {
+   "id": "752f2e6e9e28",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.03295,
+   "status": "improved"
+  },
+  {
+   "id": "75a1c9010e12",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": -0.07798,
+   "status": "regressed"
+  },
+  {
+   "id": "63e3e6ec3db2",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": -0.04319,
+   "status": "regressed"
+  },
+  {
+   "id": "f0d09929b651",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.11553,
+   "status": "regressed"
+  },
+  {
+   "id": "bea00131874f",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00099,
+   "status": "neutral"
+  },
+  {
+   "id": "46f78fded1c3",
+   "item": "algorithmic_changes",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": -0.05,
+   "status": "compile_error"
+  },
+  {
+   "id": "b812b189f434",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.94354,
+   "status": "improved"
+  },
+  {
+   "id": "cd6be870c103",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.93812,
+   "status": "improved"
+  },
+  {
+   "id": "b5e01f9a6dfc",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.95806,
+   "status": "improved"
+  },
+  {
+   "id": "570d15a5d08b",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.03537,
+   "status": "improved"
+  },
+  {
+   "id": "91e50bf9e31c",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.29325,
+   "status": "improved"
+  },
+  {
+   "id": "b5e2f3af16b6",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "relu",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00322,
+   "status": "improved"
+  },
+  {
+   "id": "f2f1ce1c02da",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.21211,
+   "status": "regressed"
+  },
+  {
+   "id": "482fa407ca97",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.01452,
+   "status": "neutral"
+  },
+  {
+   "id": "d88e92e0744e",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.05,
+   "status": "compile_error"
+  },
+  {
+   "id": "e50f3c9e72c9",
+   "item": "grid_stride_vectorized",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "relu",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00617,
+   "status": "improved"
+  },
+  {
+   "id": "68dce0f417c8",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise2",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound"
+   ],
+   "reward": 0.04984,
+   "status": "improved"
+  },
+  {
+   "id": "85411e77173f",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise2",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound"
+   ],
+   "reward": 0.0295,
+   "status": "improved"
+  },
+  {
+   "id": "8c8d7a2614b4",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.96575,
+   "status": "improved"
+  },
+  {
+   "id": "ab3684c76bca",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.97537,
+   "status": "improved"
+  },
+  {
+   "id": "40b5ca1d266c",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.97114,
+   "status": "improved"
+  },
+  {
+   "id": "d64ae4858d36",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": 0.28405,
+   "status": "improved"
+  },
+  {
+   "id": "a7477548ac99",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": -0.08751,
+   "status": "regressed"
+  },
+  {
+   "id": "fdf76b603e29",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": 0.02495,
+   "status": "improved"
+  },
+  {
+   "id": "a4312dcc23c9",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": 0.14885,
+   "status": "improved"
+  },
+  {
+   "id": "c344c150a433",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute",
+    "underutilized_compute_gemm_high_ai"
+   ],
+   "reward": 0.0248,
+   "status": "improved"
+  },
+  {
+   "id": "40ab2e372170",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute",
+    "underutilized_compute_gemm_high_ai"
+   ],
+   "reward": -0.07,
+   "status": "regressed"
+  },
+  {
+   "id": "17864f2a949d",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute",
+    "underutilized_compute_gemm_high_ai"
+   ],
+   "reward": 0.14499,
+   "status": "improved"
+  },
+  {
+   "id": "39148fb12102",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": -0.1353,
+   "status": "regressed"
+  },
+  {
+   "id": "9aa7f549082d",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.06501,
+   "status": "improved"
+  },
+  {
+   "id": "e878e351ca78",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.09443,
+   "status": "improved"
+  },
+  {
+   "id": "5f6c1d144dfd",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "latency_bound",
+    "low_parallelism"
+   ],
+   "reward": 0.09061,
+   "status": "improved"
+  },
+  {
+   "id": "cc498353c916",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00569,
+   "status": "improved"
+  },
+  {
+   "id": "4cb58c817a32",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "latency_bound",
+    "low_parallelism"
+   ],
+   "reward": -0.00311,
+   "status": "neutral"
+  },
+  {
+   "id": "acdf7b407018",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.09863,
+   "status": "improved"
+  },
+  {
+   "id": "9eb5f431d606",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": -0.08535,
+   "status": "regressed"
+  },
+  {
+   "id": "58c17dcc1474",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute",
+    "stalled_low_occupancy"
+   ],
+   "reward": -0.12663,
+   "status": "regressed"
+  },
+  {
+   "id": "c2b8c3308136",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute",
+    "stalled_low_occupancy"
+   ],
+   "reward": 0.02645,
+   "status": "improved"
+  },
+  {
+   "id": "ab743345e5da",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": -0.2437,
+   "status": "regressed"
+  },
+  {
+   "id": "b8611c1d0368",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.16318,
+   "status": "improved"
+  },
+  {
+   "id": "61772416c696",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.95115,
+   "status": "improved"
+  },
+  {
+   "id": "077ebe5e5802",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.94661,
+   "status": "improved"
+  },
+  {
+   "id": "2bffe98391bf",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.95054,
+   "status": "improved"
+  },
+  {
+   "id": "e05c8cab96bd",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise2",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound"
+   ],
+   "reward": 0.05638,
+   "status": "improved"
+  },
+  {
+   "id": "a745b1615a5a",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.042,
+   "status": "improved"
+  },
+  {
+   "id": "122ab02d8c14",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": -0.01255,
+   "status": "neutral"
+  },
+  {
+   "id": "b0149e430338",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "relu",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00289,
+   "status": "improved"
+  },
+  {
+   "id": "575e907bb51b",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise2",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": -0.00585,
+   "status": "regressed"
+  },
+  {
+   "id": "d6c3b9ff7c31",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.04394,
+   "status": "improved"
+  },
+  {
+   "id": "fe1f423a76fe",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.09869,
+   "status": "improved"
+  },
+  {
+   "id": "7a775416e4c8",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute",
+    "stalled_low_occupancy"
+   ],
+   "reward": 0.12602,
+   "status": "improved"
+  },
+  {
+   "id": "b8197c6d0dbd",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.96391,
+   "status": "improved"
+  },
+  {
+   "id": "f7cfdadc3548",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.97547,
+   "status": "improved"
+  },
+  {
+   "id": "aa1e51fa82b4",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.96716,
+   "status": "improved"
+  },
+  {
+   "id": "2359e6dbb0b7",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": 0.26583,
+   "status": "improved"
+  },
+  {
+   "id": "687681971485",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": -0.00512,
+   "status": "neutral"
+  },
+  {
+   "id": "47b5d005b82f",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute",
+    "underutilized_compute_gemm_high_ai"
+   ],
+   "reward": 0.24978,
+   "status": "improved"
+  },
+  {
+   "id": "cf0b9231ab26",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute",
+    "underutilized_compute_gemm_high_ai"
+   ],
+   "reward": -0.0938,
+   "status": "regressed"
+  },
+  {
+   "id": "5e2e2ed56353",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute",
+    "underutilized_compute_gemm_high_ai"
+   ],
+   "reward": -0.00721,
+   "status": "neutral"
+  },
+  {
+   "id": "b0eba1226b81",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute",
+    "underutilized_compute_gemm_high_ai"
+   ],
+   "reward": 0.02456,
+   "status": "improved"
+  },
+  {
+   "id": "305041757804",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": 0.11847,
+   "status": "improved"
+  },
+  {
+   "id": "317f279b262a",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": -0.01936,
+   "status": "regressed"
+  },
+  {
+   "id": "4b85d36d6d39",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00566,
+   "status": "improved"
+  },
+  {
+   "id": "8d5312a4b034",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.04768,
+   "status": "improved"
+  },
+  {
+   "id": "a41aaa00aa67",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.06547,
+   "status": "improved"
+  },
+  {
+   "id": "ff351c3fbe45",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.06233,
+   "status": "improved"
+  },
+  {
+   "id": "048d5214dfa8",
+   "item": "implicit_gemm",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.05,
+   "status": "compile_error"
+  },
+  {
+   "id": "4813aeac36e6",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "latency_bound",
+    "low_parallelism"
+   ],
+   "reward": 0.0579,
+   "status": "improved"
+  },
+  {
+   "id": "66b61bcecc0a",
+   "item": "implicit_gemm",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.14797,
+   "status": "improved"
+  },
+  {
+   "id": "7e63f9d5aa8a",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.18736,
+   "status": "improved"
+  },
+  {
+   "id": "8351f4bd5698",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "on_chip_memory_bound"
+   ],
+   "reward": 0.22883,
+   "status": "improved"
+  },
+  {
+   "id": "f2ba827150e7",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": -0.22653,
+   "status": "regressed"
+  },
+  {
+   "id": "cad00cd5dcce",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.1024,
+   "status": "improved"
+  },
+  {
+   "id": "425c23fea252",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.94106,
+   "status": "improved"
+  },
+  {
+   "id": "6920a0bda3df",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.95597,
+   "status": "improved"
+  },
+  {
+   "id": "3c529f883c8d",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.95031,
+   "status": "improved"
+  },
+  {
+   "id": "0a56ee12a09b",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "relu",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00299,
+   "status": "improved"
+  },
+  {
+   "id": "cf2861fae244",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.03436,
+   "status": "improved"
+  },
+  {
+   "id": "d83bb956e611",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.26149,
+   "status": "improved"
+  },
+  {
+   "id": "9aab60365d73",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise2",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound"
+   ],
+   "reward": 0.04642,
+   "status": "improved"
+  },
+  {
+   "id": "16f482c58f88",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.02826,
+   "status": "improved"
+  },
+  {
+   "id": "8b8bfb48124f",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": -0.32752,
+   "status": "regressed"
+  },
+  {
+   "id": "9165d6b12fc4",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.23645,
+   "status": "improved"
+  },
+  {
+   "id": "aa2cc5b217ad",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": -0.0276,
+   "status": "regressed"
+  },
+  {
+   "id": "4ae22a31f8d1",
+   "item": "loop_unrolling_and_ilp",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": 0.09446,
+   "status": "improved"
+  },
+  {
+   "id": "4edb8cc0fa66",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.97225,
+   "status": "improved"
+  },
+  {
+   "id": "93e400499122",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.97443,
+   "status": "improved"
+  },
+  {
+   "id": "3881e0f5f498",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "balanced_bound"
+   ],
+   "reward": 0.97532,
+   "status": "improved"
+  },
+  {
+   "id": "6547e02b639b",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": -0.10336,
+   "status": "regressed"
+  },
+  {
+   "id": "e657c781ff5d",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": 0.09308,
+   "status": "improved"
+  },
+  {
+   "id": "725d9884254e",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": -0.04466,
+   "status": "regressed"
+  },
+  {
+   "id": "1333bc5bd9ea",
+   "item": "vectorized_memory_access",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": -0.61059,
+   "status": "regressed"
+  },
+  {
+   "id": "7434ec488365",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute",
+    "underutilized_compute_gemm_high_ai"
+   ],
+   "reward": -0.11542,
+   "status": "regressed"
+  },
+  {
+   "id": "213029eaefbc",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "gemm",
+   "op_kind": "linear",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound",
+    "cache_thrashing"
+   ],
+   "reward": 0.02634,
+   "status": "improved"
+  },
+  {
+   "id": "0494129712d5",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": -0.28143,
+   "status": "regressed"
+  },
+  {
+   "id": "4e5b1b18725a",
+   "item": "launch_configuration_tuning",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": -0.27096,
+   "status": "regressed"
+  },
+  {
+   "id": "a62622fa0aa9",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "latency_bound",
+    "low_parallelism"
+   ],
+   "reward": -0.04963,
+   "status": "regressed"
+  },
+  {
+   "id": "01082912b219",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": -0.27937,
+   "status": "regressed"
+  },
+  {
+   "id": "12585dc2071a",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.0688,
+   "status": "improved"
+  },
+  {
+   "id": "869d1797448f",
+   "item": "memory_coalescing",
+   "target": "cuda:sm_89",
+   "op_class": "elementwise",
+   "op_kind": "ewise_scalar",
+   "dtype": "fp32",
+   "chain": [
+    "memory_bound"
+   ],
+   "reward": 0.00419,
+   "status": "improved"
+  },
+  {
+   "id": "14bf9e07c8c6",
+   "item": "implicit_gemm",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.00104,
+   "status": "neutral"
+  },
+  {
+   "id": "ca8adc7f4aa6",
+   "item": "implicit_gemm",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": -0.3255,
+   "status": "regressed"
+  },
+  {
+   "id": "3b0194503b88",
+   "item": "thread_coarsening",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "underutilized",
+    "underutilized_compute"
+   ],
+   "reward": -0.10033,
+   "status": "regressed"
+  },
+  {
+   "id": "b3a17ebc9849",
+   "item": "implicit_gemm",
+   "target": "cuda:sm_89",
+   "op_class": "conv",
+   "op_kind": "conv2d",
+   "dtype": "fp32",
+   "chain": [
+    "compute_bound",
+    "matrix_compute"
+   ],
+   "reward": 0.07222,
+   "status": "improved"
+  },
+  {
+   "id": "8ef213a6fef7",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "latency_bound",
+    "low_parallelism"
+   ],
+   "reward": 0.11109,
+   "status": "improved"
+  },
+  {
+   "id": "3dda3171cd69",
+   "item": "read_only_cache_and_restrict",
+   "target": "cuda:sm_89",
+   "op_class": "reduction",
+   "op_kind": "group_norm",
+   "dtype": "fp32",
+   "chain": [
+    "latency_bound",
+    "low_parallelism"
+   ],
+   "reward": 0.0236,
+   "status": "improved"
+  }
+ ],
+ "claims": [
+  {
+   "kind": "applicability",
+   "technique": "algorithmic_changes",
+   "op_class": "conv",
+   "effect": "hurts",
+   "scope": "nvidia_gpu",
+   "targets": [
+    "cuda:sm_75",
+    "cuda:sm_89"
+   ],
+   "evidence": [
+    "90e96cfd0cde",
+    "f2be7733e6c8",
+    "eb18e71c1e82",
+    "07241141f1eb",
+    "5d65686273a4",
+    "46f78fded1c3"
+   ],
+   "n": 6,
+   "text": "algorithmic_changes regressed or failed on conv slots in 6 of 6 recorded attempts on sm_75, sm_89, median 0.86x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "algorithmic_changes",
+   "op_class": "gemm",
+   "effect": "helps",
+   "scope": "cuda:sm_75",
+   "targets": [
+    "cuda:sm_75"
+   ],
+   "evidence": [
+    "1672216509b3",
+    "impl:9a1d21ce6137"
+   ],
+   "n": 2,
+   "text": "algorithmic_changes improved gemm slots in 2 of 3 recorded attempts on sm_75, median 1.06x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "branch_reduction",
+   "op_class": "conv",
+   "effect": "hurts",
+   "scope": "cuda:sm_75",
+   "targets": [
+    "cuda:sm_75"
+   ],
+   "evidence": [
+    "b503eb4124c1",
+    "d160435467a8",
+    "2631fc9111df"
+   ],
+   "n": 3,
+   "text": "branch_reduction regressed or failed on conv slots in 3 of 3 recorded attempts on sm_75, median 0.96x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "cache_aware_rasterization",
+   "op_class": "gemm",
+   "effect": "helps",
+   "scope": "cuda:sm_89",
+   "targets": [
+    "cuda:sm_89"
+   ],
+   "evidence": [
+    "2463dbd45116",
+    "fabe70a3cadb",
+    "517329d37517",
+    "impl:4e3d93a2b7b0",
+    "impl:3520c68451cd"
+   ],
+   "n": 5,
+   "text": "cache_aware_rasterization improved gemm slots in 5 of 6 recorded attempts on sm_89, median 1.05x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "double_buffering",
+   "op_class": "conv",
+   "effect": "hurts",
+   "scope": "cuda:sm_75",
+   "targets": [
+    "cuda:sm_75"
+   ],
+   "evidence": [
+    "c847c1f55e6a",
+    "42a1ccb09f8b",
+    "22f8dfdb25ae",
+    "b6a8a0c79bac"
+   ],
+   "n": 4,
+   "text": "double_buffering regressed or failed on conv slots in 4 of 4 recorded attempts on sm_75, median 0.88x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "double_buffering",
+   "op_class": "gemm",
+   "effect": "hurts",
+   "scope": "cuda:sm_89",
+   "targets": [
+    "cuda:sm_89"
+   ],
+   "evidence": [
+    "985020c12f48",
+    "387458cefae6"
+   ],
+   "n": 2,
+   "text": "double_buffering regressed or failed on gemm slots in 2 of 3 recorded attempts on sm_89, median 0.54x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "grid_stride_vectorized",
+   "op_class": "elementwise",
+   "effect": "helps",
+   "scope": "cuda:sm_89",
+   "targets": [
+    "cuda:sm_89"
+   ],
+   "evidence": [
+    "6aebf1878e16",
+    "dff96a3eeb9f",
+    "95bd64dcd6b5",
+    "a0a8814979b8",
+    "a1d4600ecddc",
+    "7912d7d6bcd7",
+    "3737685f9872",
+    "5cb94b86b478",
+    "f7449459373f",
+    "e50f3c9e72c9",
+    "impl:7edbad80f1e7",
+    "impl:2242b6faae09",
+    "impl:c0b0bcfe9382",
+    "impl:dd2388f5f52f",
+    "impl:c44f15692132",
+    "impl:47228d9a9635",
+    "impl:240a5d6da000",
+    "impl:93d2ba154218"
+   ],
+   "n": 18,
+   "text": "grid_stride_vectorized improved elementwise slots in 18 of 19 recorded attempts on sm_89, median 1.13x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "implicit_gemm",
+   "op_class": "conv",
+   "effect": "helps",
+   "scope": "cuda:sm_75",
+   "targets": [
+    "cuda:sm_75"
+   ],
+   "evidence": [
+    "07b7f74c3128",
+    "610e94841002",
+    "e0f8e6c77298",
+    "167516adc096",
+    "47c91d0770a0",
+    "394eab18862f",
+    "f402c2341f39",
+    "4e9635030563",
+    "impl:84d021eaa200",
+    "impl:961a0d654c6a",
+    "impl:0a74ae3f2dbc",
+    "impl:09fa174e7df3",
+    "impl:369ce1b724c1",
+    "impl:2006da9a217f",
+    "impl:524781c698d9",
+    "impl:60c823cef353"
+   ],
+   "n": 16,
+   "text": "implicit_gemm improved conv slots in 16 of 19 recorded attempts on sm_75, median 1.33x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "launch_configuration_tuning",
+   "op_class": "conv",
+   "effect": "helps",
+   "scope": "cuda:sm_75",
+   "targets": [
+    "cuda:sm_75"
+   ],
+   "evidence": [
+    "f0fff198e456",
+    "834ee691e0b6",
+    "a3a827378275",
+    "6320f9cceedd",
+    "7591f611e9fe",
+    "cf68672d5135",
+    "c60781e57db7",
+    "71f2c646b869",
+    "impl:ea91ca9fed34",
+    "impl:074625f49055",
+    "impl:090b69541524",
+    "impl:5f7d837fe0bf",
+    "impl:7b288076ab85",
+    "impl:e41c9f9df8be",
+    "impl:93f5c5fb01e7",
+    "impl:542c95bee016"
+   ],
+   "n": 16,
+   "text": "launch_configuration_tuning improved conv slots in 16 of 20 recorded attempts on sm_75, median 11.81x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "launch_configuration_tuning",
+   "op_class": "elementwise",
+   "effect": "helps",
+   "scope": "nvidia_gpu",
+   "targets": [
+    "cuda:sm_75",
+    "cuda:sm_89"
+   ],
+   "evidence": [
+    "cd05116957b2",
+    "f902b7bd33f4",
+    "4b2d13c5d8da",
+    "ebf0765f6b27",
+    "impl:54b387bf6f80",
+    "impl:b89eae4a5f16",
+    "impl:13ebeaa2a974",
+    "ae6130f65834",
+    "a181d35b42c0",
+    "0504bc542587",
+    "8728af82d61f",
+    "b9b996b1f7bc",
+    "c734f1f71200",
+    "3e537869d9f0",
+    "66e3be677700",
+    "400276fccee7",
+    "c8a1af89f24f",
+    "impl:cf5ce98b7708",
+    "impl:8f5f594a5bbf",
+    "impl:b2b6b2fb1bdd",
+    "impl:c92a080d4b39",
+    "impl:ca16ac4f569a",
+    "impl:498f757afeae",
+    "impl:6d1ddf2be512",
+    "impl:07ef3433df98"
+   ],
+   "n": 25,
+   "text": "launch_configuration_tuning improved elementwise slots in 25 of 26 recorded attempts on sm_75, sm_89, median 1.09x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "launch_configuration_tuning",
+   "op_class": "gemm",
+   "effect": "helps",
+   "scope": "cuda:sm_89",
+   "targets": [
+    "cuda:sm_89"
+   ],
+   "evidence": [
+    "fdd73f3b3bbe",
+    "impl:b0c33931ca32"
+   ],
+   "n": 2,
+   "text": "launch_configuration_tuning improved gemm slots in 2 of 3 recorded attempts on sm_89, median 1.28x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "launch_configuration_tuning",
+   "op_class": "reduction",
+   "effect": "helps",
+   "scope": "cuda:sm_75",
+   "targets": [
+    "cuda:sm_75"
+   ],
+   "evidence": [
+    "9642e962fd31",
+    "2040b96cfdde",
+    "052768311b06",
+    "impl:3294ca5a8ca4",
+    "impl:304e16df2d6a",
+    "impl:a5cbeed9f1a9"
+   ],
+   "n": 6,
+   "text": "launch_configuration_tuning improved reduction slots in 6 of 7 recorded attempts on sm_75, median 2.94x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "loop_unrolling_and_ilp",
+   "op_class": "conv",
+   "effect": "helps",
+   "scope": "nvidia_gpu",
+   "targets": [
+    "cuda:sm_75",
+    "cuda:sm_89"
+   ],
+   "evidence": [
+    "7daf9154d2ae",
+    "a079f0519135",
+    "8647b8d57f34",
+    "fe72e3e56fb5",
+    "52c9679d5809",
+    "eaedb9c63b91",
+    "ea781ae417ff",
+    "5085dffb7e42",
+    "b6e95b05666d",
+    "impl:40b18d842a19",
+    "impl:a31f98c0bfce",
+    "impl:f0177bbb66bc",
+    "impl:c7284d958cfb",
+    "impl:248642c94f90",
+    "impl:5752e480b469",
+    "57474dfb98cf",
+    "3b6117722ca4",
+    "1902b2fbe62f",
+    "6113ab3dd1bc",
+    "48645b34206b",
+    "19af044ad4d3",
+    "e8c5d351a387",
+    "9a5779dc90ae",
+    "193845ab3554",
+    "f4f31ff5bbeb",
+    "64d282721190",
+    "8d46a90a9501",
+    "b812b189f434",
+    "cd6be870c103",
+    "b5e01f9a6dfc",
+    "570d15a5d08b",
+    "91e50bf9e31c",
+    "9aa7f549082d",
+    "e878e351ca78",
+    "61772416c696",
+    "077ebe5e5802",
+    "2bffe98391bf",
+    "a745b1615a5a",
+    "7a775416e4c8",
+    "8d5312a4b034",
+    "8351f4bd5698",
+    "425c23fea252",
+    "6920a0bda3df",
+    "3c529f883c8d",
+    "cf2861fae244",
+    "d83bb956e611",
+    "9165d6b12fc4",
+    "4ae22a31f8d1",
+    "16f943466a7b",
+    "impl:f3e3ec010417",
+    "impl:37fa85a01c79",
+    "impl:8d7e8e887faa",
+    "impl:31d1bf0210db",
+    "impl:8074004d6d72",
+    "impl:237019865792",
+    "impl:a92d5be6384e",
+    "impl:ef2cbd252487",
+    "impl:7bc62315eeec",
+    "impl:6d4c01ade42f",
+    "impl:ce9e3082ccd8",
+    "impl:e622d5c7aafa",
+    "impl:d6b5d5af5bb2",
+    "impl:65e2e3e7162f",
+    "impl:0067cb7e4db5"
+   ],
+   "n": 80,
+   "text": "loop_unrolling_and_ilp improved conv slots in 80 of 105 recorded attempts on sm_75, sm_89, median 1.32x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "loop_unrolling_and_ilp",
+   "op_class": "elementwise",
+   "effect": "helps",
+   "scope": "nvidia_gpu",
+   "targets": [
+    "cuda:sm_75",
+    "cuda:sm_89"
+   ],
+   "evidence": [
+    "b90712230a9e",
+    "5b7352a2c730",
+    "77727f60d37f",
+    "ea702f0a2df3",
+    "bb4144e685ab",
+    "cb4791852593",
+    "e58d4d2017c8",
+    "impl:b47a93f97702",
+    "impl:9d62cfc15675",
+    "impl:5126fc02fb83",
+    "impl:6c86c0d91d48",
+    "impl:ca6b4b3d0f51",
+    "impl:1a023d455cfc",
+    "5cbc9a25ee3e",
+    "b32e2f996bfc",
+    "c54cc3b046ce",
+    "317f7a332371",
+    "ac181d9ea72b",
+    "5c3c78e07984",
+    "e292a357c45c",
+    "3a329acab7de",
+    "b5e2f3af16b6",
+    "b0149e430338",
+    "0a56ee12a09b",
+    "impl:d23e82a52465",
+    "impl:f38b4e513286",
+    "impl:c1f785ad8d7f",
+    "impl:fcc1286b43b5",
+    "impl:1e8fea01a1f6",
+    "impl:102704bd15f7",
+    "impl:fbcc4edfc60a",
+    "impl:8d78b9c47b97",
+    "impl:9bf2006bc457"
+   ],
+   "n": 33,
+   "text": "loop_unrolling_and_ilp improved elementwise slots in 33 of 38 recorded attempts on sm_75, sm_89, median 1.12x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "loop_unrolling_and_ilp",
+   "op_class": "other",
+   "effect": "helps",
+   "scope": "cuda:sm_75",
+   "targets": [
+    "cuda:sm_75"
+   ],
+   "evidence": [
+    "a24254c3f976",
+    "25cc79033c85",
+    "82d0689268d7",
+    "impl:7e90b9464aca",
+    "impl:015270b1a1ca",
+    "impl:237233f0160f"
+   ],
+   "n": 6,
+   "text": "loop_unrolling_and_ilp improved other slots in 6 of 6 recorded attempts on sm_75, median 29.12x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "loop_unrolling_and_ilp",
+   "op_class": "reduction",
+   "effect": "helps",
+   "scope": "cuda:sm_75",
+   "targets": [
+    "cuda:sm_75"
+   ],
+   "evidence": [
+    "7362779f1570",
+    "0d651da97012",
+    "impl:abb55303bebd",
+    "impl:95c3471da337"
+   ],
+   "n": 4,
+   "text": "loop_unrolling_and_ilp improved reduction slots in 4 of 4 recorded attempts on sm_75, median 1.78x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "memory_coalescing",
+   "op_class": "conv",
+   "effect": "helps",
+   "scope": "cuda:sm_89",
+   "targets": [
+    "cuda:sm_89"
+   ],
+   "evidence": [
+    "8bdb67a226ec",
+    "bf47995cbc4a",
+    "3629724c8d83",
+    "5a413762226b",
+    "1199e01225ac",
+    "2310a4d370e6",
+    "86570854d169",
+    "90724c981503",
+    "90342a2e9706",
+    "12585dc2071a",
+    "impl:dece7887d067",
+    "impl:176c4cf50358",
+    "impl:06d096e98d40",
+    "impl:3f5c488a932f",
+    "impl:70c1f21784a9",
+    "impl:71ec3d8408fc",
+    "impl:e92084289f48",
+    "impl:1fc7acf32c96",
+    "impl:4a756dcc7792"
+   ],
+   "n": 19,
+   "text": "memory_coalescing improved conv slots in 19 of 27 recorded attempts on sm_89, median 1.36x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "memory_coalescing",
+   "op_class": "elementwise",
+   "effect": "helps",
+   "scope": "nvidia_gpu",
+   "targets": [
+    "cuda:sm_75",
+    "cuda:sm_89"
+   ],
+   "evidence": [
+    "0d2b1fc1776a",
+    "7256aa1e0e63",
+    "impl:db27def92a4c",
+    "impl:89ac1bff057f",
+    "cb66856a1bcd",
+    "6acffd02c62a",
+    "987378d63f00",
+    "0ceb52e7020a",
+    "a6bdd46e78d0",
+    "6ab918d02d01",
+    "96ea1124a031",
+    "fce0be49968c",
+    "cc498353c916",
+    "4b85d36d6d39",
+    "869d1797448f",
+    "11d27dbc063f",
+    "impl:f4787b2307fd",
+    "impl:35c10cfc02b1",
+    "impl:318a43dd16fd",
+    "impl:d5f73655fcb9",
+    "impl:d204792020c6",
+    "impl:9199bc9a7692",
+    "impl:f6b54a738247",
+    "impl:854cdb8d8e25",
+    "impl:a22a0df5843a",
+    "impl:6450713122fe",
+    "impl:aeff641c0947"
+   ],
+   "n": 27,
+   "text": "memory_coalescing improved elementwise slots in 27 of 30 recorded attempts on sm_75, sm_89, median 1.12x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "memory_coalescing",
+   "op_class": "gemm",
+   "effect": "helps",
+   "scope": "nvidia_gpu",
+   "targets": [
+    "cuda:sm_75",
+    "cuda:sm_89"
+   ],
+   "evidence": [
+    "121a02ace205",
+    "9c6d60497826",
+    "e96bb9cf14f6",
+    "impl:d1ed165f33de",
+    "impl:4aa554bfd4d9",
+    "impl:a309f9697275",
+    "b16365157210",
+    "d0d8e62dbf51",
+    "0ac70c250e8a",
+    "c4aefe3d4b4c",
+    "d5d611c59b96",
+    "adc609ec25b4",
+    "8c8d7a2614b4",
+    "ab3684c76bca",
+    "40b5ca1d266c",
+    "d64ae4858d36",
+    "b8197c6d0dbd",
+    "f7cfdadc3548",
+    "aa1e51fa82b4",
+    "2359e6dbb0b7",
+    "b0eba1226b81",
+    "4edb8cc0fa66",
+    "93e400499122",
+    "3881e0f5f498",
+    "e657c781ff5d",
+    "impl:c2ca34a569bd",
+    "impl:67b027873d41",
+    "impl:110a204348fc",
+    "impl:32ea4e4555ef",
+    "impl:4fc6c3d6d0fa",
+    "impl:2a495c3e52df",
+    "impl:616aa5e417da",
+    "impl:22ac0938610c",
+    "impl:4eaabd3ae6ef",
+    "impl:bb715e7a887a",
+    "impl:ad165e25488c",
+    "impl:82646fc850af",
+    "impl:488a35e3a32d",
+    "impl:9ef60503e2e5",
+    "impl:2b976fc8917a",
+    "impl:f4a825f42bd2",
+    "impl:9c2bf1843964"
+   ],
+   "n": 42,
+   "text": "memory_coalescing improved gemm slots in 42 of 54 recorded attempts on sm_75, sm_89, median 30.69x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "memory_coalescing",
+   "op_class": "other",
+   "effect": "helps",
+   "scope": "cuda:sm_75",
+   "targets": [
+    "cuda:sm_75"
+   ],
+   "evidence": [
+    "476eee203d72",
+    "b9af3560b058",
+    "6cb7906f8795",
+    "impl:28b586ac1f75",
+    "impl:8dea2ab96dec",
+    "impl:3807f20fdc66"
+   ],
+   "n": 6,
+   "text": "memory_coalescing improved other slots in 6 of 6 recorded attempts on sm_75, median 27.21x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "memory_coalescing",
+   "op_class": "reduction",
+   "effect": "helps",
+   "scope": "cuda:sm_89",
+   "targets": [
+    "cuda:sm_89"
+   ],
+   "evidence": [
+    "3b0bf2a6a99f",
+    "d06b67c1e0a7",
+    "fea31aa2c787",
+    "91da2293c3ae",
+    "5f6c1d144dfd",
+    "4813aeac36e6",
+    "impl:11ae95ce9c74",
+    "impl:b1933eb7d605",
+    "impl:44c6b6fc7e6c",
+    "impl:40d060e3e988",
+    "impl:0d0e2d1b2032"
+   ],
+   "n": 11,
+   "text": "memory_coalescing improved reduction slots in 11 of 15 recorded attempts on sm_89, median 2.38x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "read_only_cache_and_restrict",
+   "op_class": "conv",
+   "effect": "helps",
+   "scope": "nvidia_gpu",
+   "targets": [
+    "cuda:sm_75",
+    "cuda:sm_89"
+   ],
+   "evidence": [
+    "a6961007ec17",
+    "a88df3c6d31c",
+    "d26cbeaebf8f",
+    "1cbe781a9c0f",
+    "a51cfeac398f",
+    "7214ae07b947",
+    "f587e1cc249f",
+    "8f2b53d4192e",
+    "impl:c997ccc2ccfe",
+    "impl:5186ef63313c",
+    "impl:b3eefd1e1bc3",
+    "impl:fa23d3dc2a57",
+    "impl:9105187f3344",
+    "impl:92f82fc1731b",
+    "impl:b45b44b13286",
+    "impl:1efe555dad8f",
+    "e2bf58784ac5",
+    "18a5ccd5e8cb",
+    "e2341f634d7a",
+    "a1008b5ac0ab",
+    "4bf46ee35a0e",
+    "4d870d00669a",
+    "b57efdd0bec0",
+    "5eb9c73c8650",
+    "00fa6370c810",
+    "1d762a0935ee",
+    "ef2ff0b926b6",
+    "7e63f9d5aa8a",
+    "db3cc3cfb686",
+    "impl:b0a7b7a74637",
+    "impl:448b98e31235",
+    "impl:b254e70ee81b",
+    "impl:ac09077326dd",
+    "impl:097d4e5af600",
+    "impl:024fb15747d0",
+    "impl:f081cbd58038",
+    "impl:96fdef6674d6",
+    "impl:bba5b852c724",
+    "impl:75f550086798",
+    "impl:7ca38078a7fb",
+    "impl:bb923497e91e"
+   ],
+   "n": 41,
+   "text": "read_only_cache_and_restrict improved conv slots in 41 of 50 recorded attempts on sm_75, sm_89, median 4.63x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "read_only_cache_and_restrict",
+   "op_class": "elementwise",
+   "effect": "helps",
+   "scope": "nvidia_gpu",
+   "targets": [
+    "cuda:sm_75",
+    "cuda:sm_89"
+   ],
+   "evidence": [
+    "6ea40c06f096",
+    "53786e8d2df0",
+    "9ddef139316b",
+    "impl:e0d1ae886c11",
+    "impl:374f7a476aee",
+    "impl:d38d8ed90253",
+    "424097e9ba9e",
+    "1c9c9cd4d3c9",
+    "940deaa8d7e9",
+    "8fd8b07f84ff",
+    "235fe1150bed",
+    "f5469d738634",
+    "834f9360d495",
+    "02aeff02afff",
+    "856fcb2848be",
+    "f7054be49801",
+    "impl:c294366f1799",
+    "impl:1e04ada40738",
+    "impl:4bd1a00fc033",
+    "impl:eb42640b0dec",
+    "impl:520df137ac8e",
+    "impl:223fcf112759",
+    "impl:9051053e5841",
+    "impl:03b094170981",
+    "impl:dcc5e77ceefa",
+    "impl:e4ee21561084"
+   ],
+   "n": 26,
+   "text": "read_only_cache_and_restrict improved elementwise slots in 26 of 27 recorded attempts on sm_75, sm_89, median 1.15x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "read_only_cache_and_restrict",
+   "op_class": "gemm",
+   "effect": "helps",
+   "scope": "nvidia_gpu",
+   "targets": [
+    "cuda:sm_75",
+    "cuda:sm_89"
+   ],
+   "evidence": [
+    "28bab583c9cc",
+    "07ab89681949",
+    "44f34db299a8",
+    "9817c61d730f",
+    "impl:c42b3dcadc31",
+    "impl:1e25b768ef57",
+    "ec59c306cce8",
+    "6bcc2a83b268",
+    "e3b013cf9753",
+    "0928d63973bc",
+    "bb6310a54dc6",
+    "5998444b146a",
+    "76bafb54f5f9",
+    "abd5639c6555",
+    "9293e4ef67f0",
+    "12bbd41a60ec",
+    "09378fcd31a5",
+    "7c998cf7b1c6",
+    "00fc4f880cc4",
+    "c0abd1ba6782",
+    "ad2655a3740c",
+    "26c6535a1870",
+    "213029eaefbc",
+    "impl:4fd905ed9c06",
+    "impl:f44b7089b75f",
+    "impl:5507587ffd75",
+    "impl:5633d58999cb",
+    "impl:990c86df9bf9",
+    "impl:b8333f48aae7",
+    "impl:fa56d01894ef",
+    "impl:0daef7e39e18",
+    "impl:b59e90336cb3",
+    "impl:d3e83df29c0d",
+    "impl:e0796a8ece80",
+    "impl:2f9100f47d66",
+    "impl:a4406b14cb17",
+    "impl:20a8a06df6cc",
+    "impl:4269a2fdc638"
+   ],
+   "n": 38,
+   "text": "read_only_cache_and_restrict improved gemm slots in 38 of 50 recorded attempts on sm_75, sm_89, median 31.58x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "read_only_cache_and_restrict",
+   "op_class": "other",
+   "effect": "helps",
+   "scope": "cuda:sm_75",
+   "targets": [
+    "cuda:sm_75"
+   ],
+   "evidence": [
+    "7518e6ae1fa3",
+    "02135f9d5703",
+    "impl:d59dc1ef1c5c",
+    "impl:735e3cebdc76"
+   ],
+   "n": 4,
+   "text": "read_only_cache_and_restrict improved other slots in 4 of 5 recorded attempts on sm_75, median 1.74x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "read_only_cache_and_restrict",
+   "op_class": "reduction",
+   "effect": "helps",
+   "scope": "nvidia_gpu",
+   "targets": [
+    "cuda:sm_75",
+    "cuda:sm_89"
+   ],
+   "evidence": [
+    "43006ba7289c",
+    "4bd201e2856e",
+    "impl:33fe3afaa56b",
+    "impl:2e9bd42f401b",
+    "0d5f9ebda91c",
+    "6d9711426d9d",
+    "d8b413364713",
+    "652c69d61cb8",
+    "8ef213a6fef7",
+    "3dda3171cd69",
+    "impl:f70422217c54",
+    "impl:ddfcd00f8937",
+    "impl:5aa60ff0fbc1",
+    "impl:fc7468e979d5",
+    "impl:3ed35e1bb742",
+    "impl:26b5d79d381e"
+   ],
+   "n": 16,
+   "text": "read_only_cache_and_restrict improved reduction slots in 16 of 18 recorded attempts on sm_75, sm_89, median 2.36x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "register_blocking",
+   "op_class": "conv",
+   "effect": "helps",
+   "scope": "cuda:sm_89",
+   "targets": [
+    "cuda:sm_89"
+   ],
+   "evidence": [
+    "3221ffaa6628",
+    "impl:2658d582f304"
+   ],
+   "n": 2,
+   "text": "register_blocking improved conv slots in 2 of 3 recorded attempts on sm_89, median 1.32x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "register_blocking",
+   "op_class": "gemm",
+   "effect": "helps",
+   "scope": "cuda:sm_75",
+   "targets": [
+    "cuda:sm_75"
+   ],
+   "evidence": [
+    "46d8048be0c6",
+    "feaca1c8f7b0",
+    "impl:867405e53423",
+    "impl:df8c9ecb536c"
+   ],
+   "n": 4,
+   "text": "register_blocking improved gemm slots in 4 of 6 recorded attempts on sm_75, median 6.47x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "shared_memory_tiling",
+   "op_class": "conv",
+   "effect": "helps",
+   "scope": "cuda:sm_75",
+   "targets": [
+    "cuda:sm_75"
+   ],
+   "evidence": [
+    "acfab860c09f",
+    "ef050660a4bf",
+    "8420d697a5a1",
+    "e47d66d9b4c2",
+    "0601b26fbe64",
+    "e21d6987effe",
+    "68002be319f6",
+    "4d4d144e04b5",
+    "impl:263e3ee48260",
+    "impl:4ca16f859cf9",
+    "impl:76b9e502ff60",
+    "impl:bd58e296b9bf",
+    "impl:d242232de479",
+    "impl:400a2828d33e",
+    "impl:2e45ee4ecd78"
+   ],
+   "n": 15,
+   "text": "shared_memory_tiling improved conv slots in 15 of 19 recorded attempts on sm_75, median 1.23x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "shared_memory_tiling",
+   "op_class": "gemm",
+   "effect": "helps",
+   "scope": "cuda:sm_75",
+   "targets": [
+    "cuda:sm_75"
+   ],
+   "evidence": [
+    "53ac3b859aaf",
+    "impl:d034d16da1cb"
+   ],
+   "n": 2,
+   "text": "shared_memory_tiling improved gemm slots in 2 of 3 recorded attempts on sm_75, median 16.08x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "single_pass_fusion",
+   "op_class": "reduction",
+   "effect": "helps",
+   "scope": "cuda:sm_75",
+   "targets": [
+    "cuda:sm_75"
+   ],
+   "evidence": [
+    "5dd0ab9aaac9",
+    "616026ebb3c2",
+    "impl:a8f56d994c55",
+    "impl:fdf4b5add3a3"
+   ],
+   "n": 4,
+   "text": "single_pass_fusion improved reduction slots in 4 of 4 recorded attempts on sm_75, median 13.98x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "tensor_core_mma",
+   "op_class": "conv",
+   "effect": "helps",
+   "scope": "cuda:sm_89",
+   "targets": [
+    "cuda:sm_89"
+   ],
+   "evidence": [
+    "9ab847c9df9c",
+    "82ce86c8d761",
+    "impl:a148c6ee9b9e",
+    "impl:ec04a79b4ef4"
+   ],
+   "n": 4,
+   "text": "tensor_core_mma improved conv slots in 4 of 4 recorded attempts on sm_89, median 12.58x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "thread_coarsening",
+   "op_class": "conv",
+   "effect": "helps",
+   "scope": "cuda:sm_89",
+   "targets": [
+    "cuda:sm_89"
+   ],
+   "evidence": [
+    "d693c5aa17b7",
+    "fa64e26d3fa1",
+    "3f25ed6b486d",
+    "5d0216efdd6c",
+    "9301f4cf430d",
+    "e045e62efb58",
+    "856ac6944591",
+    "fee65c3001d4",
+    "6dc97fe561ab",
+    "2722350780ba",
+    "f9ae72acaafe",
+    "93d1bcc8553c",
+    "d09a8654a290",
+    "36e3f12f6ae0",
+    "1a51ff8fcf68",
+    "517b78688157",
+    "a1d1996ba0e4",
+    "21d15e92a789",
+    "ec13551c7241",
+    "9d8ea230117c",
+    "57b6d3f0e503",
+    "e44cd5ec53ef",
+    "09ad9b740b18",
+    "11a2df0178a8",
+    "b8c6747bf57c",
+    "3fb83645c024",
+    "d388a00ae261",
+    "acdf7b407018",
+    "c2b8c3308136",
+    "b8611c1d0368",
+    "d6c3b9ff7c31",
+    "impl:47a033d10772",
+    "impl:fe5fc7446d1f",
+    "impl:b68a03ec7727",
+    "impl:926e744186a9",
+    "impl:182cdc7509de",
+    "impl:83f9cb00e0f2",
+    "impl:3b39967826b1",
+    "impl:efd42b041e16",
+    "impl:03566f7804e9",
+    "impl:f31a9de18cdc",
+    "impl:c9a429f7be25",
+    "impl:f56a2c8808a0",
+    "impl:1dea16159791",
+    "impl:223f7026d986",
+    "impl:3998d6d74f69",
+    "impl:c5b7209aba36",
+    "impl:6940bdf42549",
+    "impl:635f17c6c68e",
+    "impl:85b45e570b88",
+    "impl:4ee73086faea",
+    "impl:aeac7b272f45",
+    "impl:a0a5c5c3e52e",
+    "impl:0416b033aa87",
+    "impl:24ff686e736a",
+    "impl:b5c9b6818484",
+    "impl:83ff2ff4aff9",
+    "impl:6c857142f909",
+    "impl:23b92a28a5a1",
+    "impl:890c84683568"
+   ],
+   "n": 60,
+   "text": "thread_coarsening improved conv slots in 60 of 67 recorded attempts on sm_89, median 2.39x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "thread_coarsening",
+   "op_class": "elementwise",
+   "effect": "helps",
+   "scope": "cuda:sm_89",
+   "targets": [
+    "cuda:sm_89"
+   ],
+   "evidence": [
+    "3c4317caf002",
+    "e18dfdafa4c0",
+    "af59fa958fe7",
+    "fa26ca152509",
+    "84006786bbd2",
+    "68dce0f417c8",
+    "85411e77173f",
+    "e05c8cab96bd",
+    "9aab60365d73",
+    "impl:e0bf0f125fa6",
+    "impl:bd9d0e02df1c",
+    "impl:a0cbed8e9cee",
+    "impl:0e6be28830fc",
+    "impl:7b0c9f4377df",
+    "impl:f38870288b58",
+    "impl:7d34931f8ef6",
+    "impl:240dbf9faea3"
+   ],
+   "n": 17,
+   "text": "thread_coarsening improved elementwise slots in 17 of 19 recorded attempts on sm_89, median 2.17x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "thread_coarsening",
+   "op_class": "gemm",
+   "effect": "helps",
+   "scope": "cuda:sm_75",
+   "targets": [
+    "cuda:sm_75"
+   ],
+   "evidence": [
+    "8acc34877417",
+    "7ef0e5b9440a",
+    "47757c4967dc",
+    "f602efd81a3c",
+    "8d57b7b22092",
+    "65b004c9b1ed",
+    "ea44b6bcfa39",
+    "6ac81e53816e",
+    "b7a899b37d09",
+    "8e5727f448ae",
+    "02af5d57a8e2",
+    "1c9451705d7c",
+    "14384ed826f8",
+    "impl:e56b518220c6",
+    "impl:0fb0af424182",
+    "impl:741788c228ad",
+    "impl:7c39bda03abc",
+    "impl:de1288f03cf0",
+    "impl:f5519278fb9d",
+    "impl:d56c2b41745c",
+    "impl:d4829f22d686",
+    "impl:1366c4444873",
+    "impl:a7e68e2b8e02",
+    "impl:fb55a7d692fa",
+    "impl:d7898c54215c",
+    "impl:1ee944c982c8"
+   ],
+   "n": 26,
+   "text": "thread_coarsening improved gemm slots in 26 of 30 recorded attempts on sm_75, median 55.66x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "vectorized_memory_access",
+   "op_class": "conv",
+   "effect": "helps",
+   "scope": "cuda:sm_75",
+   "targets": [
+    "cuda:sm_75"
+   ],
+   "evidence": [
+    "cc661692b740",
+    "746be67a265d",
+    "d8d81619fcbd",
+    "290285b5b443",
+    "76b2f389533e",
+    "impl:970e4a21f479",
+    "impl:7a0aaf74d0dc",
+    "impl:cd04a1cf6517",
+    "impl:ec9f8de2b47d",
+    "impl:4dcb7f55e9ac"
+   ],
+   "n": 10,
+   "text": "vectorized_memory_access improved conv slots in 10 of 14 recorded attempts on sm_75, median 1.11x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "vectorized_memory_access",
+   "op_class": "elementwise",
+   "effect": "helps",
+   "scope": "nvidia_gpu",
+   "targets": [
+    "cuda:sm_75",
+    "cuda:sm_89"
+   ],
+   "evidence": [
+    "971387f24f4e",
+    "df5626ebe379",
+    "fffdb043cb92",
+    "impl:ba9bdb850be6",
+    "impl:03f0e4451242",
+    "impl:b270474e29e9",
+    "77be074f7880",
+    "cde1d36036f1",
+    "fda607bbf686",
+    "3646377cc86a",
+    "efd4ca0bac11",
+    "7ead96860585",
+    "bc5cf8400f51",
+    "8fcb4c782e3c",
+    "ca0374c79a75",
+    "impl:02efb4ed4c04",
+    "impl:c6ad8002052f",
+    "impl:58e5733fd51c",
+    "impl:6cce75dbb77f",
+    "impl:3596a789685c",
+    "impl:6a07c8e7e49f",
+    "impl:040bcbd7fba6",
+    "impl:f54b4ff31667"
+   ],
+   "n": 23,
+   "text": "vectorized_memory_access improved elementwise slots in 23 of 24 recorded attempts on sm_75, sm_89, median 1.11x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "vectorized_memory_access",
+   "op_class": "gemm",
+   "effect": "helps",
+   "scope": "nvidia_gpu",
+   "targets": [
+    "cuda:sm_75",
+    "cuda:sm_89"
+   ],
+   "evidence": [
+    "edae03f9b95a",
+    "02755aab4f5b",
+    "23736edf467d",
+    "470b72f8b0bc",
+    "impl:799f8fed785e",
+    "impl:fe6545089f73",
+    "792afb43b13a",
+    "66cc84fcab92",
+    "1741f0b2d9ef",
+    "9459de238f43",
+    "03c0499d7945",
+    "712335d26a3d",
+    "9f0766c42620",
+    "29e7221be1a6",
+    "6e5debfabc50",
+    "6b029403cd3a",
+    "967c9543e07a",
+    "7636a00223d8",
+    "768dd9289e9f",
+    "503af91c7ff9",
+    "f9ea4ebfa318",
+    "91b53db5f399",
+    "397770f9fd91",
+    "fada3dd9cac6",
+    "7ebde18b1dc1",
+    "5f1b4980d51c",
+    "829ff59ed9ee",
+    "cfcaf6d17c00",
+    "6a25245d5b47",
+    "c2e7ffc3d0f8",
+    "fdf76b603e29",
+    "a4312dcc23c9",
+    "305041757804",
+    "impl:a89ea8b2dfe0",
+    "impl:437e44475a0e",
+    "impl:8dd4b62a7170",
+    "impl:fc36a45f5214",
+    "impl:313c4f32d307",
+    "impl:ed3e33f7198a",
+    "impl:6a6badc1521d",
+    "impl:c3de4fccbf84",
+    "impl:9a67ede42b84",
+    "impl:23064a283b8f",
+    "impl:23c8b53bfad0",
+    "impl:4b80fca7b1c6",
+    "impl:69e9acd95874",
+    "impl:4842fa641821",
+    "impl:b19da5e02e0a",
+    "impl:951c2e315dbf",
+    "impl:a93bc8138b84",
+    "impl:b4ea38fa19bb",
+    "impl:8b9bfc059bda",
+    "impl:26433b748bd9",
+    "impl:2a459b35ed03",
+    "impl:ede9e24f01dc",
+    "impl:13353b801d17",
+    "impl:bb4399165276"
+   ],
+   "n": 57,
+   "text": "vectorized_memory_access improved gemm slots in 57 of 72 recorded attempts on sm_75, sm_89, median 23.96x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "vectorized_memory_access",
+   "op_class": "other",
+   "effect": "helps",
+   "scope": "cuda:sm_75",
+   "targets": [
+    "cuda:sm_75"
+   ],
+   "evidence": [
+    "4d5f40c7e5b1",
+    "d6fb58bbd43d",
+    "impl:3f45a882bc1d",
+    "impl:b9c4e4d4c3f2"
+   ],
+   "n": 4,
+   "text": "vectorized_memory_access improved other slots in 4 of 5 recorded attempts on sm_75, median 1.23x."
+  },
+  {
+   "kind": "applicability",
+   "technique": "vectorized_memory_access",
+   "op_class": "reduction",
+   "effect": "helps",
+   "scope": "nvidia_gpu",
+   "targets": [
+    "cuda:sm_75",
+    "cuda:sm_89"
+   ],
+   "evidence": [
+    "0cfad0524a74",
+    "impl:c197fd6d8848",
+    "9adb949a97f2",
+    "4704ddf3f56b",
+    "9eb342565361",
+    "e8d378fb358f",
+    "0c83bbe1bc92",
+    "f26fa5e2e6fc",
+    "8e7d151943c7",
+    "impl:dde661fb229c",
+    "impl:e1c040bcee7b",
+    "impl:ccc7e4bdf402",
+    "impl:3b058d7f7f13",
+    "impl:665889993fba",
+    "impl:df13e90d049c",
+    "impl:9d867675f0a1"
+   ],
+   "n": 16,
+   "text": "vectorized_memory_access improved reduction slots in 16 of 22 recorded attempts on sm_75, sm_89, median 2.84x."
+  }
+ ]
+}

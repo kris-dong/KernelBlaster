@@ -1,37 +1,302 @@
 {
- "_doc": "Families and targets (knowledge_architecture.md section 2); keys are <manifest target>:<TargetProfile.arch_label>, peaks match the agents' ARCH_PEAKS / OPENCL_PEAKS, which fill in for targets missing here. Levels are fixed in code; this file is data. Peaks are fp32 GFLOP/s and DRAM GB/s; width = parallel lanes the machine needs to be full (SMs x max resident threads, subgroups, VLEN/32 lanes); launch_us = per-kernel launch/sync floor.",
- "families": {
-  "simt_gpu": {"description": "SIMT GPUs: CUDA (NVIDIA), OpenCL (Adreno)", "backends": ["cuda", "opencl"]},
-  "vector_cpu": {"description": "in-order CPUs with a vector unit (RISC-V V)", "backends": ["riscv", "rvv"]},
-  "systolic": {"description": "systolic-array accelerators (Gemmini)", "backends": ["gemmini"]}
+ "_doc": "Scope tree (knowledge_architecture.md section 2): scope nodes (id -> parent, description; root 'universal'; optional kappa = shrinkage strength toward the parent), targets hanging off any node, and the backend -> node map that places unknown targets. Target keys are <manifest target>:<TargetProfile.arch_label>; peaks are fp32 GFLOP/s and DRAM GB/s and match the agents' ARCH_PEAKS / OPENCL_PEAKS, which fill in for targets missing here; width = SMs x max resident threads; launch_us = per-kernel launch/sync floor; limits = per-target resource limits shown to retrieval and used by preconditions' authors. Nodes and targets added at run time live in the knowledge DB.",
+ "scopes": {
+  "simt_gpu": {
+   "parent": "universal",
+   "description": "SIMT GPUs: warps/wavefronts, on-chip shared/local memory, many cores"
+  },
+  "nvidia_gpu": {
+   "parent": "simt_gpu",
+   "description": "NVIDIA GPUs (CUDA): 32-wide warps, shared memory, NCU counters"
+  },
+  "turing": {
+   "parent": "nvidia_gpu",
+   "description": "Turing (sm_75): fp16 tensor cores, no cp.async, 64 KB smem/SM"
+  },
+  "ampere": {
+   "parent": "nvidia_gpu",
+   "description": "Ampere (sm_80, sm_86): cp.async, tf32/bf16 tensor cores"
+  },
+  "ada": {
+   "parent": "nvidia_gpu",
+   "description": "Ada Lovelace (sm_89): Ampere ISA, large L2, high fp32 rate"
+  },
+  "hopper": {
+   "parent": "nvidia_gpu",
+   "description": "Hopper (sm_90): TMA, wgmma, thread-block clusters"
+  },
+  "adreno": {
+   "parent": "simt_gpu",
+   "description": "Qualcomm Adreno (OpenCL): 64-wide waves, texture path, no tensor cores"
+  },
+  "vector_cpu": {
+   "parent": "universal",
+   "description": "in-order CPUs with a vector unit (RISC-V V)"
+  },
+  "systolic": {
+   "parent": "universal",
+   "description": "systolic-array accelerators (Gemmini)"
+  },
+  "rvv": {
+   "parent": "vector_cpu",
+   "description": "RISC-V V (Saturn): VLEN-agnostic strip-mined vectors, LMUL register grouping, segment loads"
+  },
+  "gemmini": {
+   "parent": "systolic",
+   "description": "Gemmini: 16x16 systolic array, 256 KiB scratchpad, 64 KiB accumulator, DMA mvin/mvout, im2col unit"
+  }
+ },
+ "backends": {
+  "cuda": "nvidia_gpu",
+  "opencl": "adreno",
+  "riscv": "rvv",
+  "rvv": "rvv",
+  "gemmini": "gemmini"
  },
  "targets": {
-  "cuda:sm_75": {"family": "simt_gpu", "name": "TITAN RTX", "peak_gflops": 16300.0, "peak_gbps": 672.0,
-                 "sms": 72, "threads_per_sm": 1024, "warp": 32, "smem_kb": 64, "l2_kb": 6144,
-                 "launch_us": 4.0, "profiler": "ncu"},
-  "cuda:sm_80": {"family": "simt_gpu", "name": "A100 40GB", "peak_gflops": 19500.0, "peak_gbps": 1555.0,
-                 "sms": 108, "threads_per_sm": 2048, "warp": 32, "smem_kb": 164, "l2_kb": 40960,
-                 "launch_us": 3.0, "profiler": "ncu"},
-  "cuda:sm_86": {"family": "simt_gpu", "name": "RTX 3090", "peak_gflops": 35600.0, "peak_gbps": 936.0,
-                 "sms": 82, "threads_per_sm": 1536, "warp": 32, "smem_kb": 100, "l2_kb": 6144,
-                 "launch_us": 3.0, "profiler": "ncu"},
-  "cuda:sm_89": {"family": "simt_gpu", "name": "L40S", "peak_gflops": 91600.0, "peak_gbps": 864.0,
-                 "sms": 142, "threads_per_sm": 1536, "warp": 32, "smem_kb": 100, "l2_kb": 98304,
-                 "launch_us": 3.0, "profiler": "ncu"},
-  "cuda:sm_90": {"family": "simt_gpu", "name": "H100 SXM", "peak_gflops": 67000.0, "peak_gbps": 3350.0,
-                 "sms": 132, "threads_per_sm": 2048, "warp": 32, "smem_kb": 228, "l2_kb": 51200,
-                 "launch_us": 3.0, "profiler": "ncu"},
-  "opencl:adreno650": {"family": "simt_gpu", "name": "Adreno 650 (QRB5165 / RB5)", "peak_gflops": 1228.0, "peak_gbps": 44.0,
-                       "sms": 2, "threads_per_sm": 1024, "warp": 64, "smem_kb": 32, "l2_kb": 1024,
-                       "launch_us": 10.0, "profiler": "opencl_profile"},
-  "opencl:adreno740": {"family": "simt_gpu", "name": "Adreno 740", "peak_gflops": 3000.0, "peak_gbps": 67.0,
-                       "sms": 6, "threads_per_sm": 1024, "warp": 64, "smem_kb": 32, "l2_kb": 1024,
-                       "launch_us": 10.0, "profiler": "opencl_profile", "aliases": ["opencl:adreno_740"]},
-  "rvv:vlen256": {"family": "vector_cpu", "name": "Saturn VLEN=256", "peak_gflops": 8.0, "peak_gbps": 16.0,
-                  "sms": 1, "threads_per_sm": 8, "warp": 8, "smem_kb": 32, "l2_kb": 512,
-                  "launch_us": 1.0, "profiler": "mcycle", "aliases": ["riscv:rvv-vlen256"]},
-  "gemmini:default": {"family": "systolic", "name": "Gemmini 16x16", "peak_gflops": 256.0, "peak_gbps": 16.0,
-                      "sms": 1, "threads_per_sm": 256, "warp": 16, "smem_kb": 256, "l2_kb": 512,
-                      "launch_us": 1.0, "profiler": "roofline"}
+  "cuda:sm_75": {
+   "node": "turing",
+   "name": "TITAN RTX",
+   "peak_gflops": 16300.0,
+   "peak_gbps": 672.0,
+   "sms": 72,
+   "threads_per_sm": 1024,
+   "warp": 32,
+   "smem_kb": 64,
+   "l2_kb": 6144,
+   "launch_us": 4.0,
+   "profiler": "ncu",
+   "limits": {
+    "regs_per_sm": 65536,
+    "max_regs_per_thread": 255,
+    "max_threads_per_block": 1024,
+    "smem_per_block_kb": 64,
+    "l1_kb": 96,
+    "tensor_cores": "fp16 (wmma m16n16k16, mma.sync m16n8k8)",
+    "cp_async": false,
+    "tf32": false
+   }
+  },
+  "cuda:sm_80": {
+   "node": "ampere",
+   "name": "A100 40GB",
+   "peak_gflops": 19500.0,
+   "peak_gbps": 1555.0,
+   "sms": 108,
+   "threads_per_sm": 2048,
+   "warp": 32,
+   "smem_kb": 164,
+   "l2_kb": 40960,
+   "launch_us": 3.0,
+   "profiler": "ncu",
+   "limits": {
+    "regs_per_sm": 65536,
+    "max_regs_per_thread": 255,
+    "max_threads_per_block": 1024,
+    "smem_per_block_kb": 163,
+    "l1_kb": 192,
+    "tensor_cores": "fp16/bf16/tf32/int8 (mma.sync m16n8k16)",
+    "cp_async": true,
+    "tf32": true
+   }
+  },
+  "cuda:sm_86": {
+   "node": "ampere",
+   "name": "RTX 3090",
+   "peak_gflops": 35600.0,
+   "peak_gbps": 936.0,
+   "sms": 82,
+   "threads_per_sm": 1536,
+   "warp": 32,
+   "smem_kb": 100,
+   "l2_kb": 6144,
+   "launch_us": 3.0,
+   "profiler": "ncu",
+   "limits": {
+    "regs_per_sm": 65536,
+    "max_regs_per_thread": 255,
+    "max_threads_per_block": 1024,
+    "smem_per_block_kb": 99,
+    "l1_kb": 128,
+    "tensor_cores": "fp16/bf16/tf32/int8",
+    "cp_async": true,
+    "tf32": true
+   }
+  },
+  "cuda:sm_89": {
+   "node": "ada",
+   "name": "L40S",
+   "peak_gflops": 91600.0,
+   "peak_gbps": 864.0,
+   "sms": 142,
+   "threads_per_sm": 1536,
+   "warp": 32,
+   "smem_kb": 100,
+   "l2_kb": 98304,
+   "launch_us": 3.0,
+   "profiler": "ncu",
+   "limits": {
+    "regs_per_sm": 65536,
+    "max_regs_per_thread": 255,
+    "max_threads_per_block": 1024,
+    "smem_per_block_kb": 99,
+    "l1_kb": 128,
+    "tensor_cores": "fp16/bf16/tf32/int8/fp8",
+    "cp_async": true,
+    "tf32": true
+   }
+  },
+  "cuda:sm_90": {
+   "node": "hopper",
+   "name": "H100 SXM",
+   "peak_gflops": 67000.0,
+   "peak_gbps": 3350.0,
+   "sms": 132,
+   "threads_per_sm": 2048,
+   "warp": 32,
+   "smem_kb": 228,
+   "l2_kb": 51200,
+   "launch_us": 3.0,
+   "profiler": "ncu",
+   "limits": {
+    "regs_per_sm": 65536,
+    "max_regs_per_thread": 255,
+    "max_threads_per_block": 1024,
+    "smem_per_block_kb": 227,
+    "l1_kb": 256,
+    "tensor_cores": "fp16/bf16/tf32/fp8 (wgmma, TMA)",
+    "cp_async": true,
+    "tf32": true
+   }
+  },
+  "opencl:adreno650": {
+   "node": "adreno",
+   "name": "Adreno 650 (QRB5165 / RB5)",
+   "peak_gflops": 1228.0,
+   "peak_gbps": 44.0,
+   "sms": 2,
+   "threads_per_sm": 1024,
+   "warp": 64,
+   "smem_kb": 32,
+   "l2_kb": 1024,
+   "launch_us": 10.0,
+   "profiler": "opencl_profile",
+   "limits": {
+    "max_work_group": 1024,
+    "wave": 64,
+    "local_mem_kb": 32,
+    "fp16_rate": 2.0,
+    "image_support": true,
+    "subgroups": "cl_qcom_reqd_sub_group_size (half/full wave)"
+   }
+  },
+  "opencl:adreno740": {
+   "node": "adreno",
+   "name": "Adreno 740",
+   "peak_gflops": 3000.0,
+   "peak_gbps": 67.0,
+   "sms": 6,
+   "threads_per_sm": 1024,
+   "warp": 64,
+   "smem_kb": 32,
+   "l2_kb": 1024,
+   "launch_us": 10.0,
+   "profiler": "opencl_profile",
+   "aliases": [
+    "opencl:adreno_740"
+   ],
+   "limits": {
+    "max_work_group": 1024,
+    "wave": 64,
+    "local_mem_kb": 32,
+    "fp16_rate": 2.0,
+    "image_support": true,
+    "subgroups": "cl_khr_subgroups"
+   }
+  },
+  "rvv:vlen128": {
+   "node": "rvv",
+   "name": "Saturn VLEN=128",
+   "peak_gflops": 4.0,
+   "peak_gbps": 16.0,
+   "sms": 1,
+   "threads_per_sm": 4,
+   "warp": 4,
+   "smem_kb": 32,
+   "l2_kb": 512,
+   "launch_us": 1.0,
+   "profiler": "mcycle",
+   "limits": {
+    "vlen": 128,
+    "elen": 64,
+    "lmul_max": 8,
+    "vregs": 32,
+    "l1d_kb": 32
+   }
+  },
+  "rvv:vlen256": {
+   "node": "rvv",
+   "name": "Saturn VLEN=256",
+   "peak_gflops": 8.0,
+   "peak_gbps": 16.0,
+   "sms": 1,
+   "threads_per_sm": 8,
+   "warp": 8,
+   "smem_kb": 32,
+   "l2_kb": 512,
+   "launch_us": 1.0,
+   "profiler": "mcycle",
+   "aliases": [
+    "riscv:rvv-vlen256"
+   ],
+   "limits": {
+    "vlen": 256,
+    "elen": 64,
+    "lmul_max": 8,
+    "vregs": 32,
+    "l1d_kb": 32
+   }
+  },
+  "rvv:vlen512": {
+   "node": "rvv",
+   "name": "Saturn VLEN=512",
+   "peak_gflops": 16.0,
+   "peak_gbps": 16.0,
+   "sms": 1,
+   "threads_per_sm": 16,
+   "warp": 16,
+   "smem_kb": 32,
+   "l2_kb": 512,
+   "launch_us": 1.0,
+   "profiler": "mcycle",
+   "limits": {
+    "vlen": 512,
+    "elen": 64,
+    "lmul_max": 8,
+    "vregs": 32,
+    "l1d_kb": 32
+   }
+  },
+  "gemmini:default": {
+   "node": "gemmini",
+   "name": "Gemmini 16x16",
+   "peak_gflops": 256.0,
+   "peak_gbps": 16.0,
+   "sms": 1,
+   "threads_per_sm": 256,
+   "warp": 16,
+   "smem_kb": 256,
+   "l2_kb": 512,
+   "launch_us": 1.0,
+   "profiler": "roofline",
+   "limits": {
+    "dim": 16,
+    "scratchpad_kb": 256,
+    "accumulator_kb": 64,
+    "dataflow": "WS|OS",
+    "input_dtype": "int8 (fp32 configs exist)",
+    "acc_dtype": "int32"
+   }
+  }
  }
 }

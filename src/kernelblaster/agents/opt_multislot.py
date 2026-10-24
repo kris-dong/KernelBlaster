@@ -790,7 +790,7 @@ class MultiSlotAgent:
                                         profile=prof_before, profile_kind=self._profile_kind)
             cls = self.kv.classify(vec_before, target_key=self._tkey, op_class=slot.op_class, dtype=self.p.dtype)
             choice = self.kv.select(target_key=self._tkey, op_class=slot.op_class, dtype=self.p.dtype, cls=cls,
-                                    vec=vec_before, rng=self.rng)
+                                    vec=vec_before, rng=self.rng, op_kind=slot.op)
             tech, desc, state = choice.item_id, choice.desc, cls.label()
             nums = {**nums, **cls.decided_by}
         else:
@@ -813,7 +813,8 @@ class MultiSlotAgent:
             adapt = (f"{json.dumps(r['adapt'].shapes[:2])}", self.store.code(r["adapt"]))
         if self.kv is not None:
             ktext = self.kv.retrieve(target_key=self._tkey, op_class=slot.op_class, dtype=self.p.dtype, cls=cls,
-                                     vec=vec_before, problem_id=self.problem_id, slot=sid, technique=tech)
+                                     vec=vec_before, problem_id=self.problem_id, slot=sid, technique=tech,
+                                     op_kind=slot.op)
             tried = self.kv.already_tried(self.problem_id, sid)
         else:
             ktext, tried = self._knowledge(sid, state, tech)
