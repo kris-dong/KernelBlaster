@@ -12,7 +12,7 @@ the full list of design decisions are in ModelBlaster's
 |---|---|
 | `data/sources/base.py` | `Problem.slots` (+ `slot_artifacts`, `is_multislot`); single-file problems are one `kernel` slot |
 | `data/sources/modelblaster_source.py` | `get_source("modelblaster", root=...)`: finds exported problem dirs |
-| `src/kernelblaster/knowledge/slots.py` | `SlotProblem` (manifest, assembly, neighbours, fusion-candidate pairs), `parse_driver_output`, `LocalEvaluator` (nvcc), `ServerEvaluator` (compile + exec servers) |
+| `src/kernelblaster/knowledge/slots.py` | `SlotProblem` (manifest, assembly, neighbours, fusion-candidate pairs), `parse_driver_output`, `LocalEvaluator` (nvcc), `ServerEvaluator` (compile + exec servers), OpenCL evaluators (below) |
 | `src/kernelblaster/agents/opt_multislot.py` | `MultiSlotAgent`, roofline `slot_state`, `TechniqueBandit`, prompts, `propose_fusions` |
 | `src/kernelblaster/knowledge/impl_store.py` | implementation knowledgebase: verified sources, retrieval, winners export |
 | `src/kernelblaster/knowledge/{outcomes,claims,reflect,semantic}.py` | outcome records and the semantic update pass (`docs/semantic_update_pass.md`) |
@@ -79,6 +79,34 @@ bound and metrics replace the roofline state in prompts and the bandit key; outc
 `metrics_delta`. Needs counter access; otherwise NCU is disabled after the first failure.
 `--evaluator ssh --ssh-host user@host --remote-dir DIR --cuda-visible-devices N` builds here and
 runs the self-contained binary on a remote GPU (e.g. an L40S with counter access).
+
+## OpenCL / Qualcomm Adreno
+
+Problems with manifest `target: "opencl"` (ModelBlaster `kb_export --target opencl`; design in
+ModelBlaster's `docs/opencl_adreno.md`) have C++11 slots that hold OpenCL C programs as raw
+strings plus the host launcher, on ModelBlaster's OpenCL runtime (SVM pointers, `mb_launch`,
+cl_event timing). What is target-specific on this side:
+
+| piece | OpenCL |
+|---|---|
+| `opt_multislot.TargetProfile` | system prompt (`agents/multislot_opencl.py`: slot format, runtime API, OpenCL C 1.2 / no fp64 rules, Adreno guidance), ```` ```cpp ```` fence, technique catalogue (vectorised 128-bit I/O, `__local` tiling, cooperative reductions, register tiling, work-group size, compile-time constants, mad/native math -- what the Adreno RL flow found), roofline peaks per device (`adreno650` ...; `titanrtx` for the local stand-in), arch label = device name, profiler |
+| records | `ImplStore`, `OutcomeRecord` and claims keyed by `(target, arch)`: CUDA and OpenCL winners and lessons never mix |
+| evaluators (`knowledge/slots.py`) | `OpenCLLocalEvaluator` (g++ + this host's OpenCL GPU), `AdrenoEvaluator` (scp one `main.cpp`, build with the board's g++, run, `rm -rf`; data.bin copied once per problem, `close()` removes the remote dir), `OpenCLServerEvaluator` (OpenCL compile server -- `compile_opencl.py` now builds `.cpp` mains with g++ -- and Adreno exec server, data.bin as a kernel file). Slots that call `clEnqueue*`/`clFinish` directly are rejected (all work must go through the timed `mb_launch`) |
+| profile (`knowledge/opencl_profile.py`) | `--ncu best|all` runs the driver's `MB_MODE=profile` and parses per-kernel cl_event times and launch counts, `CL_KERNEL_WORK_GROUP_SIZE` (falls with register pressure on Adreno), private/local memory; hints and `latency_bound` (many short launches) go into prompts and outcome records (same interface as `knowledge/ncu.py`) |
+
+```bash
+# on the board (RB5 over ssh; default host $KERNELBLASTER_ADRENO_BOARD_HOST)
+python scripts/run_multislot.py OUT --out runs/cl --evaluator board --board-host root@rb5 --arch adreno650 \
+    --model us.anthropic.claude-haiku-5-5 --ncu best
+# functional stand-in: any local OpenCL 2.0 GPU with coarse-grained SVM (times are not Adreno's)
+python scripts/run_multislot.py OUT --out runs/cl --evaluator local --arch titanrtx ...
+```
+
+`tests/test_multislot_opencl.py`: units (profiles, prompts, peaks, store separation, the direct-
+enqueue guard, the server evaluator's plumbing with faked servers) everywhere; with g++ and an
+OpenCL GPU, the OpenCL LeNet fixture (`tests/fixtures/mb_lenet_opencl`) baseline, a wrong slot
+attributed, the profile run, and the scripted agent end to end; `KB_OPENCL_BOARD_HOST=user@host`
+(`KB_OPENCL_BOARD_DIR`) runs the board evaluator against a real host.
 
 ## Notes
 
