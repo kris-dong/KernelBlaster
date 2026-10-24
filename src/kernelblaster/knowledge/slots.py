@@ -25,6 +25,7 @@ import shutil
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from collections import OrderedDict
 from typing import Mapping, Optional
 
 FORMAT = "mb-kb-problem/1"
@@ -188,6 +189,47 @@ class EvalResult:
     log: str = ""
     kernel_us: dict = field(default_factory=dict)      # "slot/kernel" -> us (OpenCL driver MB_KERNEL_US)
     device: Optional[str] = None                       # OpenCL driver MB_DEVICE
+    # end to end, as deployed (MB_E2E_US): the CUDA-graph replay of the whole
+    # partition where it is capturable, else the eager launch sequence
+    e2e_us: Optional[float] = None
+    e2e_basis: Optional[str] = None                    # "graph" | "eager"
+    graph_skip: Optional[str] = None                   # why there is no graph time (MB_GRAPH_SKIP)
+    graph_nodes: Optional[int] = None
+    # the incumbent timed in the same process, interleaved rep by rep (persistent host, ref=)
+    ref_e2e_us: Optional[float] = None
+    ref_e2e_basis: Optional[str] = None
+    e2e_ratio: Optional[dict] = None                   # candidate / incumbent per rep: med, mean, min, max, n
+    # per-op attribution: GPU time of each op's kernels run back to back (CUPTI, MB_ATTR_*)
+    attr_slot_us: dict = field(default_factory=dict)
+    attr_op_us: dict = field(default_factory=dict)
+    attr_slot_launches: dict = field(default_factory=dict)
+    attr_sum_us: Optional[float] = None
+    attr_launches: Optional[float] = None              # kernel launches (+ memsets/copies) per forward pass
+    attr_skip: Optional[str] = None
+    launch_overhead_us: Optional[float] = None         # eager partition time - sum of kernel time
+    launch_overhead_graph_us: Optional[float] = None
+    launch_overhead_frac: Optional[float] = None       # of the eager partition time
+    runtime: str = "process"                           # "process" (one driver run) | "host" (persistent host)
+    eval_wall_s: Optional[float] = None
+
+    @property
+    def deployed_us(self) -> Optional[float]:
+        """The problem's time as deployed: MB_E2E_US, else the graph time, else
+        the eager partition time (drivers that predate MB_E2E_US)."""
+        return self.e2e_us or self.partition_graph_us or self.partition_us
+
+    def slot_time(self, sid: str) -> Optional[float]:
+        """A slot's attributed GPU time (CUPTI), else its event-timed MB_SLOT_US."""
+        v = self.attr_slot_us.get(sid)
+        return v if v is not None else self.slot_us.get(sid)
+
+    def slot_times(self) -> dict:
+        return {s: self.slot_time(s) for s in (self.slot_us or self.attr_slot_us)}
+
+    def launch_gap_us(self, sid: str) -> Optional[float]:
+        """Event-timed minus attributed time of a slot: its launch and gap cost."""
+        a, e = self.attr_slot_us.get(sid), self.slot_us.get(sid)
+        return None if a is None or e is None else max(0.0, e - a)
 
     def failing_slots(self) -> list[str]:
         return [s for s, c in self.slot_checks.items() if not c.get("ok")]
@@ -229,9 +271,45 @@ def parse_driver_output(text: str) -> EvalResult:
     m = re.search(r"^MB_DEVICE (.*)$", text, re.M)
     if m:
         r.device = m.group(1).strip()
+    _parse_e2e(text, r)
     if r.errors and not passed:
         r.stage = "run"
     return r
+
+
+def _parse_e2e(text: str, r: EvalResult) -> None:
+    m = re.search(r"^MB_E2E_US (\S+) basis=(\w+)", text, re.M)
+    if m:
+        r.e2e_us, r.e2e_basis = float(m.group(1)), m.group(2)
+    m = re.search(r"^MB_GRAPH_SKIP (.*)$", text, re.M)
+    if m:
+        r.graph_skip = m.group(1).strip()
+    m = re.search(r"^MB_PARTITION_GRAPH_US \S+ reps=\d+ nodes=(\d+)", text, re.M)
+    if m:
+        r.graph_nodes = int(m.group(1))
+    m = re.search(r"^MB_REF_E2E_US (\S+) basis=(\w+)", text, re.M)
+    if m:
+        r.ref_e2e_us, r.ref_e2e_basis = float(m.group(1)), m.group(2)
+    m = re.search(r"^MB_E2E_RATIO med=(\S+) mean=(\S+) min=(\S+) max=(\S+) n=(\d+)(?: basis=(\w+))?", text, re.M)
+    if m:
+        r.e2e_ratio = {"med": float(m.group(1)), "mean": float(m.group(2)), "min": float(m.group(3)),
+                       "max": float(m.group(4)), "n": int(m.group(5)), "basis": m.group(6) or "eager"}
+    for m in re.finditer(r"^MB_ATTR_SLOT_US (\S+) (\S+)(?: launches=(\S+))?", text, re.M):
+        r.attr_slot_us[m.group(1)] = float(m.group(2))
+        if m.group(3):
+            r.attr_slot_launches[m.group(1)] = float(m.group(3))
+    for m in re.finditer(r"^MB_ATTR_OP_US (\S+) (\S+)", text, re.M):
+        r.attr_op_us[m.group(1)] = float(m.group(2))
+    m = re.search(r"^MB_ATTR_SUM_US (\S+) basis=\w+ reps=\d+ launches=(\S+)", text, re.M)
+    if m:
+        r.attr_sum_us, r.attr_launches = float(m.group(1)), float(m.group(2))
+    m = re.search(r"^MB_ATTR_SKIP (.*)$", text, re.M)
+    if m:
+        r.attr_skip = m.group(1).strip()
+    m = re.search(r"^MB_LAUNCH_OVERHEAD_US eager=(\S+)(?: graph=(\S+))? frac_eager=(\S+)", text, re.M)
+    if m:
+        r.launch_overhead_us, r.launch_overhead_frac = float(m.group(1)), float(m.group(3))
+        r.launch_overhead_graph_us = float(m.group(2)) if m.group(2) else None
 
 
 # ---------------------------------------------------------------- driver run options
@@ -270,10 +348,16 @@ class Evaluator:
     """Compile an assembled candidate with the problem's driver and run it.
 
     ``only_slots`` / ``screen``: see :func:`driver_env` (ignored where the
-    driver has no such modes)."""
+    driver has no such modes). ``incumbent``: the sources the candidate is
+    compared with; an evaluator with ``pairs_incumbent(problem)`` true times
+    both in one process, interleaved (``EvalResult.e2e_ratio``), the others
+    ignore it (callers pass it only where it is supported)."""
+
+    def pairs_incumbent(self, problem: SlotProblem) -> bool:
+        return False
 
     async def evaluate(self, problem: SlotProblem, sources: Mapping[str, str], tag: str, *,
-                       only_slots=None, screen: bool = False) -> EvalResult:
+                       only_slots=None, screen: bool = False, incumbent=None) -> EvalResult:
         raise NotImplementedError
 
     async def profile(self, problem: SlotProblem, sources: Mapping[str, str], tag: str, slots=None):
@@ -311,14 +395,30 @@ class LocalEvaluator(Evaluator):
     is ``"auto"`` (default: idle GPUs), ``"all"``, or a list of nvidia-smi
     indices / UUIDs; ``pool`` passes a ready pool (e.g. shared between
     evaluators). Leases are grouped by problem, so one problem's runs stay on
-    one GPU model."""
+    one GPU model.
+
+    Runtime: ``runtime="host"`` (the default, ``"auto"``, for drivers that have
+    it; ``KERNELBLASTER_MULTISLOT_RUNTIME``) evaluates candidates in a
+    persistent host per (problem, GPU) (``knowledge/runtime_host.py``): the
+    candidate is a shared object of its slot units, the host keeps the CUDA
+    context and the data, the partition is timed as a CUDA graph where it is
+    capturable, and ``incumbent=`` sources are timed in the same request
+    (paired). ``"process"`` (and the fallback when the host cannot be built or
+    started) runs one driver process per evaluation, as before."""
 
     def __init__(self, arch: str = "75", work_root: Optional[Path] = None, nvcc: str = "nvcc",
                  max_parallel: Optional[int] = None, timeout_s: int = 900, keep: bool = False,
                  incremental: Optional[bool] = None, cache_dir: Optional[Path] = None,
                  build_jobs: Optional[int] = None, gpus=None, pool=None, infra_retries: int = 2,
-                 graph: Optional[bool] = None):
+                 graph: Optional[bool] = None, runtime: Optional[str] = None, hosts_per_device: int = 3):
         from ..servers.utils.resources import build_limiter
+        from .runtime_host import HostPool
+
+        self.runtime = (runtime or os.getenv("KERNELBLASTER_MULTISLOT_RUNTIME", "auto")).lower()
+        if self.runtime not in ("auto", "host", "process"):
+            raise ValueError(f"runtime must be auto|host|process, not {self.runtime!r}")
+        self._hosts = HostPool(hosts_per_device)
+        self._host_off: dict = {}                # problem root -> why the host is not used
 
         self.arch, self.nvcc, self.timeout_s, self.keep = arch, nvcc, timeout_s, keep
         # also time the partition as a CUDA graph (MB_PARTITION_GRAPH_US): every
@@ -387,6 +487,10 @@ class LocalEvaluator(Evaluator):
         return ["-O3", f"-arch=sm_{self.arch}", "-std=c++17", "-lineinfo",
                 *(["--default-stream", "per-thread"] if getattr(self, "graph", False) else [])]
 
+    def _driver_flags(self) -> list[str]:
+        """Extra flags for the driver TU: CUPTI's headers (per-op attribution)."""
+        return cupti_flags(self.nvcc)
+
     def _run_env(self, only_slots=None, screen: bool = False) -> dict:
         return {**driver_env(only_slots, screen), **({"MB_GRAPH": "1"} if getattr(self, "graph", False) else {})}
 
@@ -421,12 +525,12 @@ class LocalEvaluator(Evaluator):
         class _Failed(Exception):
             pass
 
-        async def obj(src: Path, text: str):
-            key = cache_key("nvcc-c", self.nvcc, *flags, text, *external_inputs(text))
+        async def obj(src: Path, text: str, extra=()):
+            key = cache_key("nvcc-c", self.nvcc, *flags, *extra, text, *external_inputs(text))
 
             async def build(tmp: Path):
                 async with self._unit_sem:
-                    rc, _ = await self._nvcc([*flags, "-c", str(src), "-o", str(tmp)])
+                    rc, _ = await self._nvcc([*flags, *extra, "-c", str(src), "-o", str(tmp)])
                 if rc != 0:
                     raise _Failed(src.name)
             return key, (await cache.get_or_build(key, ".o", build))[0]
@@ -436,7 +540,7 @@ class LocalEvaluator(Evaluator):
             (work / name).write_text(text)
             jobs.append(obj(work / name, text))
         drv = problem.driver_path
-        jobs.append(obj(drv, drv.read_text()))
+        jobs.append(obj(drv, drv.read_text(), self._driver_flags()))
         objs = await asyncio.gather(*jobs, return_exceptions=True)
         if any(isinstance(o, BaseException) for o in objs):
             return False
@@ -462,7 +566,7 @@ class LocalEvaluator(Evaluator):
         (work / "kernels.cu").write_text(problem.assemble(sources))
         async with self._sem:
             proc = await asyncio.create_subprocess_exec(
-                self.nvcc, *self._flags(), "-o", str(work / "problem"),
+                self.nvcc, *self._flags(), *self._driver_flags(), "-o", str(work / "problem"),
                 str(work / "kernels.cu"), str(problem.driver_path),
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
             out, _ = await asyncio.wait_for(proc.communicate(), self.timeout_s)
@@ -490,7 +594,11 @@ class LocalEvaluator(Evaluator):
             return None
         return out.decode(errors="replace")
 
-    async def evaluate(self, problem, sources, tag, *, only_slots=None, screen=False):
+    async def evaluate(self, problem, sources, tag, *, only_slots=None, screen=False, incumbent=None):
+        if self._use_host(problem):
+            res = await self._evaluate_host(problem, sources, tag, only_slots, screen, incumbent)
+            if res is not None:
+                return res
         work = self._workdir(problem, tag)
         try:
             bad = await self._build(problem, sources, work)
@@ -517,6 +625,196 @@ class LocalEvaluator(Evaluator):
         finally:
             if not self.keep:
                 shutil.rmtree(work, ignore_errors=True)
+
+
+    # ---- the persistent host (knowledge/runtime_host.py)
+    # telemetry stages of the host path (telemetry/evaluator.py); the host client itself
+    # records driver.host_start (start / restart) and run.exec with the driver's phases
+    # (load, checks, graph_build = capture, time_partition = graph / eager replay, attribution)
+    TELEMETRY_STAGES = {"_build_so": "build", "_host_exe": "build", "_host_request": "run",
+                        "_stage_file": "run.stage"}
+
+    def _use_host(self, problem) -> bool:
+        from .runtime_host import supports_host
+
+        drv = getattr(problem, "driver_path", None)
+        if self.runtime == "process" or getattr(problem, "target", "cuda") != "cuda" or drv is None or \
+                str(problem.root) in self._host_off:
+            return False
+        if not supports_host(drv.read_text()):
+            self._host_off[str(problem.root)] = "driver exported without the persistent host"
+            if self.runtime == "host":
+                _log().warning(f"{problem.name}: {self._host_off[str(problem.root)]}; one process per run")
+            return False
+        return True
+
+    def pairs_incumbent(self, problem) -> bool:
+        return self._use_host(problem)
+
+    def _so_flags(self) -> list[str]:
+        """The candidate's shared object: always the per-thread default stream (graph capture)."""
+        return ["-O3", f"-arch=sm_{self.arch}", "-std=c++17", "-lineinfo", "--default-stream", "per-thread",
+                "-Xcompiler", "-fPIC"]
+
+    async def _build_so(self, problem, sources, work: Path) -> tuple[Optional[Path], Optional[EvalResult]]:
+        """The candidate's kernels as a shared object (cached by content):
+        slot units + tail linked -shared, else the assembled TU (authoritative errors)."""
+        from ..servers.utils.build_cache import cache_key, external_inputs
+
+        cache = self._build_cache(problem)
+        flags = self._so_flags()
+        work.mkdir(parents=True, exist_ok=True)
+
+        class _Failed(Exception):
+            pass
+
+        async def obj(src: Path, text: str):
+            key = cache_key("nvcc-c", self.nvcc, *flags, text, *external_inputs(text))
+
+            async def build(tmp: Path):
+                async with self._unit_sem:
+                    rc, _ = await self._nvcc([*flags, "-c", str(src), "-o", str(tmp)])
+                if rc != 0:
+                    raise _Failed(src.name)
+            return key, (await cache.get_or_build(key, ".o", build))[0]
+
+        if self.incremental:
+            jobs = []
+            for name, text in problem.units(sources):
+                (work / name).write_text(text)
+                jobs.append(obj(work / name, text))
+            objs = await asyncio.gather(*jobs, return_exceptions=True)
+            if not any(isinstance(o, BaseException) for o in objs):
+                link_key = cache_key("nvcc-so", self.nvcc, f"-arch=sm_{self.arch}", *[k for k, _ in objs])
+
+                async def link(tmp: Path):
+                    async with self._sem:
+                        rc, _ = await self._nvcc(["-shared", f"-arch=sm_{self.arch}", *[str(p) for _, p in objs],
+                                                  "-o", str(tmp)])
+                    if rc != 0:
+                        raise _Failed("link")
+                try:
+                    return (await cache.get_or_build(link_key, ".so", link))[0], None
+                except _Failed:
+                    pass
+        text = problem.assemble(sources)
+        (work / "kernels.cu").write_text(text)
+        key = cache_key("nvcc-so-tu", self.nvcc, *flags, text, *external_inputs(text))
+        log = {}
+
+        async def build_tu(tmp: Path):
+            async with self._sem:
+                rc, out = await self._nvcc([*flags, "-shared", "-o", str(tmp), str(work / "kernels.cu")])
+            if rc != 0:
+                log["out"] = out
+                raise _Failed("kernels.cu")
+        try:
+            return (await cache.get_or_build(key, ".so", build_tu))[0], None
+        except _Failed:
+            out = log.get("out", "")
+            return None, EvalResult(ok=False, stage="compile", errors=[_compile_errors(out)], log=out[-4000:],
+                                    runtime="host")
+
+    async def _host_exe(self, problem) -> Optional[Path]:
+        """driver.cpp built -DMB_HOST (cached by content); None if it does not build."""
+        from ..servers.utils.build_cache import cache_key, external_inputs
+
+        drv = problem.driver_path
+        text = drv.read_text()
+        flags = ["-O3", f"-arch=sm_{self.arch}", "-std=c++17", "-DMB_HOST", *self._driver_flags()]
+        key = cache_key("nvcc-host", self.nvcc, *flags, text, *external_inputs(text))
+        log = {}
+
+        async def build(tmp: Path):
+            async with self._sem:
+                rc, out = await self._nvcc([*flags, "-o", str(tmp), str(drv), "-ldl"])
+            if rc != 0:
+                log["out"] = out
+                raise RuntimeError("host build failed")
+        try:
+            return (await self._build_cache(problem).get_or_build(key, ".host", build))[0]
+        except RuntimeError:
+            self._host_off[str(problem.root)] = "host build failed: " + _compile_errors(log.get("out", ""), 500)
+            _log().warning(f"{problem.name}: {self._host_off[str(problem.root)]}; one process per run")
+            return None
+
+    def _host_vars(self, only_slots, screen) -> dict:
+        return {**driver_env(only_slots, screen), "MB_GRAPH": "1"}
+
+    async def _evaluate_host(self, problem, sources, tag, only_slots, screen, incumbent) -> Optional[EvalResult]:
+        """One request to the problem's host; None to fall back to one process per run."""
+        exe = await self._host_exe(problem)
+        if exe is None:
+            return None
+        work = self._workdir(problem, tag)
+        try:
+            so, bad = await self._build_so(problem, sources, work)
+            if bad is not None:
+                return bad
+            ref = None
+            if incumbent is not None and dict(incumbent) != dict(sources):
+                ref, rbad = await self._build_so(problem, incumbent, work / "incumbent")
+                if rbad is not None:
+                    _log().warning(f"{problem.name}: incumbent does not build as a shared object; unpaired run")
+            rep = await self._host_request(problem, exe, so, ref, self._host_vars(only_slots, screen))
+            if rep is None:
+                return None
+            return self._host_result(problem, rep)
+        finally:
+            if not self.keep:
+                shutil.rmtree(work, ignore_errors=True)
+
+    def _host_result(self, problem, rep) -> Optional[EvalResult]:
+        if rep.status == "start_failed":
+            # the host itself failed (it printed): one process per run from now
+            # on; a link or device failure before it printed: this run only
+            if re.search(r"^MB_", rep.text, re.M):
+                self._host_off[str(problem.root)] = "host did not start: " + rep.text[-300:]
+            _log().warning(f"{problem.name}: host did not start ({rep.text[-300:]!r}); one process for this run")
+            return None
+        r = parse_driver_output(rep.text)
+        r.runtime, r.eval_wall_s = "host", round(rep.wall_s, 3)
+        if rep.status != "done" or rep.poisoned:
+            r.ok, r.stage = False, "run"
+            r.errors.append({"timeout": f"timeout after {self.timeout_s}s (the runtime was restarted)",
+                             "crash": f"the candidate crashed the runtime (exit {rep.rc}); it was restarted"}.get(
+                rep.status, "the candidate left the CUDA context unusable (sticky CUDA error); the runtime "
+                            "was restarted"))
+        return r
+
+    async def _host_request(self, problem, exe: Path, so: Path, ref: Optional[Path], env: dict):
+        """Run one request on a leased local GPU's host (started on first use)."""
+        from ..servers.utils.resources import gpu_lock_file, is_infra_failure
+        from .runtime_host import HostClient, host_env
+
+        pool = await self.pool()
+        avoid: set = set()
+        rep = None
+        for attempt in range(self.infra_retries + 1):
+            async with pool.lease(str(problem.root), avoid) as lease:
+                dev = lease.device
+                key = (str(problem.root), dev.key, str(exe))
+                h = await self._hosts.get(key, dev.key, lambda: HostClient(
+                    [str(exe)], env=host_env(dev.env()), label=f"{problem.name}@{dev.label()}",
+                    start_timeout=self.timeout_s, device=dev.label()))
+                rep = await h.request(str(so), ref=str(ref) if ref else None, env=env,
+                                      lock=gpu_lock_file(dev.ident), lock_wait=self.timeout_s, timeout=self.timeout_s)
+                self._hosts.stats.note(rep, dev.label())
+                lease.infra_error = is_infra_failure(rep.text) and not re.search(r"^passed$", rep.text, re.M)
+            if not lease.infra_error:
+                return rep
+            await self._hosts.drop(key)
+            avoid.add(dev.key)
+            _log().warning(f"{problem.name}: infrastructure failure on {dev.label()} (attempt {attempt + 1}): "
+                           f"{rep.text[-300:]!r}")
+        return rep
+
+    def host_stats(self) -> dict:
+        return {"runtime": self.runtime, **self._hosts.stats.to_json(),
+                "fallbacks": {Path(k).name: v for k, v in self._host_off.items()}}
+
+    async def close(self):
+        await self._hosts.close()
 
 
 class SSHEvaluator(LocalEvaluator):
@@ -566,6 +864,7 @@ class SSHEvaluator(LocalEvaluator):
             except OSError:
                 pass
         self.transfer = {"rsync": 0, "scp": 0}
+        self._staged: dict = {}                  # host -> OrderedDict of staged host binaries / .so names
 
     def _ssh_base(self) -> list[str]:
         mux = (["-o", "ControlMaster=auto", "-o", f"ControlPath={self._mux_dir}/%C", "-o", "ControlPersist=120"]
@@ -697,10 +996,92 @@ class SSHEvaluator(LocalEvaluator):
         return text
 
     async def close(self):
-        """Remove the rsync basis binaries from every host."""
-        for h in self._rsync_hosts:
+        """Stop the persistent hosts; remove the rsync basis binaries and the
+        staged host binaries / shared objects from every host."""
+        await self._hosts.close()
+        for h in sorted(self._rsync_hosts | set(self._staged)):
             await self._sh(self.ssh, *self._ssh_base(), h,
-                           f"rm -f {shlex.quote(self.remote_dirs[h])}/.kb_basis_*", timeout=60)
+                           f"cd {shlex.quote(self.remote_dirs[h])} && rm -f .kb_basis_* kbhost_* kbso_*.so", timeout=60)
+        self._staged.clear()
+
+    # ---- the persistent host on a remote GPU: `ssh host ./kbhost_<sha>` over the
+    # multiplexed connection; the host binary is copied once per problem and
+    # host, each candidate's shared object (~1 MB) per request
+    STAGED_SO_LIMIT = 48
+
+    def _use_host(self, problem) -> bool:
+        drv = getattr(problem, "driver_path", None)
+        if drv is None or "MB_DATA_PATH" in drv.read_text():
+            return False                             # not self-contained: the process path reports it
+        return super()._use_host(problem)
+
+    async def _stage_file(self, host: str, path: Path, name: str, keep: set) -> Optional[str]:
+        """Copy ``path`` to host:rdir/name once (content-named); evict old shared objects."""
+        staged = self._staged.setdefault(host, OrderedDict())
+        if name in staged:
+            staged.move_to_end(name)
+            return None
+        rdir = self.remote_dirs.get(host, self.remote_dir)
+        err = await self._send(path, host, rdir, name, None)
+        if err is not None:
+            return err
+        staged[name] = True
+        old = [n for n in staged if n.startswith("kbso_") and n not in keep]
+        drop = old[:max(0, len([n for n in staged if n.startswith("kbso_")]) - self.STAGED_SO_LIMIT)]
+        if drop:
+            for n in drop:
+                staged.pop(n, None)
+            await self._sh(self.ssh, *self._ssh_base(), host,
+                           f"cd {shlex.quote(rdir)} && rm -f " + " ".join(shlex.quote(n) for n in drop), timeout=60)
+        return None
+
+    async def _host_request(self, problem, exe: Path, so: Path, ref: Optional[Path], env: dict):
+        from ..servers.utils.resources import gpu_lock_file, is_infra_failure
+        from .runtime_host import HostClient, HostReply
+
+        pool = await self.pool()
+        group = str(problem.root)
+        bad_hosts: set = set()
+        hname = f"kbhost_{exe.stem[:16]}"
+        names = {so: f"kbso_{so.stem[:16]}.so", **({ref: f"kbso_{ref.stem[:16]}.so"} if ref else {})}
+        rep = None
+        for attempt in range(self.infra_retries + 1):
+            host = pool.pick_host(group, avoid_hosts=bad_hosts) or self.host
+            rdir = self.remote_dirs.get(host, self.remote_dir)
+            err = await self._stage_file(host, exe, hname, set())
+            for path, name in names.items():
+                if err is None:
+                    err = await self._stage_file(host, path, name, set(names.values()))
+            if err is not None:
+                rep = HostReply(f"MB_ERROR [infra] copy to {host} failed: {err[-300:]}\nfailed\n", "done", rc=1)
+                pool.unreserve(host)
+                pool.host_failure(host)
+                bad_hosts.add(host)
+                continue
+            async with pool.lease(group, host=host) as lease:
+                dev = lease.device
+                key = (group, dev.key, hname)
+                envs = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in dev.env().items())
+                remote = (f"cd {shlex.quote(rdir)} && export PATH={shlex.quote(self.remote_path)}:$PATH && "
+                          f"exec env {envs} ./{hname}")
+                h = await self._hosts.get(key, dev.key, lambda: HostClient(
+                    [self.ssh, *self._ssh_base(), host, remote], label=f"{problem.name}@{dev.label()}",
+                    start_timeout=self.timeout_s, device=dev.label()))
+                # dlopen searches the library path for a bare name: ./ (the host runs in rdir)
+                rep = await h.request(f"./{names[so]}", ref=f"./{names[ref]}" if ref else None, env=env,
+                                      lock=gpu_lock_file(dev.ident), lock_wait=self.timeout_s, timeout=self.timeout_s)
+                self._hosts.stats.note(rep, dev.label())
+                # ssh itself failing (rc 255 before the host printed anything) is the link, not the candidate
+                link_down = rep.status in ("crash", "start_failed") and rep.rc == 255 and \
+                    not re.search(r"^MB_", rep.text, re.M)
+                lease.infra_error = link_down or (is_infra_failure(rep.text) and not re.search(r"^passed$", rep.text, re.M))
+            if not lease.infra_error:
+                return rep
+            await self._hosts.drop(key)
+            bad_hosts.add(host)
+            _log().warning(f"{problem.name}: infrastructure failure on {host} (attempt {attempt + 1}): "
+                           f"{rep.text[-300:]!r}")
+        return rep
 
     async def _build(self, problem, sources, work):
         if "MB_DATA_PATH" in problem.driver_path.read_text():
@@ -761,7 +1142,7 @@ class ServerEvaluator(Evaluator):
             return cu, None, EvalResult(ok=False, stage="compile", errors=[_compile_errors(str(e))],
                                         log=str(e)[-4000:])
 
-    async def evaluate(self, problem, sources, tag, *, only_slots=None, screen=False):
+    async def evaluate(self, problem, sources, tag, *, only_slots=None, screen=False, incumbent=None):
         from ..agents.utils.commands import run_gpu_executable
         from ..agents.utils import FeedbackError
 
@@ -800,6 +1181,17 @@ def _log():
     except ImportError:                       # pragma: no cover
         import logging
         return logging.getLogger(__name__)
+
+
+def cupti_flags(nvcc: str = "nvcc") -> list[str]:
+    """``-I`` for CUPTI's headers beside ``nvcc`` (the driver's per-op
+    attribution, ``MB_ATTR_*``); [] without them (the driver then prints
+    MB_ATTR_SKIP). ``KERNELBLASTER_CUPTI=0`` leaves them out."""
+    if not _env_on("KERNELBLASTER_CUPTI", "1"):
+        return []
+    exe = shutil.which(nvcc) or nvcc
+    inc = Path(exe).resolve().parent.parent / "extras" / "CUPTI" / "include"
+    return [f"-I{inc}"] if (inc / "cupti.h").exists() else []
 
 
 def _incremental_default() -> bool:
@@ -905,7 +1297,7 @@ class OpenCLLocalEvaluator(LocalEvaluator):
             if not self.keep:
                 shutil.rmtree(work, ignore_errors=True)
 
-    async def evaluate(self, problem, sources, tag, *, only_slots=None, screen=False):  # full run (OpenCL driver)
+    async def evaluate(self, problem, sources, tag, *, only_slots=None, screen=False, incumbent=None):  # full run (OpenCL driver)
         bad, text = await self._exec(problem, sources, tag, {})
         if bad is not None:
             return bad
@@ -1007,7 +1399,7 @@ class AdrenoEvaluator(Evaluator):
             return EvalResult(ok=False, stage="compile", errors=[_compile_errors(log)], log=log[-4000:]), None
         return None, out
 
-    async def evaluate(self, problem, sources, tag, *, only_slots=None, screen=False):  # full run (OpenCL driver)
+    async def evaluate(self, problem, sources, tag, *, only_slots=None, screen=False, incumbent=None):  # full run (OpenCL driver)
         bad, text = await self._exec(problem, sources, tag, {})
         if bad is not None:
             return bad
@@ -1072,7 +1464,7 @@ class OpenCLServerEvaluator(Evaluator):
             return EvalResult(ok=False, stage="run", errors=[str(e)[-2000:]], log=str(e)[-4000:]), None
         return None, stdout + "\n" + stderr
 
-    async def evaluate(self, problem, sources, tag, *, only_slots=None, screen=False):  # full run (OpenCL driver)
+    async def evaluate(self, problem, sources, tag, *, only_slots=None, screen=False, incumbent=None):  # full run (OpenCL driver)
         bad, text = await self._exec(problem, sources, tag, False)
         return bad if bad is not None else parse_driver_output(text)
 

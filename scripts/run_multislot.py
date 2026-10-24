@@ -177,10 +177,10 @@ async def _run_inner(args, run_span) -> int:
             hosts, cvd = _ssh_hosts(args)
             ev = SSHEvaluator(hosts, arch=arch_for("cuda"), remote_dir=args.remote_dir, ssh_key=args.ssh_key,
                               cuda_visible_devices=cvd, remote_path=args.remote_cuda_bin,
-                              work_root=out / "work", max_parallel=args.compile_jobs)
+                              work_root=out / "work", max_parallel=args.compile_jobs, runtime=args.runtime)
         elif args.evaluator == "local":
             ev = LocalEvaluator(arch_for("cuda"), work_root=out / "work", max_parallel=args.compile_jobs,
-                                gpus=args.gpus)
+                                gpus=args.gpus, runtime=args.runtime)
         else:
             raise SystemExit(f"--evaluator {args.evaluator} runs OpenCL problems only")
         evaluators[target] = ev
@@ -216,7 +216,7 @@ async def _run_inner(args, run_span) -> int:
                                        outcome_log=olog, claims=claims, semantic_updater=updater,
                                        rollouts=args.rollouts, steps=args.steps,
                                        max_fix_attempts=args.max_fix, seed=args.seed, logger=logger, ncu=args.ncu,
-                                       knowledge_v2=kv)
+                                       knowledge_v2=kv, reward=args.reward, e2e_accept_pct=args.e2e_accept_pct)
                 try:
                     res = await agent.run()
                 except Exception as e:
@@ -224,8 +224,9 @@ async def _run_inner(args, run_span) -> int:
                     results[i] = {"problem": p.name, "error": repr(e)}
                     return
                 res["seconds"] = round(time.time() - t0, 1)
-                results[i] = {k: res[k] for k in ("problem", "baseline_partition_us", "final_partition_us",
-                                                  "speedup", "final_ok", "llm_calls", "llm_usage", "seconds")}
+                results[i] = {k: res.get(k) for k in ("problem", "baseline_partition_us", "final_partition_us",
+                                                      "speedup", "final_ok", "llm_calls", "llm_usage", "seconds",
+                                                      "reward", "baseline_e2e_us", "final_e2e_us", "e2e_speedup")}
                 if res.get("telemetry"):
                     results[i]["telemetry"] = {"wall_s": res["telemetry"]["wall_s"],
                                                "llm": res["telemetry"]["llm"]["total"],
@@ -259,6 +260,7 @@ async def _run_inner(args, run_span) -> int:
         pool = getattr(ev, "_pool", None)
         jobs = getattr(ev, "_jobs", None)
         lb[t] = {"evaluator": type(ev).__name__,
+                 **({"runtime": ev.host_stats()} if hasattr(ev, "host_stats") else {}),
                  **({"gpus": pool.stats(), "peak_busy_gpus": pool.peak_busy} if pool is not None else {}),
                  **({"compile_jobs": jobs.describe(), "peak_compile_jobs": jobs.peak} if jobs is not None else {})}
     summary.append({"load_balance": lb})
@@ -351,6 +353,16 @@ def main():
                     help="local GPUs: auto (idle ones; KERNELBLASTER_ALLOW_SHARED_GPU=1 adds busy ones), all, "
                          "or nvidia-smi indices / UUIDs, e.g. 0,2")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--reward", choices=["e2e", "slot"], default=os.getenv("KERNELBLASTER_MULTISLOT_REWARD", "e2e"),
+                    help="what a step is rewarded and accepted on: the deployed end-to-end partition time (default) "
+                         "or the changed slot's time")
+    ap.add_argument("--e2e-accept-pct", type=float, default=None,
+                    help="end-to-end gain (%% of the partition) a step needs to join the composite (default 1.0; "
+                         "env KERNELBLASTER_MULTISLOT_E2E_ACCEPT_PCT)")
+    ap.add_argument("--runtime", choices=["auto", "host", "process"],
+                    default=os.getenv("KERNELBLASTER_MULTISLOT_RUNTIME", "auto"),
+                    help="local/ssh evaluators: persistent driver host per problem and GPU (auto: where the driver "
+                         "has it) or one driver process per run")
     ap.add_argument("--evaluator", choices=["local", "server", "ssh", "board"], default="local",
                     help="local nvcc|g++ + run | KB compile/exec servers | build here, run on --ssh-host (CUDA) | "
                          "build + run on the Adreno board over ssh (OpenCL)")

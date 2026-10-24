@@ -104,6 +104,7 @@ class RooflineInput:
     time_us: float                    # measured slot time (all instances)
     work_items: Optional[float] = None  # largest instance's output elements
     launches: int = 1                 # kernel calls in the slot time (>= instances)
+    launch_frac: Optional[float] = None  # measured share of launch/idle overhead (runtime attribution)
 
 
 def roofline_vector(t: Target, est: RooflineInput) -> MetricVector:
@@ -121,7 +122,10 @@ def roofline_vector(t: Target, est: RooflineInput) -> MetricVector:
     if est.work_items:
         out["parallel_fill"] = metric(min(1.0, est.work_items / t.width), ESTIMATED,
                                       f"work items/{t.width} lanes")
-    if est.time_us > 0:
+    if est.launch_frac is not None:
+        out["launch_frac"] = metric(max(0.0, min(1.0, est.launch_frac)), MEASURED,
+                                    f"{est.launches} launches: deployed overhead share (runtime attribution)")
+    elif est.time_us > 0:
         out["launch_frac"] = metric(min(1.0, est.launches * t.launch_us / est.time_us), ESTIMATED,
                                     f"{est.launches} launches x {t.launch_us} us / time")
     return out

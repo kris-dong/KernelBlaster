@@ -41,11 +41,111 @@ Per step: sample a slot (time share × stall decay × exploration bonus) → cla
 state from the manifest's bytes/FLOPs and the measured time → pick a technique (UCB1 keyed by
 op class and state, untried arms seeded from the technique's mean elsewhere) → the LLM rewrites
 that slot only, with neighbours' signatures, the C reference, shapes, store examples, claims
-and "already tried" notes → assemble, build, run the driver (partition + isolated-op checks,
-per-slot times) with a bounded fix loop → reward = slot time saved / partition time → outcome
-record, store record, claim tally. Parallel rollouts share a per-slot composite best that is
-re-verified at the end. After the run, `propose_fusions` and `propose_splits` write
-`kb-proposal/1` for ModelBlaster.
+and "already tried" notes → assemble, build, run the candidate in the persistent runtime
+(partition + isolated-op checks, the partition replayed as a CUDA graph, paired with the
+rollout's current state) with a bounded fix loop → reward = fraction of the end-to-end
+partition time saved → outcome record, store record, claim tally. Parallel rollouts share a
+per-slot composite best that is re-verified at the end. After the run, `propose_fusions` and
+`propose_splits` write `kb-proposal/1` for ModelBlaster. The reward and the runtime are
+described in the next section.
+
+## End-to-end reward and the persistent runtime
+
+### Reward
+
+A step is accepted and rewarded on the **whole partition's forward pass as deployed**, not on
+the changed slot's own time.
+
+- **Deployed time.** The driver's `MB_E2E_US` is the median CUDA-graph replay of the whole
+  partition when it is capturable, else the eager launch sequence. `EvalResult.deployed_us`
+  falls back to the graph time, then the eager time, for drivers that predate the line.
+- **Pairing.** The persistent host times the candidate and the rollout's current state in
+  the same process, rep by rep, alternately (`incumbent=`, driver `ref=`). The gain is
+  `1 − median(candidate / incumbent)` (`e2e_gain`). Both sides use the same method: both graph
+  replays when both capture, else both eager.
+- **Unpaired evaluators.** The one-process path and the server evaluator compare against the
+  incumbent's time from an earlier run.
+- **Accepting a gain.**
+  - A gain of `--e2e-accept-pct` (default 1 % of the partition) or more is re-measured with
+    every check, paired against the *composite* best.
+  - It joins the composite if it holds there too. The reward is the smaller of the two gains.
+  - Smaller moves are neutral. The rollout keeps a candidate unless it is more than half the
+    threshold slower.
+- **Status** of outcome records (improved / neutral / regressed) is the same threshold on the
+  end-to-end gain.
+- **Not graph-capturable is a defect.** A verified candidate that makes a capturable
+  partition fall back to eager launches (a host sync, an allocation or a host copy per call)
+  goes back to the fix loop with the capture error. If it stays uncapturable, it is compared
+  eager to eager, and the step records `graph_capture`.
+- **The old reward stays available.** `--reward slot` (`KERNELBLASTER_MULTISLOT_REWARD=slot`)
+  keeps the previous rule: slot time saved over the sum of slot times, accepted at
+  `confirm_pct`. In the end-to-end mode every step records what that rule would have decided
+  on the same runs (`context.e2e.slot_rule`).
+
+### Attribution and the launch signal
+
+Slot times are diagnostics. They choose the slot to work on, feed the prompt, the roofline and
+v2 metrics, and the proposals.
+
+- **Kernel time per op.** The driver measures it with CUPTI activity records, for ops run back
+  to back as in the partition (`MB_ATTR_SLOT_US` / `MB_ATTR_OP_US`, with launches per slot).
+  `EvalResult.slot_time()` prefers it to the event-timed `MB_SLOT_US`, which charged tiny
+  slots 2–3× their kernel time (ModelBlaster `docs/gpu_harness_perf.md`).
+- **Slot share** for sampling is a slot's kernel time plus its launches' share of the
+  deployed overhead (`slot_weights`).
+- **Overhead.** `MB_LAUNCH_OVERHEAD_US` is deployed or eager time minus kernel time
+  (`partition_runtime`: `launch_overhead_frac`, `graph_saving_frac`, `launch_bound`).
+- **When the partition or slot is launch-bound** (eager overhead ≥ 15 %, a graph saving ≥ 5 %,
+  more than 1.5 launches per call, or kernels under 5 µs):
+  - the prompt says that fewer launches count as much as faster kernels;
+  - the v1 bandit also offers `kernel_fusion_in_slot` and `persistent_kernel`;
+  - knowledge v2 gets the measured `launch_frac` and launch count, so its `launch_overhead`
+    state and `persistent_kernel` technique apply.
+- **Prompt context.** Every prompt states the deployed time, kernel time, launches and
+  overhead, and that the slot must stay graph-capturable.
+- **Proposals.** `propose_fusions` estimates a fusion as the consumer's kernel time plus its
+  launch overhead. Before, it used the event-timed consumer time: the ResNet18 conv+bn
+  proposal fell from 13 % to 5.5 %, and the measured fusion saved 4.2 %.
+
+### Records
+
+| record | new fields | compatibility |
+|---|---|---|
+| `OutcomeRecord` | `timing_basis` (`e2e_graph`, `e2e_eager` or `slot_events`; `None` = written before), `e2e_before`, `e2e_after`, `partition_effect` | `metric_*` stay the slot's times; readers drop unknown fields (`OutcomeRecord.from_json`) |
+| v2 outcome | the reward is the end-to-end gain, the same unit as before (a fraction of the partition); `extra.e2e` holds the decision | unchanged schema |
+| `result.json` | `reward`, `baseline_e2e_us`, `final_e2e_us`, `e2e_speedup`, `final_e2e_ratio` (final vs seeds, paired), `runtime` (baseline/final `partition_runtime`, evaluator host stats), `attr_op_us`, per slot `baseline_attr_us` / `final_attr_us` / `launches`; steps `reward_basis`, `e2e_before`, `e2e_after` | old fields unchanged (`speedup` is still eager) |
+| `summary.json` | `reward`, `baseline_e2e_us`, `final_e2e_us`, `e2e_speedup`; `load_balance.cuda.runtime` | |
+
+### Persistent runtime (`knowledge/runtime_host.py`)
+
+`LocalEvaluator` and `SSHEvaluator` run candidates in a persistent driver host per (problem,
+GPU) when the driver has one (`--runtime auto`, the default; `host`; `process` for one
+process per run).
+
+- **Host.** The problem's `driver.cpp` built with `-DMB_HOST`. It keeps the CUDA context,
+  buffers and reference data.
+- **Candidate.** A shared object of the slot units + tail (`-shared -fPIC`, per-thread
+  default stream, cached by content), dlopen'ed for one request.
+- **Protocol.** One tab-separated `EVAL` line per request. The reply is the one-process
+  driver's output for the same `MB_*` variables, then `MB_HOST_DONE`.
+- **GPU lock.** The host takes the GPU's flock (`resources.gpu_lock_file`) for each request
+  only. An idle host does not block other runs on its GPU.
+- **SSH.** The host runs as `ssh host ./kbhost_<sha>` over the multiplexed connection. Its
+  binary is copied once per problem and host. Shared objects (about 1 MB) are copied per
+  candidate, and at most 48 are kept per host.
+- **Failures** are runtime errors of the candidate, and the next request starts a new host:
+  - a crash ends the stream;
+  - a hang is killed at the timeout;
+  - a sticky CUDA error is reported by the host itself (`poisoned=1`).
+- **Recycling.** The host exits by itself after 500 requests, after 1 GiB of leaked device
+  memory, or when its stdin closes.
+- **Fallback.** A host that cannot be built or started falls back to one process per run.
+- **Server path.** `ServerEvaluator` (KernelBlaster's exec server) stays one process per run.
+  It parses the same lines, eager only, without attribution: the server builds the driver
+  without CUPTI's headers.
+
+Measurements and design: ModelBlaster `docs/gpu_harness_perf.md`; bench script
+`scripts/bench_runtime.py`.
 
 ## Proposals
 
@@ -69,7 +169,12 @@ register `stub:` models when ModelBlaster drives this runner as a subprocess.
 float4 improvement, no-op rewrites, and a broken candidate repaired by the fix loop; and reuse
 of a stored winner by a second problem. Needs nvcc and a GPU (skipped otherwise).
 `tests/test_multislot_units.py` covers proposals (fusion, split), the roofline state, bandit
-transfer and driver-output parsing without a GPU.
+transfer and driver-output parsing without a GPU. `tests/test_runtime_host.py` covers the host
+protocol and crash recovery against a scripted fake host, the end-to-end reward decision
+(a fewer-launches win the slot rule rejects, a slot-only gain it would take) with a scripted
+evaluator, record compatibility, and, with a GPU, the real host on the LeNet fixture: the same
+checks and errors as the one-process driver, and recovery from a segfault, an illegal address
+and a hang.
 
 ## NCU
 

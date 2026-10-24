@@ -19,3 +19,8 @@ int mb_num_ops() { return 11; }
 void launch_gpu_implementation(void **b) {
     for (int i = 0; i < 11; ++i) mb_run_op(i, b);
 }
+// persistent-host ABI (driver.cpp -DMB_HOST dlopens these from the candidate's .so)
+extern "C" int mb_so_abi() { return 1; }
+extern "C" void mb_so_run_op(int i, void **b) { mb_run_op(i, b); }
+extern "C" void mb_so_launch(void **b) { launch_gpu_implementation(b); }
+extern "C" int mb_so_num_ops() { return mb_num_ops(); }

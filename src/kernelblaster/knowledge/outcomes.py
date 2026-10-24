@@ -65,8 +65,22 @@ class OutcomeRecord:
     diff_summary: Optional[str] = None       # short description of the code change
     impl_id: Optional[str] = None            # impl_store record this produced (verified only)
     parent_impl_id: Optional[str] = None
+    # what status / reward were measured on: "e2e_graph" / "e2e_eager" (the deployed
+    # partition time; metric_* are then the slot's attributed GPU times, speedup the
+    # slot's), "slot_events" (the slot's event-timed time); None: records written
+    # before the field existed (slot_events)
+    timing_basis: Optional[str] = None
+    e2e_before: Optional[float] = None       # deployed partition time before / with the change, us
+    e2e_after: Optional[float] = None
+    partition_effect: Optional[float] = None  # fraction of the deployed partition time saved (> 0 faster)
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     ts: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds"))
+
+    @classmethod
+    def from_json(cls, d: dict) -> "OutcomeRecord":
+        """A stored record; fields this version does not know are dropped (newer writers)."""
+        known = cls.__dataclass_fields__
+        return cls(**{k: v for k, v in d.items() if k in known})
 
     def __post_init__(self):
         if self.status not in STATUSES:
@@ -96,7 +110,7 @@ class OutcomeLog:
             for line in f:
                 line = line.strip()
                 if line:
-                    yield OutcomeRecord(**json.loads(line))
+                    yield OutcomeRecord.from_json(json.loads(line))
 
     def get(self, ids) -> list[OutcomeRecord]:
         want = set(ids)
