@@ -1,8 +1,9 @@
 # Knowledge architecture v2: cross-target, mechanism-aware, hypothesis-driven
 
-Status: steps 1-6 of "Plan" implemented in `src/kernelblaster/knowledge/v2/`, behind a switch
-(`run_multislot.py --knowledge v2`, `KB_KNOWLEDGE=v2` for the single-file flows); v1 stays the
-default. Evaluation (step 7) results and the deviations from this design are in section 14. Companion docs: `docs/semantic_update_pass.md` (claims + reflection, v1),
+Status: steps 1-6 of "Plan" are implemented in `src/kernelblaster/knowledge/v2/` behind a switch
+(`run_multislot.py --knowledge v2`, `KB_KNOWLEDGE=v2` for the single-file flows) and evaluated;
+v1 stays the default (the evaluation shows no transfer benefit yet). Results and the deviations
+from this design are in section 14. Companion docs: `docs/semantic_update_pass.md` (claims + reflection, v1),
 `docs/multislot_optimization.md`, ModelBlaster `docs/kernelblaster_multislot.md`.
 
 ## 1. Why
@@ -243,6 +244,12 @@ Retrieval for a slot builds a budgeted prompt section, most specific first:
 | state definition | predicates over canonical metrics | LLM-described profiles | testable, deterministic, mergeable |
 | value inheritance | statistical shrinkage to parent | copying technique lists into new states | no duplicated, drifting entries; evidence flows both ways |
 | store | SQLite (WAL) | JSON files | concurrency, queries across entities, one source of truth |
+| seed format (impl.) | JSON seeds | YAML | no PyYAML dependency (section 14) |
+| `occupancy` (impl.) | achieved occupancy, % of hardware max | achieved / theoretical | what the profilers report directly (section 14) |
+| seed roots (impl.) | five ordered roots, total over (mem_util, compute_util) | the design's partial roots | nothing falls between roots; estimates rarely reach 50 % (section 14) |
+| stats path (impl.) | linear: target -> family -> universal at the leaf, then the state chain, then op class `*` | a lattice with several parents | one parent per node keeps the shrinkage recursion simple (section 14) |
+| graph hypotheses (impl.) | keyed by ModelBlaster `graph_hints/v1` ids, decisions synced from MB | a KB-side lifecycle | MB already builds and decides graph changes (section 14) |
+| metric adapters (impl.) | chosen by the agent's `TargetProfile.profiler` module; profile peaks fill `targets.json` gaps | a separate target switch | one place decides per-target behaviour (section 14) |
 
 ## 14. Implementation (steps 1-6) and evaluation
 
@@ -283,3 +290,102 @@ Tests: `tests/test_knowledge_v2.py`.
 | hypothesis generation "cheap model" | the upkeep model is configurable (`--upkeep-model`); runs below used Sonnet for generation and state discovery, Haiku for codegen and reflection | design reasoning quality matters most there |
 | graph-level hypotheses with the same lifecycle | kb-proposals become `kind=graph` hypotheses keyed by ModelBlaster's `graph_hints/v1` ids (`fuse:<kind>`, `split:<slot>`); MB's accepted / rejected decisions are synced into promoted / retired (`sync_graph_hints`) | MB's hint layer already owns building and deciding graph changes; KB does not duplicate it |
 | "already tried" tally in the claim store | derived from the outcomes table | one source of truth, safe across processes |
+
+### Evaluation
+
+**Offline** (`scripts/eval_knowledge_v2.py`, 142 recorded v1 outcomes from seven earlier runs on
+sm_75 / sm_89; roofline vectors rebuilt from the problem manifests and the measured slot times):
+every record classifies (unknown rate 0 %; 126 at depth 2, 16 at depth 1). The seed thresholds
+put most roofline-estimated slots under `underutilized` (the old 15 %-of-peak names
+`compute_bound` / `underutilized_compute` both land in `underutilized > underutilized_compute`).
+Do states separate technique effects (eta^2 of log2 speedup by state, within technique,
+permutation p over 2000 shuffles): v1 roofline state 0.62 (p < 0.001), v2 leaf 0.61 (p < 0.001), v2
+root 0.19 (p = 0.07), op class alone 0.68. Within technique x op class (does the state add
+anything beyond the op class): v1 0.27 (p = 0.04, 87 outcomes), v2 leaf 0.37 (p = 0.05, 36
+outcomes: fewer groups have two v2 states). So the seed leaves are about as informative as v1's
+roofline names on estimated data, and neither is much better than the op class. The old logs
+have only 4 records with NCU deltas (2 decided), too few for the mechanism check.
+
+On the v2 database of the L40S NCU run (B1 below; 90 outcomes, 43 with measured deltas):
+mechanism check decided on 20 (23 ties / no predicted metric measured), agreement with the
+outcome 0.70 vs 0.485 by chance; P(improved | confirmed) = 6/7 = 0.86, P(improved | contradicted)
+= 5/13 = 0.38, one-sided Fisher p = 0.058. Suggestive, not conclusive at this size. The
+contradictions are informative: on naive seed kernels `thread_coarsening` / `loop_unrolling_and_ilp`
+win while `compute_util` (SM throughput) *falls* (the naive kernel was busy issuing redundant
+instructions), against their `predicts`; reflection wrote validated `mechanism` claims saying
+exactly that (see below) -- material for refining `predicts`.
+
+**Online** (Bedrock Haiku codegen + reflection, Sonnet for the upkeep passes; problems exported
+by ModelBlaster: Level2 1_Conv2D_ReLU_BiasAdd, 12_Gemm_Multiply_LeakyReLU, 17_Conv2d_InstanceNorm_
+Divide, 99_Matmul_GELU_Softmax; 3 rollouts x 5 steps per problem):
+
+| run | where | what the system did | tokens (in/out) | est. $ |
+|---|---|---|---|---|
+| A1 | sm_75 local (counters unavailable: roofline vectors) | 45 outcomes classified (`underutilized_compute` 30, `memory_bound` 9, `underutilized_memory` 6); 10 hypotheses proposed (port / combine triggers), 2 tested and **promoted** (target level, mechanism unmeasured: `cuda_streaming_cs_stores_for_elementwise`, `inline_affine_index_instead_of_index_tensor_load`; wins on 2 problems, small rewards); state discovery: `underutilized_compute_near_idle` (`compute_util < 5 and mem_util < 0.5`) **admitted** as probationary (variance reduced 95 % on the held-out third), `underutilized_compute_low_util` **rejected** ("sides 2/4, need >= 3 each"), one cluster declined by the model ("groups interleave on every metric") | codegen 198k/224k, reflection 24k/11k, upkeep 25k/13k | 1.66 |
+| B1 | L40S sm_89 via ssh, `--ncu all` (copy of A1's DB) | measured vectors: `balanced_bound` (naive conv), `compute_bound > matrix_compute`, `memory_bound > cache_thrashing`, `on_chip_memory_bound`, `low_parallelism`; 11 hypotheses from **profiler** (NCU rule) and **code-mining** triggers (e.g. `gemm_address_compaction_to_reach_48_regs_for_5_cta_residency`, `stream_k_persistent_gemm_with_l2_swizzled_order`); 10 validated `mechanism` claims (3 rejected: "observed down but the cited deltas are mostly flat") | codegen 220k/201k, reflection 37k/20k, upkeep 29k/16k | 1.68 |
+| lift | reflection pass on a copy of B1's DB, mixed sm_75 + sm_89 batch | with deterministic lift candidates in the prompt, one claim **lifted** target -> `simt_gpu` family, validated on its cited records (support on cuda:sm_75 and cuda:sm_89); a universal lift in the unit tests is rejected ("needs >= 2 families"). Without the candidates (B1 live) the model never saw the sm_75 claims and proposed no lift; fixed in 1d7a1e4 | 24k/9k (2 calls) | 0.07 |
+| A2 | sm_75 local, seed 1, continues A1 | 45 more outcomes; one discovery cluster declined by the model with reasons; knowledge snapshot for the transfer (90 outcomes, 23 claims, 15 hypotheses: 2 promoted, 2 testing, 11 proposed, 1 probationary state) | codegen 236k/208k, reflection 33k/15k, upkeep 17k/6k | 1.52 |
+
+| A3 | sm_75 local, seed 2, after the unit fix (012e5ac) | the review pass **retired** 10 stored hypotheses with the reason ("preconditions in the wrong unit: bw_util is in percent (0-100) but compared with 0.85"); 2 new ones with correct units; `underutilized_compute_gemm_high_ai` (`arith_intensity > 400`) **admitted** (variance -92 %, judged on the full cluster: < 4 held out); a re-proposal of an existing state rejected ("already exists"), two clusters declined by the model | codegen 248k/203k, reflection 30k/15k, upkeep 13k/4k | 1.47 |
+| transfer x 9 | L40S sm_89, `--ncu best`, 3 x 4 steps per problem | see below; in the knowledge-on runs reflection **lifted 9 claims** target -> `simt_gpu` family on sm_75 + sm_89 support and **rejected 5 lifts** with the per-target counts ("needs consistent support on >= 2 of its targets, has ['cuda:sm_89'] (support {sm_75: 3, sm_89: 5}, contradict {sm_75: 3})") | ~1.1 per run | 9.9 |
+
+Across the online runs: states were assigned from metrics on every step (roofline on sm_75,
+NCU-measured on sm_89); hypotheses were proposed from five sources (gap triggers never fired:
+no state had >= 4 locally tried techniques all <= 0), tested under the exploration budget,
+promoted (2) and retired (10, plus budget retirements in the unit tests); state proposals were
+admitted (2, both still probationary) and rejected with reasons (6); lifts happened only with
+two-target evidence.
+
+On the NCU-measured data (the L40S run plus the three knowledge-off transfer runs: 198
+outcomes, 85 with measured deltas), the seed states do separate technique effects: eta^2 0.38
+(p = 0.04) for leaves and 0.48 (p = 0.005) within technique x op class, against 0.14 (p = 0.24)
+for the op class alone. On roofline-only sm_75 data (135 outcomes) they do not (leaf 0.16,
+p = 0.37; op class 0.31, p = 0.02). The mechanism check on the 33 decided measured records:
+agreement 0.70 vs 0.51 by chance, P(improved | confirmed) = 15/17 = 0.88 vs 8/16 = 0.50 for
+contradicted, one-sided Fisher p = 0.02.
+
+**Transfer** (learn on sm_75: A1-A3, 135 outcomes, 3 Level2 problems; then the same problems on
+the L40S, knowledge on = a copy of that database with an empty implementation store, off = an
+empty database; both v2, Haiku codegen + reflection, no upkeep model, 3 seeds each). Final
+partition speedup over the exported seed (geometric mean, log s.d.):
+
+| problem | off | on (round 1) | on (round 2, after the unit fix) |
+|---|---|---|---|
+| 1_Conv2D_ReLU_BiasAdd | 35.7x (0.20) | 30.4x (0.25) | 27.3x (0.10) |
+| 12_Gemm_Multiply_LeakyReLU | 45.8x (0.08) | 48.0x (0.14) | 46.8x (0.10) |
+| 17_Conv2d_InstanceNorm_Divide | 36.6x (0.23) | 31.8x (0.21) | 34.2x (0.04) |
+
+LLM calls to the first win (> 1 % of the partition): 1 in every run for problems 1 and 12 (the
+first rewrite of a naive seed always wins), 3-6 (off) vs 2-5 (on) for problem 17. Pooled over
+problems (log speedup centred per problem), on / off = 0.92 (round 1, permutation p = 0.32) and
+0.90 (round 2, p = 0.14). **Conclusion: no measurable benefit from sm_75 knowledge on sm_89 at
+this scale; the point estimate is slightly negative and within the seed-to-seed spread.** Round 1
+tested no hypothesis at all (every learned hypothesis had fraction thresholds on percent
+metrics, so its preconditions were False on measured slots -- the bug fixed in 012e5ac); in
+round 2 hypotheses took 0-3 of 12 steps, mostly on small elementwise slots (rewards <= 0.002).
+Caveats: the seeds are naive kernels, so a 25-50x first-step gain dominates the final number and
+leaves little room for priors; off-arm runs ran one at a time on GPU 3, on-arm runs in parallel on
+GPUs 2 and 3 (shared local compile CPU); 12 steps per problem.
+
+LLM spend (ledger `who=knowledge-v2`): $16.34 of the $150 allowance (Haiku codegen and reflection
+$15.51, Sonnet upkeep in A1-A3 and B1 $0.83).
+
+### Open issues / next steps
+
+* Predictions: `thread_coarsening` / `loop_unrolling_and_ilp` predict `compute_util` up, but on
+  naive kernels it falls with a win; the validated `mechanism` claims say so. Close the loop:
+  refine `predicts` (or condition them on the state) from eligible mechanism claims.
+* Gap triggers never fired and port triggers dominate hypothesis generation (footer techniques
+  without a CUDA realization); give gap/profiler/code-mining triggers priority and cap port.
+* Promotion with tiny rewards (mean 0.005) passes "LCB > 0" on two or three attempts; consider a
+  minimum effect size or >= 3 attempts.
+* Seed thresholds at 50 % of peak put most roofline-estimated slots under `underutilized`;
+  state discovery admitted refinements but both are still probationary (probation needs 10 more
+  decidable outcomes of the trigger technique).
+* The transfer needs a harder setting to be informative: stronger seeds (e.g. ModelBlaster's
+  kernel-cache winners), more steps, more problems/op classes, and an OpenCL target.
+* Graph hypotheses are recorded from kb-proposals and synced from ModelBlaster's graph_hints
+  decisions, but nothing runs `sync_graph_hints` automatically yet.
+
+A v1 bug surfaced on the way: `parse_json_response` cut JSON at a ```` ```cuda ```` mentioned
+inside a claim text and silently dropped whole reflection passes (fixed, tested).
