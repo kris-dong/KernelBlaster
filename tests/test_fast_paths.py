@@ -314,6 +314,38 @@ def test_fast_and_cmake_builds_agree(tmp_path, env_root, monkeypatch):
     assert "libtorch" not in libs                                         # plain flavour
 
 
+# ---------------------------------------------------------------- multi-slot NCU
+
+
+def test_ncu_command_slot_filter():
+    from kernelblaster.knowledge import ncu
+
+    assert "regex:'mbslot_'" in ncu.ncu_command()
+    assert "regex:'mbslot_relu::'" in ncu.ncu_command(slots=["relu"])
+    assert "regex:'mbslot_(conv2d|relu)::'" in ncu.ncu_command(slots=["relu", "conv2d"])
+
+
+def test_profile_skips_slots_with_cached_profiles():
+    from kernelblaster.agents.opt_multislot import MultiSlotAgent
+
+    calls = []
+
+    class Ev:
+        async def profile(self, problem, sources, tag, slots=None):
+            calls.append(slots)
+            return {s: {"duration_us": 1.0, "code": sources[s]} for s in (slots or sources)}, None
+
+    a = object.__new__(MultiSlotAgent)
+    a.ncu, a.ncu_disabled, a.ncu_cache, a.ncu_runs, a.ev, a.p = "best", None, {}, 0, Ev(), None
+    src = {"a": "A0", "b": "B0", "c": "C0"}
+    by = asyncio.run(a._profile(src, "baseline"))
+    assert calls == [None] and set(by) == {"a", "b", "c"}
+    by = asyncio.run(a._profile({**src, "b": "B1"}, "cand"))
+    assert calls[-1] == ["b"] and by["b"]["code"] == "B1" and by["a"]["code"] == "A0"
+    assert asyncio.run(a._profile({**src, "b": "B1"}, "again")) == by and len(calls) == 2
+    assert a.ncu_runs == 2
+
+
 # ---------------------------------------------------------------- exec by path
 
 
