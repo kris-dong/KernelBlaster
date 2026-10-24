@@ -101,7 +101,7 @@ def techniques_for(op_class: str) -> list[tuple[str, str]]:
 # ---------------------------------------------------------------- roofline
 
 # element bytes per manifest buffer dtype (fp16 problems move half the bytes)
-BUFFER_BYTES = {"f32": 4, "f16": 2, "i32": 4}
+BUFFER_BYTES = {"f32": 4, "f16": 2, "i32": 4, "i64": 8}
 
 
 def _nbytes(buf: dict) -> float:
