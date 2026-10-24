@@ -174,6 +174,14 @@ async def check_gpu_processes():
             scope_note = (
                 f" (scoped to assigned GPUs {sorted(GPU_IDS)})" if scoped else ""
             )
+            # Opt-in for single-GPU dev boxes: timings get noisier, so the
+            # default stays strict.
+            if os.getenv("KERNELBLASTER_ALLOW_SHARED_GPU", "0") in ("1", "true", "yes"):
+                logging.getLogger(__name__).warning(
+                    f"Sharing the GPU with pre-existing processes{scope_note} "
+                    f"(KERNELBLASTER_ALLOW_SHARED_GPU): {active_processes}"
+                )
+                return
             raise RuntimeError(
                 f"Found pre-existing GPU processes{scope_note}:\n"
                 f"{json.dumps(active_processes, indent=2)}"
