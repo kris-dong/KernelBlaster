@@ -1,0 +1,297 @@
+{
+ "_doc": "Curated technique seeds (knowledge_architecture.md section 5), one file per area. Fields: id, level + scope (a scope node or universal), aliases (v1 / technique-DB / footer names folded in), mechanism, preconditions (predicate DSL), predicts (canonical metric -> up|down|flat|up_or_flat|down_or_flat), risks (pitfalls), states / op_classes / op_kinds gates (empty = any), slot (offered by the multi-slot agent), prior {mean, n}: a seed prior with a low pseudo-count that evidence overrides, realizations by scope (target:<key> | target:<backend>:sm_NN+ | target:<backend> | node:<id> | universal). Loaded by Ontology.seed(); scripts/seed_knowledge.py builds a knowledge.db from these files.",
+ "techniques": [
+  {
+   "id": "warp_shuffle_reduction",
+   "level": "node",
+   "scope": "simt_gpu",
+   "aliases": [
+    "warp_level_primitives",
+    "subgroup_reduction",
+    "cooperative_reduction"
+   ],
+   "mechanism": "reduce in registers across the lanes of a warp / subgroup, with no shared-memory round trips or barriers per step",
+   "predicts": {
+    "mem_util": "down_or_flat",
+    "compute_util": "up_or_flat"
+   },
+   "risks": [
+    "wrong masks on partial warps"
+   ],
+   "states": [],
+   "op_classes": [
+    "reduction",
+    "attention"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.08,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:cuda",
+     "how": "Reduce within a warp with __shfl_down_sync(0xffffffff, v, o) for o = 16..1, then across warps via a 32-entry shared array and one more warp reduction."
+    },
+    {
+     "scope": "target:opencl",
+     "how": "sub_group_reduce_add / sub_group_reduce_max (cl_khr_subgroups; on Adreno a subgroup is a half or full 64-wide wave), then across subgroups via __local."
+    }
+   ]
+  },
+  {
+   "id": "one_block_per_row",
+   "level": "node",
+   "scope": "simt_gpu",
+   "aliases": [
+    "row_parallel_reduction"
+   ],
+   "mechanism": "map one block (or warp) to each reduced row and parallelise the reduced dimension, so every lane has work",
+   "predicts": {
+    "parallel_fill": "up_or_flat",
+    "occupancy": "up"
+   },
+   "risks": [],
+   "states": [],
+   "op_classes": [
+    "reduction"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.08,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "node:simt_gpu",
+     "how": "Map one block (or one warp / subgroup for short rows) to each reduced row; threads stride over the row with coalesced loads, then a block reduction."
+    }
+   ]
+  },
+  {
+   "id": "two_stage_grid_reduction",
+   "level": "universal",
+   "aliases": [
+    "grid_reduction",
+    "cooperative_groups"
+   ],
+   "mechanism": "a reduction over a huge dimension to few outputs: every block reduces a chunk, a second pass combines the partials",
+   "preconditions": {
+    "parallel_fill": "<",
+    "v": 0.5
+   },
+   "predicts": {
+    "parallel_fill": "up",
+    "bw_util": "up"
+   },
+   "risks": [
+    "atomics change summation order"
+   ],
+   "states": [
+    "low_parallelism",
+    "latency_bound",
+    "underutilized"
+   ],
+   "op_classes": [
+    "reduction"
+   ],
+   "op_kinds": [
+    "sum_dim",
+    "mean_dim",
+    "reduce",
+    "adaptive_avg_pool2d"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.08,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "node:simt_gpu",
+     "how": "Grid of a few blocks per SM, each reduces a contiguous chunk to one partial; a second tiny kernel (or the last block, via an atomic counter) reduces the partials."
+    }
+   ]
+  },
+  {
+   "id": "welford_online_statistics",
+   "level": "universal",
+   "aliases": [
+    "welford",
+    "online_variance",
+    "one_pass_mean_var"
+   ],
+   "mechanism": "mean and variance in one pass with Welford's update (merge partials with Chan's formula): one read of the input instead of two",
+   "predicts": {
+    "bw_util": "down_or_flat"
+   },
+   "risks": [
+    "the naive one-pass E[x^2]-E[x]^2 loses precision; Welford does not"
+   ],
+   "states": [],
+   "op_classes": [
+    "reduction"
+   ],
+   "op_kinds": [
+    "layer_norm",
+    "group_norm",
+    "batchnorm2d"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.08,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "node:simt_gpu",
+     "how": "Per thread: Welford (count, mean, M2) over its elements; combine across lanes / warps with Chan's merge; then normalise in the same kernel with the row still on chip."
+    },
+    {
+     "scope": "node:vector_cpu",
+     "how": "Vector Welford over strip-mined chunks, merge the lane partials at the end."
+    }
+   ]
+  },
+  {
+   "id": "online_softmax",
+   "level": "universal",
+   "aliases": [
+    "online_softmax_reduction",
+    "one_pass_softmax"
+   ],
+   "mechanism": "max and normaliser in one pass with running rescaling (m, l), then one write pass: two reads of the row become one",
+   "predicts": {
+    "bw_util": "down_or_flat"
+   },
+   "risks": [
+    "rescale the running sum when the max changes: l = l * exp(m_old - m_new) + exp(x - m_new)"
+   ],
+   "states": [],
+   "op_classes": [
+    "reduction",
+    "attention"
+   ],
+   "op_kinds": [
+    "softmax",
+    "softmax_dim",
+    "sdpa"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.08,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "node:simt_gpu",
+     "how": "One block (or warp) per row: each thread keeps (m, l) over its elements, combine across lanes with the rescaling merge, then write exp(x - m) / l in a second sweep over registers / on-chip memory."
+    },
+    {
+     "scope": "node:vector_cpu",
+     "how": "Strip-mined pass computing running max and rescaled sum (vfredmax + polynomial exp), then the write pass."
+    }
+   ]
+  },
+  {
+   "id": "pooling_window_reuse",
+   "level": "universal",
+   "aliases": [
+    "pool_tiling"
+   ],
+   "mechanism": "pooling windows overlap: stage the input tile plus halo once and let each thread compute several outputs from it",
+   "predicts": {
+    "bw_util": "up_or_flat",
+    "l1_hit": "up"
+   },
+   "risks": [],
+   "states": [],
+   "op_classes": [
+    "reduction"
+   ],
+   "op_kinds": [
+    "maxpool2d",
+    "maxpool2d_ex",
+    "maxpool3d",
+    "avgpool2d",
+    "avgpool3d"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.06,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "node:simt_gpu",
+     "how": "One thread per output (or a strip of outputs along W) reading a staged input tile; for non-overlapping windows (stride == kernel) just vectorise the loads along W."
+    }
+   ]
+  },
+  {
+   "id": "global_pool_plane_reduction",
+   "level": "universal",
+   "aliases": [
+    "global_average_pool"
+   ],
+   "mechanism": "global / adaptive pooling and mean over H x W: one block (or warp) per (n, c) plane with a tree reduction",
+   "predicts": {
+    "parallel_fill": "up_or_flat",
+    "bw_util": "up"
+   },
+   "risks": [],
+   "states": [],
+   "op_classes": [
+    "reduction"
+   ],
+   "op_kinds": [
+    "adaptive_avg_pool2d",
+    "mean_dim",
+    "sum_dim",
+    "max_dim",
+    "min_dim"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.08,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "node:simt_gpu",
+     "how": "Grid over N*C planes; threads stride over the H*W elements with vectorised loads; warp / block reduction; one store per plane."
+    }
+   ]
+  },
+  {
+   "id": "topk_register_selection",
+   "level": "universal",
+   "aliases": [
+    "partial_sort"
+   ],
+   "mechanism": "per-row top-k with a small register / on-chip heap or bitonic network instead of a full sort",
+   "predicts": {
+    "compute_util": "down"
+   },
+   "risks": [],
+   "states": [],
+   "op_classes": [
+    "reduction"
+   ],
+   "op_kinds": [
+    "topk"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.06,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "node:simt_gpu",
+     "how": "One warp per row: each lane keeps its k best in registers (k small), then a warp-level bitonic merge; radix select for large k."
+    }
+   ]
+  }
+ ]
+}

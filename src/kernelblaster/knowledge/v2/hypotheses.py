@@ -18,12 +18,20 @@ technique) and ``graph`` (ModelBlaster proposals, ids shared with MB's
 into specs; :func:`validate_spec` checks them and dedupes against known
 techniques and hypotheses by name and mechanism similarity.
 
-Promotion (:meth:`HypothesisBook.review`): wins (reward > 0) on >= 2
-problems, lower confidence bound of the mean reward > 0, mechanism confirmed
-in >= 50% of the measured attempts -> a technique at the lowest level that
-covers the evidence (one target -> target; >= 2 targets of a family ->
-family; >= 2 families -> universal). Retired once the budget is spent
-without meeting that bar (the reason is kept).
+Promotion (:meth:`HypothesisBook.review`) is automatic -- nobody reviews it,
+so the bar carries the safeguards: wins (reward > 0, status improved) on >= 2
+problems, mean reward >= ``MIN_EFFECT`` (1% of partition time: below that a
+"win" is indistinguishable from timing noise on a shared GPU, where the
+agent's own win threshold is 3% of the slot), lower confidence bound of the
+mean > 0, mechanism confirmed in >= 50% of the measured attempts. The new
+technique is scoped to the lowest common ancestor of the targets it won on
+(one target -> that target) and is used at once. Retired once the budget is
+spent without meeting the bar (the reason is kept).
+
+Promoted techniques keep being checked (:meth:`HypothesisBook.revalidate`):
+when later outcomes on some target under its scope average <= 0 over >= 3
+attempts, the technique is rescoped to the common ancestor of the targets
+where it still pays (or to one target), and retired when none is left.
 """
 from __future__ import annotations
 
@@ -38,13 +46,15 @@ from typing import Optional
 from ..claims import normalise, similar
 from . import predicates as P
 from .ontology import CONFIRMED, MECH_UNKNOWN, Technique, validate_predicts
-from .targets import FAMILY, TARGET, UNIVERSAL
+from .targets import ROOT, TARGET, UNIVERSAL
 
 PROPOSED, TESTING, PROMOTED, RETIRED = "proposed", "testing", "promoted", "retired"
 SOURCES = ("gap", "port", "combine", "profiler", "code_mining", "graph")
 DEFAULT_BUDGET = 4
 EXPLORE_FRAC = 0.15
 MIN_WIN_PROBLEMS = 2
+MIN_EFFECT = 0.01            # mean reward (fraction of partition time) a promotion needs
+DEMOTE_MIN_N = 3             # outcomes on one target before its evidence can demote a technique
 NAME_RE = re.compile(r"[a-z][a-z0-9_]{2,63}")
 
 
@@ -158,7 +168,7 @@ class HypothesisBook:
 
     def add(self, h: Hypothesis, mirror=None) -> Hypothesis:
         self.save(h)
-        self.db.review("hypothesis_proposed", h.id, {"name": h.name, "source": h.source,
+        self.db.audit("hypothesis_proposed", h.id, {"name": h.name, "source": h.source,
                                                     "mechanism": h.mechanism, "target": h.target_key}, mirror)
         return h
 
@@ -170,7 +180,7 @@ class HypothesisBook:
         for h in self.open():
             if h.kind != "slot" or len(h.attempts) >= h.budget:
                 continue
-            if self.registry.family_of(h.target_key) != self.registry.family_of(target_key):
+            if self.registry.lca([h.target_key, target_key]) == ROOT:   # only below a shared node
                 continue
             if h.op_classes and op_class not in h.op_classes:
                 continue
@@ -207,6 +217,8 @@ class HypothesisBook:
         mean = sum(rs) / n
         sd = math.sqrt(sum((r - mean) ** 2 for r in rs) / (n - 1)) if n > 1 else float("inf")
         lcb = mean - sd / math.sqrt(n)
+        if mean < MIN_EFFECT:
+            return False, f"mean reward {mean:.4f} < minimum effect {MIN_EFFECT}"
         if lcb <= 0:
             return False, f"mean reward {mean:.3f}, LCB {lcb:.3f} <= 0"
         meas = [a for a in h.attempts if a.get("measured") and a["mechanism"] != MECH_UNKNOWN]
@@ -218,21 +230,19 @@ class HypothesisBook:
                       + (f"mechanism confirmed {conf:.0%} of {len(meas)} measured" if meas
                          else "mechanism unmeasured"))
 
-    def evidence_level(self, h: Hypothesis) -> tuple[str, Optional[str]]:
-        tks = {a["target_key"] for a in h.attempts if a["reward"] > 0}
-        fams = {self.registry.family_of(t) for t in tks}
-        if len(fams) >= 2:
-            return UNIVERSAL, None
-        if len(tks) >= 2:
-            return FAMILY, fams.pop()
-        return TARGET, (tks.pop() if tks else h.target_key)
+    def evidence_scope(self, h: Hypothesis) -> str:
+        """Lowest common ancestor of the targets the hypothesis won on (one target -> itself)."""
+        tks = sorted({a["target_key"] for a in h.attempts if a["reward"] > 0}) or [h.target_key]
+        return self.registry.lca(tks)
 
     def promote(self, h: Hypothesis, reason: str, mirror=None) -> Technique:
-        level, scope = self.evidence_level(h)
-        rscope = {UNIVERSAL: f"family:{self.registry.family_of(h.target_key)}", FAMILY: f"family:{scope}",
-                  TARGET: f"target:{scope}"}[level]
+        scope = self.evidence_scope(h)
+        level = self.registry.level_of(scope)
+        rscope = (f"target:{scope}" if level == TARGET else
+                  f"node:{scope}" if scope != ROOT else f"node:{self.registry.family_of(h.target_key)}")
         tid = h.name if not self.ontology.resolve(h.name) else f"{h.name}_{h.id[2:6]}"
-        t = Technique(id=tid, mechanism=h.mechanism, level=level, scope=scope, preconditions=h.preconditions,
+        t = Technique(id=tid, mechanism=h.mechanism, level=level, scope=None if scope == ROOT else scope,
+                      preconditions=h.preconditions,
                       predicts=h.predicts, risks=h.risks, states=h.states, op_classes=h.op_classes, slot=True,
                       realizations=[{"scope": rscope, "how": h.how}], source=f"hypothesis:{h.id}",
                       relations={"based_on": h.based_on} if h.based_on else {})
@@ -240,14 +250,54 @@ class HypothesisBook:
         self.db.put("techniques", t.id, t.to_dict())
         h.status, h.reason, h.promoted_to = PROMOTED, reason, t.id
         self.save(h)
-        self.db.review("hypothesis_promoted", h.id, {"technique": t.id, "level": level, "scope": scope,
-                                                    "reason": reason, "attempts": len(h.attempts)}, mirror)
+        self.db.audit("hypothesis_promoted", h.id, {"technique": t.id, "level": level, "scope": scope,
+                                                   "reason": reason, "attempts": len(h.attempts)}, mirror)
         return t
+
+    def revalidate(self, rows: list[dict], mirror=None) -> list[dict]:
+        """Demote / retire promoted techniques that later outcomes contradict (automatic rollback)."""
+        events = []
+        for t in list(self.ontology.techniques.values()):
+            if not t.source.startswith("hypothesis:") or t.status != "active":
+                continue
+            sid = self.registry.scope_id(t.level, t.scope)
+            by: dict[str, list] = {}
+            for r in rows:
+                if ((r.get("v2") or {}).get("item_id") or r["technique"]) == t.id and \
+                        (r.get("v2") or {}).get("reward") is not None:
+                    by.setdefault(self.registry.get(f"{r['target']}:{r['arch']}").key, []).append(
+                        float(r["v2"]["reward"]))
+            under = lambda k: sid in self.registry.chain(k)                       # noqa: E731
+            neg = {k for k, xs in by.items() if len(xs) >= DEMOTE_MIN_N and sum(xs) / len(xs) <= 0}
+            bad = sorted(k for k in neg if under(k))
+            if not bad:
+                continue
+            h = self.items.get(t.source.split(":", 1)[1])
+            won = {a["target_key"] for a in (h.attempts if h else []) if a["reward"] > 0}
+            good = sorted(k for k in set(by) | won if k not in neg and under(k)
+                          and (k not in by or sum(by[k]) / len(by[k]) >= MIN_EFFECT))
+            dest = self.registry.lca(good) if good else None
+            stats = {k: [len(xs), round(sum(xs) / len(xs), 4)] for k, xs in by.items()}
+            if dest is None:
+                t.status, t.slot = "retired", False
+                kind = "technique_retired"
+            elif dest != sid:
+                t.level, t.scope = self.registry.level_of(dest), (None if dest == ROOT else dest)
+                if self.registry.level_of(dest) == TARGET:
+                    t.realizations = [dict(r, scope=f"target:{dest}") for r in t.realizations[:1]]
+                kind = "technique_demoted"
+            else:
+                continue
+            self.db.put("techniques", t.id, t.to_dict())
+            ev = {"event": kind, "technique": t.id, "from": sid, "to": dest, "bad_targets": bad, "per_target": stats}
+            self.db.audit(kind, t.id, ev, mirror)
+            events.append(ev)
+        return events
 
     def retire(self, h: Hypothesis, reason: str, mirror=None) -> None:
         h.status, h.reason = RETIRED, reason
         self.save(h)
-        self.db.review("hypothesis_retired", h.id, {"name": h.name, "reason": reason,
+        self.db.audit("hypothesis_retired", h.id, {"name": h.name, "reason": reason,
                                                    "attempts": len(h.attempts)}, mirror)
 
     def review(self, mirror=None) -> list[dict]:
