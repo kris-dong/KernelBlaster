@@ -185,6 +185,11 @@ the class defines itself:
   that, and the report skips a torn last line.
 - **Rebuilding a run.** `report.summarize_events` rebuilds a run's collector summary from its events, so the
   JSONL alone gives the same tables as `summary.json`.
+- **Resumed runs.** Each segment of a resumed run appends to the same file as its own run (`<id>.s<n>`) after a
+  `{"t":"resume",...}` event; the multi-slot agent flushes the sink with every checkpoint and every journaled LLM
+  response. `step` counts completed steps (a step redone after a kill counts once) and responses reused from the
+  journal count as `llm.replayed`, so the report's combined totals equal an uninterrupted run's (plus any call
+  that was in flight at a kill). See [multislot_optimization.md](multislot_optimization.md#resume).
 
 ## Overhead
 

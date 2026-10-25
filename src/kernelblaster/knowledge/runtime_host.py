@@ -109,6 +109,9 @@ class HostClient:
             out.append(line)
             if line.startswith(HOST_MARKER):
                 self.ready = line.strip()
+                for x in out:                          # ssh hosts print their remote pid first
+                    if x.startswith("KB_HOST_PID "):
+                        self.remote_pid = x.split()[1].strip()
                 return None
 
     async def _readline(self, deadline: float) -> Optional[str]:

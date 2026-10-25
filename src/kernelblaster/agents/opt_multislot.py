@@ -28,6 +28,7 @@ and FLOPs per op) and the measured slot time -- no NCU counters needed.
 from __future__ import annotations
 
 import asyncio
+import copy
 import difflib
 import json
 import math
@@ -638,7 +639,8 @@ class MultiSlotAgent:
                  model_fix: Optional[str] = None, seed: int = 0, logger=None, run_id: Optional[str] = None,
                  problem_id: Optional[str] = None, propose: bool = True, ncu: str = "off",
                  knowledge_v2: Any = None, router: Optional[ModelRouter] = None, reward: Optional[str] = None,
-                 e2e_accept_pct: Optional[float] = None):
+                 e2e_accept_pct: Optional[float] = None, journal: Any = None,
+                 stop_event: Optional[asyncio.Event] = None, on_checkpoint: Any = None):
         self.p, self.ev, self.model = problem, evaluator, model
         # what a step is rewarded and accepted on: "e2e" (default; KERNELBLASTER_MULTISLOT_REWARD):
         # the deployed partition time (CUDA graph where capturable), paired with the incumbent
@@ -684,7 +686,22 @@ class MultiSlotAgent:
         self.bandit = bandit or TechniqueBandit()
         self.rng = random.Random(seed)
         self.log = logger or _default_logger
-        self.run_id = run_id or uuid.uuid4().hex[:8]
+        # resume (agents/journal.py): the snapshot + LLM responses of this problem, the
+        # run's stop request (SIGTERM / SIGINT) and a hook called after every checkpoint
+        self.journal, self.stop_event, self.on_checkpoint = journal, stop_event, on_checkpoint
+        prev = (journal.state or {}) if journal is not None else {}
+        self.run_id = prev.get("run_id") or run_id or uuid.uuid4().hex[:8]
+        self.segment = int(prev.get("segment", -1)) + 1 if prev else 0
+        self.resumed = bool(prev)
+        self._rstate: dict[int, dict] = {}              # rollout -> state after its last completed step
+        self._inflight: dict[str, dict] = {}            # "r,s" -> the slot / technique the step picked
+        self._replay: dict[str, dict] = {}              # in-flight plans restored from the journal
+        self._counted: set = set()                      # LLM journal keys whose usage is in llm_usage
+        self._existing: dict[str, set] = {"impl": set(), "outcome": set()}   # ids recorded before a kill
+        self.llm_replayed = 0                           # responses taken from the journal (not re-paid)
+        self.resume_info: dict = {}
+        self.phase: Optional[str] = None                # journal phase: init | rollouts | final | done
+        self.segments: list = []
         self.problem_id = problem_id or problem.name
         self.best: dict[str, SlotBest] = {}
         self.partition_us: Optional[float] = None
@@ -806,13 +823,38 @@ class MultiSlotAgent:
                                    signature=s.signature, shapes=s.shapes(), exclude_problem=self.problem_id,
                                    dtype=self.p.dtype)
 
-    async def _llm(self, messages, model, role: str = "codegen") -> str:
-        self.llm_calls += 1
+    async def _llm(self, messages, model, role: str = "codegen", key: Optional[str] = None,
+                   digest: Optional[str] = None, extra: Optional[dict] = None) -> str:
+        """One LLM call. With a journal and ``key``, a response journaled under ``key``
+        (and ``digest``, where given) is returned instead of calling the model again; a
+        new response is journaled before it is returned (so before its candidate is
+        evaluated). Usage is counted once per key across segments."""
+        jr = self.journal
+        if jr is not None and key is not None:
+            hit = jr.llm_get(key)
+            if hit is not None and (digest is None or hit.get("digest") == digest):
+                self.llm_replayed += 1
+                tel.count("llm.replayed")
+                if key not in self._counted:          # paid in a segment that died before its checkpoint
+                    self._count_usage(hit.get("usage") or {}, hit.get("model", model), hit.get("role", role), key)
+                return hit.get("text", "")
         with tel.attrs(role=role):            # telemetry: the llm.<role> span + token record
             resp = await generate_code_retry(messages, model, self.log, n_tasks=1)
         u = getattr(resp, "usage", None) or {}
         if not isinstance(u, dict):
             u = {k: getattr(u, k, 0) for k in ("prompt_tokens", "completion_tokens")}
+        text = resp.generations[0] if resp.generations else ""
+        if jr is not None and key is not None:
+            jr.llm_put(key, {"model": model, "role": role, "digest": digest, "text": text, **(extra or {}),
+                             "usage": {k: v for k, v in u.items() if isinstance(v, (int, float))}})
+            tel.flush()                        # its telemetry record is on disk with it
+        self._count_usage(u, model, role, key)
+        return text
+
+    def _count_usage(self, u: dict, model: str, role: str, key: Optional[str]) -> None:
+        if key is not None:
+            self._counted.add(key)
+        self.llm_calls += 1
         # OpenAI-style (prompt/completion) or Bedrock Converse-style (input/output) keys
         pt = int(u.get("prompt_tokens") or u.get("input_tokens") or 0)
         ct = int(u.get("completion_tokens") or u.get("output_tokens") or 0)
@@ -830,7 +872,6 @@ class MultiSlotAgent:
         by["completion_tokens"] += ct
         by["cost_usd"] += cost
         by["est_usd"] += est
-        return resp.generations[0] if resp.generations else ""
 
     def _outcome(self, **kw) -> OutcomeRecord:
         sid = kw.pop("sid")
@@ -839,6 +880,11 @@ class MultiSlotAgent:
                              run_id=self.run_id, slot=sid, op_kind=s.op, op_class=s.op_class,
                              shape_bucket=shape_bucket(s.op_class, s.shapes()[0] if s.instances else {}),
                              dtype=self.p.dtype, **kw)
+
+    def _rid(self, *parts) -> str:
+        """Deterministic record id of this run (impl store / outcome log idempotency key)."""
+        from .journal import sha
+        return sha(self.problem_id, self.run_id, *parts)
 
     @property
     def _tkey(self) -> str:
@@ -877,15 +923,21 @@ class MultiSlotAgent:
         if self.olog is None:
             return None
         rec = self._outcome(**kw)
+        if rec.id in self._existing["outcome"]:      # recorded by a segment killed before its checkpoint
+            return rec
         self.olog.append(rec)
         if self.claims is not None and hasattr(self.claims, "observe"):
             self.claims.observe(rec)          # "already tried" visible to parallel rollouts now
         return rec
 
     def _store(self, sid: str, code: str, slot_us: float, baseline_us: Optional[float],
-               techniques: list, parent: Optional[str], rel_err: Optional[float]) -> Optional[str]:
+               techniques: list, parent: Optional[str], rel_err: Optional[float],
+               rid: Optional[str] = None) -> Optional[str]:
+        """Add verified code to the store; ``rid``: a deterministic id (idempotent on resume)."""
         if self.store is None:
             return None
+        if rid is not None and rid in self._existing["impl"]:
+            return rid
         s = self.p.slots[sid]
         seed_us = self.baseline.slot_us.get(sid) if self.baseline else None
         rec = self.store.add(code, target=self.p.target, arch=self.arch_label, op=s.op, op_class=s.op_class,
@@ -895,7 +947,8 @@ class MultiSlotAgent:
                              speedup=(baseline_us / slot_us) if baseline_us and slot_us else None,
                              seed_us=seed_us, speedup_vs_seed=(seed_us / slot_us) if seed_us and slot_us else None,
                              techniques=techniques, parent_id=parent, problem_id=self.problem_id,
-                             run_id=self.run_id, slot=sid, max_rel_err=rel_err, dtype=self.p.dtype)
+                             run_id=self.run_id, slot=sid, max_rel_err=rel_err, dtype=self.p.dtype,
+                             **({"id": rid} if rid else {}))
         return rec.id
 
     # ---- initialise: baseline + store seeds
@@ -956,7 +1009,7 @@ class MultiSlotAgent:
         for sid, b in self.best.items():
             if b.impl_id is None:
                 b.impl_id = self._store(sid, b.source, b.slot_us, None, [], None,
-                                        base.slot_checks.get(sid, {}).get("rel_err"))
+                                        base.slot_checks.get(sid, {}).get("rel_err"), rid=self._rid("seed", sid))
         return base
 
     def _set_composite(self, res: EvalResult) -> None:
@@ -971,8 +1024,8 @@ class MultiSlotAgent:
                     meta: Optional[dict] = None) -> None:
         """One step inside a telemetry ``step`` span; its breakdown goes into the step's context."""
         n = len(self.steps_log)
-        with tel.span("step", collect=True, laps=True, rollout=ridx, step=step) as sp:
-            tel.count("step")
+        with tel.span("step", collect=True, laps=True, rollout=ridx, step=step,
+                      **({"replay": True} if f"{ridx},{step}" in self._replay else {})) as sp:
             try:
                 await self._step_body(ridx, step, cur, cur_us, meta)
             finally:
@@ -993,33 +1046,61 @@ class MultiSlotAgent:
             meta = {"e2e": self.e2e_us, "ev": {s: b.event_us for s, b in self.best.items()}}
         e2e = self.reward == "e2e"
         info = self.last_full if e2e else None
+        skey = f"{ridx},{step}"
         tel.lap("knowledge.select")
-        async with self._lock:
-            sid = self._pick_slot()
-            self.slot_tries[sid] += 1
-        slot = self.p.slots[sid]
-        state, nums = slot_state(self.p, sid, cur_us[sid], self.arch, self.tp.peaks_for(self.arch))
-        prof_before = self._ncu_of(sid, cur[sid])
-        if prof_before:
-            state = prof_before.get("state") or state    # measured bound beats the roofline estimate
-        choice = cls = vec_before = None
-        if self.kv is not None:
-            vec_before = self.kv.vector(self._tkey, estimate=self._roofline_input(sid, cur_us[sid], info),
-                                        profile=prof_before, profile_kind=self._profile_kind)
-            cls = self.kv.classify(vec_before, target_key=self._tkey, op_class=slot.op_class, dtype=self.p.dtype)
-            choice = self.kv.select(target_key=self._tkey, op_class=slot.op_class, dtype=self.p.dtype, cls=cls,
-                                    vec=vec_before, rng=self.rng, op_kind=slot.op)
-            tech, desc, state = choice.item_id, choice.desc, cls.label()
-            nums = {**nums, **cls.decided_by}
+        plan = self._replay.pop(skey, None)       # picked before a kill: its tries / RNG draws are in the snapshot
+        choice = cls = vec_before = key = None
+        if plan is not None:
+            sid = plan["sid"]
+            adopted = plan.get("count_try")
+            plan = {k: v for k, v in plan.items() if k != "count_try"}
+            self._inflight[skey] = plan               # in flight again (a later checkpoint keeps it)
+            if adopted:                               # from the LLM journal: its pick was never checkpointed
+                self.slot_tries[sid] += 1
+                if plan.get("rng"):                   # the draws the pick made
+                    from .journal import set_rng_state
+                    set_rng_state(self.rng, plan["rng"])
+            slot = self.p.slots[sid]
+            tech, desc, state, nums, key = plan["tech"], plan["desc"], plan["state"], plan["nums"], plan.get("key")
+            prof_before = self._ncu_of(sid, cur[sid])
+            if self.kv is not None:
+                from ..knowledge.v2.knowledge import Choice
+                from ..knowledge.v2.states import Classification
+                choice, cls, vec_before = Choice(**plan["choice"]), Classification(**plan["cls"]), plan["vec"]
         else:
-            lb = e2e and (self.runtime_info.get("launch_bound") or slot_launch_bound(info, sid, self.p))
-            techs = techniques_for(slot.op_class, self.tp.techniques, launch_bound=bool(lb))
-            # fp16 arms are their own keys (half2 / tensor-core techniques pay off
-            # differently); fp32 keys keep their names, and the cross-key prior
-            # still seeds an untried fp16 arm from its fp32 record
-            key = f"{slot.op_class}|{state}" + ("" if self.p.dtype == "fp32" else f"|{self.p.dtype}")
-            tech = self.bandit.select(key, [t for t, _ in techs], self.rng)
-            desc = dict(techs)[tech]
+            async with self._lock:
+                sid = self._pick_slot()
+                self.slot_tries[sid] += 1
+            slot = self.p.slots[sid]
+            state, nums = slot_state(self.p, sid, cur_us[sid], self.arch, self.tp.peaks_for(self.arch))
+            prof_before = self._ncu_of(sid, cur[sid])
+            if prof_before:
+                state = prof_before.get("state") or state    # measured bound beats the roofline estimate
+            if self.kv is not None:
+                vec_before = self.kv.vector(self._tkey, estimate=self._roofline_input(sid, cur_us[sid], info),
+                                            profile=prof_before, profile_kind=self._profile_kind)
+                cls = self.kv.classify(vec_before, target_key=self._tkey, op_class=slot.op_class,
+                                       dtype=self.p.dtype)
+                choice = self.kv.select(target_key=self._tkey, op_class=slot.op_class, dtype=self.p.dtype, cls=cls,
+                                        vec=vec_before, rng=self.rng, op_kind=slot.op)
+                tech, desc, state = choice.item_id, choice.desc, cls.label()
+                nums = {**nums, **cls.decided_by}
+            else:
+                lb = e2e and (self.runtime_info.get("launch_bound") or slot_launch_bound(info, sid, self.p))
+                techs = techniques_for(slot.op_class, self.tp.techniques, launch_bound=bool(lb))
+                # fp16 arms are their own keys (half2 / tensor-core techniques pay off
+                # differently); fp32 keys keep their names, and the cross-key prior
+                # still seeds an untried fp16 arm from its fp32 record
+                key = f"{slot.op_class}|{state}" + ("" if self.p.dtype == "fp32" else f"|{self.p.dtype}")
+                tech = self.bandit.select(key, [t for t, _ in techs], self.rng)
+                desc = dict(techs)[tech]
+            # no await since the pick: a checkpoint never sees the tries / draws without the plan
+            from .journal import rng_state
+            self._inflight[skey] = {"sid": sid, "tech": tech, "desc": desc, "state": state, "nums": nums,
+                                    "key": key, "rng": rng_state(self.rng),
+                                    **({"choice": asdict(choice), "cls": asdict(cls), "vec": vec_before}
+                                       if self.kv is not None else {})}
+        jkey = f"r{ridx}s{step}"                  # LLM journal keys: <jkey>c0 codegen, c1.. fixes
         tel.lap("knowledge.lookup", slot=sid)
         r = self._retrieve(sid)
         examples = []
@@ -1054,7 +1135,14 @@ class MultiSlotAgent:
         model, role, why = self.router.codegen(technique=tech, tier=technique_tier(tech, tdef),
                                                share=self._share(sid), stall=self.slot_stall[sid],
                                                kind=choice.kind if choice is not None else "technique")
-        text = await self._llm(msgs, model, role)
+        if plan is not None and plan.get("model"):
+            model, role, why = plan["model"], plan["role"], plan["why"]
+        if skey in self._inflight:
+            self._inflight[skey].update(model=model, role=role, why=why)
+        # the plan goes with the response: a step killed before any checkpoint saw it is
+        # resumed with the same slot / technique, so its journaled response still applies
+        text = await self._llm(msgs, model, role, key=f"{jkey}c0",
+                               extra={"plan": self._inflight.get(skey) or plan})
         tel.lap("candidate", technique=tech)
         code = extract_code(text)
         fix_models, capture_defects = [], []
@@ -1081,9 +1169,11 @@ class MultiSlotAgent:
             fix_models.append(fmodel)
             if capture:
                 capture_defects.append(res.graph_skip)
-            text = await self._llm(build_fix_messages(problem=self.p, sid=sid, source=code,
-                                                      error=capture or res.error_text(),
-                                                      pitfalls=self._pitfalls(sid, tech)), fmodel, frole)
+            err = capture or res.error_text()
+            from .journal import sha as _jsha
+            text = await self._llm(build_fix_messages(problem=self.p, sid=sid, source=code, error=err,
+                                                      pitfalls=self._pitfalls(sid, tech)), fmodel, frole,
+                                   key=f"{jkey}c{fixes}", digest=_jsha(code, err))
             new = extract_code(text)
             if not new or new == code:
                 break
@@ -1108,40 +1198,51 @@ class MultiSlotAgent:
             status = {"compile": COMPILE_ERROR, "run": RUNTIME_ERROR}.get(res.stage, WRONG_OUTPUT)
             reward = -0.05 if status == COMPILE_ERROR else -0.1
         tel.lap("knowledge.record")
-        if self.kv is None:
-            self.bandit.update(key, tech, reward)
         prof_after = None
         if res.ok and (self.ncu == "all" or (self.ncu == "best" and (
                 d["merged"] if d is not None else after < self.best[sid].slot_us * (1 - self.confirm_pct / 100)))):
             by = await self._profile({**cur, sid: code}, f"r{ridx}_s{step}_{sid}")
             prof_after = by.get(sid)
+        # ---- commit: everything below up to the checkpoint runs without an await, so a
+        # checkpoint written by another rollout never sees half a step; the store /
+        # outcome records carry deterministic ids, so a replayed step does not add them twice
+        async with self._lock:
+            self._commit_step(ridx, step, t0, sid, slot, tech, key, state, choice, cls, vec_before, prof_before,
+                              prof_after, code, res, d, before, after, speedup, status, reward, fixes, fix_models,
+                              capture_defects, cur, cur_us, meta, r, ktext, tried, model, role, why, e2e)
+
+    def _commit_step(self, ridx, step, t0, sid, slot, tech, key, state, choice, cls, vec_before, prof_before,
+                     prof_after, code, res, d, before, after, speedup, status, reward, fixes, fix_models,
+                     capture_defects, cur, cur_us, meta, r, ktext, tried, model, role, why, e2e) -> None:
+        if self.kv is None:
+            self.bandit.update(key, tech, reward)
         impl_id, parent = None, self.best[sid].impl_id
         dsum = diff_summary(cur[sid], code) if code else None
         if res.ok:
             impl_id = self._store(sid, code, after, before, self.best[sid].techniques + [tech], parent,
-                                  res.slot_checks.get(sid, {}).get("rel_err"))
+                                  res.slot_checks.get(sid, {}).get("rel_err"), rid=self._rid("impl", ridx, step))
             keep = d["keep"] if d is not None else after <= before * 1.05   # keep improving/neutral moves
             if keep:
                 cur[sid], cur_us[sid] = code, after
                 meta["ev"][sid] = res.slot_us.get(sid)
                 if d is not None and d["e2e_after"]:
                     meta["e2e"] = d["e2e_after"]
-        async with self._lock:
-            if d is not None:
-                merged = d["merged"] and self._merge(sid, code, d, impl_id, tech)
-            else:
-                merged = res.ok and after < self.best[sid].slot_us * (1 - self.confirm_pct / 100)
-                if merged:
-                    self.best[sid] = SlotBest(code, after, impl_id, self.best[sid].techniques + [tech],
-                                              event_us=res.slot_us.get(sid))
+        if d is not None:
+            merged = d["merged"] and self._merge(sid, code, d, impl_id, tech)
+        else:
+            merged = res.ok and after < self.best[sid].slot_us * (1 - self.confirm_pct / 100)
             if merged:
-                self.slot_stall[sid] = 0
-                tel.count("win")
-                self.log.info(f"[{self.p.name}] r{ridx} s{step}: {sid} {before:.1f} -> {after:.1f} us "
-                              f"via {tech} (new slot best" + (f", end to end -{100 * d['reward']:.1f}%)" if d else ")"))
-            else:
-                self.slot_stall[sid] += 1
-        okw = dict(sid=sid, technique=tech, status=status, state_before=state,
+                self.best[sid] = SlotBest(code, after, impl_id, self.best[sid].techniques + [tech],
+                                          event_us=res.slot_us.get(sid))
+        if merged:
+            self.slot_stall[sid] = 0
+            tel.count("win")
+            self.log.info(f"[{self.p.name}] r{ridx} s{step}: {sid} {before:.1f} -> {after:.1f} us "
+                          f"via {tech} (new slot best" + (f", end to end -{100 * d['reward']:.1f}%)" if d else ")"))
+        else:
+            self.slot_stall[sid] += 1
+        oid = self._rid("outcome", ridx, step)
+        okw = dict(sid=sid, technique=tech, status=status, state_before=state, id=oid,
                    state_after=prof_after.get("state") if prof_after else None,
                    metric_before=before, metric_after=after, speedup=speedup,
                    metrics_delta=self.tp.profiler.delta(prof_before, prof_after),
@@ -1154,12 +1255,17 @@ class MultiSlotAgent:
                                         profile=prof_after, profile_kind=self._profile_kind)
                          if res.ok and after else None)
             try:
-                v2 = self.kv.record(self._outcome(**okw), choice=choice, reward=reward, cls=cls, before=vec_before,
-                                    after=vec_after, op_class=slot.op_class, dtype=self.p.dtype,
-                                    extra={"lineage": list(self.best[sid].techniques),
-                                           "ncu_rules": (prof_before or {}).get("rules", []),
-                                           "diff_excerpt": diff_excerpt(cur[sid], code) if code else "",
-                                           **({"e2e": d["ctx"]} if d is not None else {})})
+                if oid in self._existing["outcome"]:     # recorded before a kill: its stats are in the DB
+                    rows = self.kv.outcomes.rows("id=?", (oid,))
+                    v2 = rows[0]["v2"] if rows else None
+                else:
+                    v2 = self.kv.record(self._outcome(**okw), choice=choice, reward=reward, cls=cls,
+                                        before=vec_before, after=vec_after, op_class=slot.op_class,
+                                        dtype=self.p.dtype,
+                                        extra={"lineage": list(self.best[sid].techniques),
+                                               "ncu_rules": (prof_before or {}).get("rules", []),
+                                               "diff_excerpt": diff_excerpt(cur[sid], code) if code else "",
+                                               **({"e2e": d["ctx"]} if d is not None else {})})
             except Exception as e:                                # knowledge must never break a step
                 self.log.warning(f"knowledge-v2 record failed: {e!r}")
         else:
@@ -1184,6 +1290,8 @@ class MultiSlotAgent:
                                       e2e_after=d["e2e_after"] if d else None))
         self.log.info(f"[{self.p.name}] r{ridx} s{step}: {sid} {tech} -> {status}"
                       + (f" {before:.1f}->{after:.1f} us" if after else "") + f" (fixes={fixes})")
+        tel.count("step")                      # completed steps (a step replayed after a kill counts once)
+        self._step_done(ridx, step, cur, cur_us, meta)
 
     def _capture_defect(self, res: Optional[EvalResult]) -> Optional[str]:
         """The fix-loop error text when a verified candidate made the partition fall back
@@ -1272,14 +1380,30 @@ class MultiSlotAgent:
 
     async def _rollout(self, ridx: int):
         async with self._lock:
-            cur = {s: b.source for s, b in self.best.items()}
-            cur_us = {s: b.slot_us for s, b in self.best.items()}
-            meta = {"e2e": self.e2e_us, "ev": {s: b.event_us for s, b in self.best.items()}}
-        for step in range(self.steps):
+            st = self._rstate.get(ridx)
+            if st is None:
+                cur = {s: b.source for s, b in self.best.items()}
+                cur_us = {s: b.slot_us for s, b in self.best.items()}
+                meta = {"e2e": self.e2e_us, "ev": {s: b.event_us for s, b in self.best.items()}}
+                first = 0
+                self._rstate[ridx] = {"next_step": 0, "cur": dict(cur), "cur_us": dict(cur_us),
+                                      "meta": copy.deepcopy(meta)}
+            else:                                   # resumed: from the rollout's last completed step
+                cur, cur_us, meta = dict(st["cur"]), dict(st["cur_us"]), copy.deepcopy(st["meta"])
+                first = st["next_step"]
+        for step in range(first, self.steps):
+            if self.stopping:                       # SIGTERM / SIGINT: no new steps
+                break
             try:
                 await self._step(ridx, step, cur, cur_us, meta)
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 self.log.error(f"[{self.p.name}] rollout {ridx} step {step} failed: {e!r}")
+                if self._rstate[ridx]["next_step"] <= step:      # a failed step is done too
+                    self._step_done(ridx, step, cur, cur_us, meta)
+            if self.stopping:
+                break
             if self.semantic is not None:
                 try:
                     await self.semantic.maybe_reflect()
@@ -1291,21 +1415,232 @@ class MultiSlotAgent:
                 except Exception as e:
                     self.log.warning(f"knowledge-v2 upkeep failed: {e!r}")
 
+    # ---- resume (agents/journal.py)
+    @property
+    def stopping(self) -> bool:
+        return self.stop_event is not None and self.stop_event.is_set()
+
+    def _step_done(self, ridx: int, step: int, cur: dict, cur_us: dict, meta: dict) -> None:
+        """A step finished (or failed): the rollout continues from here after a kill."""
+        self._inflight.pop(f"{ridx},{step}", None)
+        self._replay.pop(f"{ridx},{step}", None)
+        self._rstate[ridx] = {"next_step": step + 1, "cur": dict(cur), "cur_us": dict(cur_us),
+                              "meta": copy.deepcopy(meta)}
+        self._checkpoint()
+
+    def _checkpoint(self, phase: Optional[str] = None) -> None:
+        if phase is not None:
+            self.phase = phase
+        if self.journal is None:
+            return
+        with tel.span("io.checkpoint"):
+            # v1 "already tried" tallies live in claims.json; saved first (observe is idempotent
+            # by outcome id), so a kill between the two writes never loses a completed step's tally
+            if self.claims is not None and self.kv is None and hasattr(self.claims, "save"):
+                try:
+                    self.claims.save()
+                except Exception as e:
+                    self.log.warning(f"claims save failed: {e!r}")
+            self.journal.save(self._snapshot())
+        tel.flush()                            # the telemetry of completed steps is on disk with them
+        if self.on_checkpoint is not None:
+            try:
+                self.on_checkpoint(self)
+            except Exception as e:
+                self.log.warning(f"checkpoint hook failed: {e!r}")
+
+    @staticmethod
+    def _er(res: Optional[EvalResult]) -> Optional[dict]:
+        if res is None:
+            return None
+        d = asdict(res)
+        d["log"] = (d.get("log") or "")[-4000:]
+        return d
+
+    @staticmethod
+    def _er_load(d: Optional[dict]) -> Optional[EvalResult]:
+        if d is None:
+            return None
+        known = EvalResult.__dataclass_fields__
+        return EvalResult(**{k: v for k, v in d.items() if k in known})
+
+    def _snapshot(self) -> dict:
+        from .journal import problem_hash, rng_state
+        code: dict[str, str] = {}
+
+        def ref(src: str) -> str:
+            h = self._sha(src)
+            code[h] = src
+            return h
+
+        if not hasattr(self, "_phash"):
+            self._phash = problem_hash(self.p)
+        return {
+            "phase": self.phase, "problem": self.p.name, "problem_id": self.problem_id, "problem_hash": self._phash,
+            "run_id": self.run_id, "segment": self.segment, "segments": self.segments,
+            "steps": self.steps, "rollouts": self.rollouts,
+            "baseline": self._er(self.baseline), "partition_us": self.partition_us, "e2e_us": self.e2e_us,
+            "last_full": self._er(self.last_full), "runtime_info": self.runtime_info,
+            "composite_version": getattr(self, "composite_version", 0),
+            "best": {sid: {**asdict(b), "source": ref(b.source)} for sid, b in self.best.items()},
+            "slot_tries": self.slot_tries, "slot_stall": self.slot_stall,
+            "steps_log": [asdict(x) for x in self.steps_log],
+            "llm_calls": self.llm_calls, "llm_usage": self.llm_usage, "llm_usage_by": self.llm_usage_by,
+            "llm_counted": sorted(self._counted), "llm_replayed": self.llm_replayed,
+            "bandit": self.bandit.to_json(), "rng": rng_state(self.rng),
+            "ncu": {"cache": [[k[0], k[1], v] for k, v in self.ncu_cache.items()], "runs": self.ncu_runs,
+                    "disabled": self.ncu_disabled},
+            "rollout_state": {str(r): {"next_step": st["next_step"], "cur": {s: ref(c) for s, c in st["cur"].items()},
+                                       "cur_us": st["cur_us"], "meta": st["meta"]}
+                              for r, st in self._rstate.items()},
+            "inflight": {**self._replay, **self._inflight},
+            "gpu": getattr(self.baseline, "gpu", None) if self.baseline is not None else None,
+            # knowledge v2's exploration budget counters (in memory, shared by the run's problems)
+            "kv_counters": ({"n_selected": getattr(self.kv, "n_selected", 0), "n_explore": getattr(self.kv, "n_explore", 0)}
+                            if self.kv is not None else None),
+            "code": code,
+        }
+
+    def _restore(self, st: dict) -> None:
+        from .journal import set_rng_state
+        code = st.get("code", {})
+        self.phase = st.get("phase")
+        self.segments = list(st.get("segments", []))
+        self.baseline = self._er_load(st.get("baseline"))
+        self.partition_us, self.e2e_us = st.get("partition_us"), st.get("e2e_us")
+        self.last_full = self._er_load(st.get("last_full"))
+        self.runtime_info = st.get("runtime_info") or {}
+        self.composite_version = st.get("composite_version", 0)
+        self.best = {sid: SlotBest(**{**b, "source": code[b["source"]]}) for sid, b in st.get("best", {}).items()}
+        self.slot_tries.update(st.get("slot_tries", {}))
+        self.slot_stall.update(st.get("slot_stall", {}))
+        self.steps_log = [StepLog(**x) for x in st.get("steps_log", [])]
+        self.llm_calls = st.get("llm_calls", 0)
+        self.llm_usage = st.get("llm_usage") or self.llm_usage
+        self.llm_usage_by = st.get("llm_usage_by") or {}
+        self._counted = set(st.get("llm_counted", []))
+        self.llm_replayed = st.get("llm_replayed", 0)
+        self.bandit = TechniqueBandit.from_json(st.get("bandit", {}), c=self.bandit.c,
+                                                prior_weight=self.bandit.prior_weight)
+        if st.get("rng"):
+            set_rng_state(self.rng, st["rng"])
+        n = st.get("ncu", {})
+        self.ncu_cache = {(a, b): v for a, b, v in n.get("cache", [])}
+        self.ncu_runs, self.ncu_disabled = n.get("runs", 0), n.get("disabled")
+        self._rstate = {int(r): {"next_step": x["next_step"], "cur": {s: code[h] for s, h in x["cur"].items()},
+                                 "cur_us": x["cur_us"], "meta": x["meta"]}
+                        for r, x in st.get("rollout_state", {}).items()}
+        self._replay = dict(st.get("inflight", {}))
+        kc = st.get("kv_counters")
+        if kc and self.kv is not None:
+            for k, v in kc.items():
+                if hasattr(self.kv, k):
+                    setattr(self.kv, k, max(getattr(self.kv, k), v))
+        if self.journal is not None:                 # steps that got a response but no checkpoint
+            for k in self.journal.llm_keys():
+                m = re.fullmatch(r"r(\d+)s(\d+)c0", k)
+                if not m:
+                    continue
+                ridx, step = int(m.group(1)), int(m.group(2))
+                skey = f"{ridx},{step}"
+                plan = self.journal.llm_get(k).get("plan")
+                done = self._rstate.get(ridx, {}).get("next_step", 0) > step
+                if plan and not done and skey not in self._replay:
+                    self._replay[skey] = {**plan, "count_try": True}
+        # records a killed segment wrote after its last checkpoint: not written again
+        try:
+            if self.store is not None:
+                self._existing["impl"] = {r.id for r in self.store.records()
+                                          if r.run_id == self.run_id and r.problem_id == self.problem_id}
+            if self.olog is not None:
+                self._existing["outcome"] = {r.id for r in self.olog
+                                             if r.run_id == self.run_id and r.problem_id == self.problem_id}
+        except Exception as e:
+            self.log.warning(f"[{self.p.name}] scanning earlier records failed: {e!r}")
+
+    async def _verify_restored(self) -> None:
+        """Re-measure the restored composite best and rollout states once (the GPU or
+        host may differ from the killed segment's): a state that no longer verifies
+        falls back (slots to their seeds; a rollout to the composite)."""
+        if not any(st["next_step"] < self.steps for st in self._rstate.values()) and \
+                len(self._rstate) >= self.rollouts:
+            return
+        seeds = self.p.seed_sources()
+        comp = self._sources()
+        res = await self.ev.evaluate(self.p, comp, "resume_verify", **self._eval_kw(seeds))
+        info = {"composite_ok": res.ok, "rollouts_reset": []}
+        if not res.ok:
+            self.log.warning(f"[{self.p.name}] restored composite failed ({res.error_text(300)}); repairing")
+            for sid in res.failing_slots() or list(self.best):
+                self.best[sid] = SlotBest(seeds[sid], self._slot_us(self.baseline, sid) or 0.0,
+                                          event_us=self.baseline.slot_us.get(sid))
+            comp = self._sources()
+            res = await self.ev.evaluate(self.p, comp, "resume_repaired", **self._eval_kw(seeds))
+            if not res.ok:
+                raise RuntimeError(f"restored composite does not verify ({res.stage}): {res.error_text(500)}")
+        self._set_composite(res)
+        for sid, b in self.best.items():
+            b.slot_us = self._slot_us(res, sid) or b.slot_us
+            b.event_us = res.slot_us.get(sid, b.event_us)
+        for ridx, st in sorted(self._rstate.items()):
+            if st["next_step"] >= self.steps:
+                continue
+            r2 = res if st["cur"] == comp else \
+                await self.ev.evaluate(self.p, st["cur"], f"resume_verify_r{ridx}", **self._eval_kw(comp))
+            if not r2.ok:
+                info["rollouts_reset"].append(ridx)
+                st["cur"], r2 = dict(comp), res
+            st["cur_us"] = {s: (self._slot_us(r2, s) or st["cur_us"].get(s, 0.0)) for s in st["cur"]}
+            st["meta"] = {"e2e": r2.deployed_us if r2 is res else
+                          ((self.e2e_us * (1.0 - (e2e_gain(r2, self.e2e_us)[0] or 0.0))) if self.e2e_us else
+                           r2.deployed_us),
+                          "ev": {s: r2.slot_us.get(s) for s in st["cur"]}}
+        self.resume_info.update(verify=info)
+        self._checkpoint()
+
     # ---- run
     async def run(self) -> dict:
         """``_run`` inside a telemetry ``problem`` span; result.json gets its breakdown."""
-        with tel.span("problem", collect=True, problem=self.problem_id) as sp:
+        with tel.span("problem", collect=True, problem=self.problem_id, segment=self.segment) as sp:
             result = await self._run()
         summ = tel.full_summary(sp)
-        if summ is not None:
+        if summ is not None and not result.get("resume", {}).get("skipped"):
             result["telemetry"] = summ
             (self.out / "result.json").write_text(json.dumps(result, indent=1, default=str))
         return result
 
     async def _run(self) -> dict:
-        if self.baseline is None:
-            await self.initialize()
-        await asyncio.gather(*[self._rollout(i) for i in range(self.rollouts)])
+        from .journal import RunInterrupted
+        st = self.journal.state if self.journal is not None else None
+        self.phase, self.segments = None, []
+        if st:
+            self._restore(st)
+            res_path = self.out / "result.json"
+            if self.phase == "done" and res_path.exists():
+                self.log.info(f"[{self.p.name}] already done (journal); skipped")
+                result = json.loads(res_path.read_text())
+                result.setdefault("resume", {})["skipped"] = True
+                return result
+            self.log.info(f"[{self.p.name}] resuming segment {self.segment} from phase {self.phase}: "
+                          f"{len(self.steps_log)} step(s) done, {len(self._replay)} in flight, "
+                          f"{sum(1 for _ in self.journal.llm_keys())} journaled LLM response(s)")
+            tel.emit({"t": "resume", "ts": time.time(), "problem": self.problem_id, "segment": self.segment,
+                      "phase": self.phase, "steps_done": len(self.steps_log), "inflight": len(self._replay)})
+        self.segments.append({"n": self.segment, "start": time.time(), "phase": self.phase,
+                              "steps_done": len(self.steps_log), "pid": os.getpid()})
+        if self.phase in (None, "init"):
+            self._checkpoint("init")                 # the run id is on disk before anything is recorded
+            if self.baseline is None:
+                await self.initialize()
+            self._checkpoint("rollouts")
+        elif self.phase == "rollouts":
+            await self._verify_restored()
+        if self.phase == "rollouts":
+            await asyncio.gather(*[self._rollout(i) for i in range(self.rollouts)])
+            if self.stopping:
+                self._checkpoint()
+                raise RunInterrupted(f"{self.p.name}: stopped after {len(self.steps_log)} step(s)")
+            self._checkpoint("final")
         final = await self.ev.evaluate(self.p, self._sources(), "final_composite",
                                        **self._eval_kw(self.p.seed_sources()))
         if not final.ok:
@@ -1342,6 +1677,7 @@ class MultiSlotAgent:
             (self.out / "result.json").write_text(json.dumps(result, indent=1, default=str))
         if self.claims is not None and hasattr(self.claims, "save"):
             self.claims.save()
+        self._checkpoint("done")
         return result
 
     @tel.traced("io.result")
@@ -1382,6 +1718,10 @@ class MultiSlotAgent:
                       for sid, b in self.best.items()},
             "steps": [asdict(s) for s in self.steps_log],
             "bandit": self.bandit.to_json(),
+            # segments of a resumed run (journal); llm_replayed: responses reused, not paid again
+            "resume": {"segments": len(getattr(self, "segments", []) or [None]), "llm_replayed": self.llm_replayed,
+                       **({"run_segments": self.segments} if getattr(self, "segments", None) else {}),
+                       **self.resume_info},
         }
         (self.out / "result.json").write_text(json.dumps(res, indent=1))
         return res

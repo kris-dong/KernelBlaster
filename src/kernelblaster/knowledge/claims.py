@@ -238,6 +238,8 @@ class ClaimStore:
 
     VERSION = 1
 
+    OBSERVED_KEEP = 4096         # outcome ids remembered by observe() (resume idempotency)
+
     def __init__(self, path: Path, *, min_support: Optional[int] = None):
         self.path = Path(path)
         self.min_support = min_support   # None -> per-kind defaults
@@ -492,6 +494,12 @@ class ClaimStore:
         if not rec.problem_id:
             return
         with self._lock:
+            # idempotent by outcome id: a step replayed after a kill is not tallied twice
+            seen = self.meta.setdefault("observed", [])
+            if rec.id in seen:
+                return
+            seen.append(rec.id)
+            del seen[:-self.OBSERVED_KEEP]
             bucket = self.tried.setdefault(self._tkey(rec.problem_id, rec.slot), {})
             t = bucket.setdefault(rec.technique, {"n": 0, "statuses": {}, "best_speedup": None,
                                                   "last_error": None, "target": rec.target})

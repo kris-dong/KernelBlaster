@@ -204,6 +204,145 @@ evaluator, record compatibility, and, with a GPU, the real host on the LeNet fix
 checks and errors as the one-process driver, and recovery from a segfault, an illegal address
 and a hang.
 
+## Resume
+
+A run killed by SIGKILL, OOM, a reboot, an ssh drop or Ctrl-C continues where it stopped: rerun the
+same command. Completed steps are kept, and no LLM response that reached the run is paid for twice.
+
+### What is resumed, and at what granularity
+
+| Stage | After a kill |
+|---|---|
+| Problem finished (`result.json` + journal phase `done`) | Skipped. Its row is folded into `summary.json`, and nothing is re-evaluated. |
+| Baseline / store seeds | Redone (no LLM). The seed records in the store keep their ids. |
+| Rollout steps | Each rollout continues after its last completed step. A step that was in flight is redone with the same slot and technique. Its codegen and fix responses come from the journal, so only compile, eval, confirm and profile run again. |
+| An LLM call in flight | Lost: it is paid but its response never arrived. The call is made again. This is the only repeated spend. |
+| Final composite, proposals, final reflection / upkeep | Redone (one eval; the reflection and upkeep cursors are persisted). |
+| `summary.json`, `--export-winners` | Written at the end of the segment that finishes. |
+
+Before a rollout continues, the restored composite best and each rollout's state are evaluated once
+more, because the GPU or host may differ from the killed segment's. A state that fails falls back:
+failing slots go back to their seeds, and a rollout goes back to the composite. The journal
+records the GPU model of the baseline. Without `--gpu-model`, a resumed run pins it, so the
+numbers stay on one GPU model.
+
+### Journal (`agents/journal.py`)
+
+`OUT/<problem>/journal/`:
+
+- **`state.json`**: the agent snapshot, written atomically (temp file, fsync, rename, fsync of the
+  directory) after the baseline and after every completed step. It holds:
+  - `phase` (`init`, then `rollouts`, `final`, `done`) and `run_id`;
+  - the baseline and latest composite `EvalResult`s;
+  - slot bests, slot tries and stall counters;
+  - the bandit, the RNG state, and knowledge-v2's exploration counters;
+  - the NCU cache;
+  - `llm_calls`, `llm_usage`, `llm_usage_by`, and the journal keys whose usage they include;
+  - the steps log;
+  - per rollout, `next_step` with the current sources, slot times and deployed time;
+  - the steps in flight with the slot / technique / model they picked;
+  - sources, stored once per content hash.
+- **`llm.jsonl`**: one fsynced line per LLM response, written before its candidate is evaluated.
+  - Keys are `r<rollout>s<step>c0` for codegen (the line also carries the step's plan) and
+    `...c<n>` for fix attempt *n*.
+  - A fix response is reused only for the same code and error (`digest`).
+
+`OUT/run.json` holds:
+
+- the configuration that must match: models, rollouts, steps, max fix, seed, reward, accept %, knowledge mode, NCU, arch, knowledge dir;
+- each problem's hash (manifest, driver, seed sources);
+- the segments (pid, argv, status, signal);
+- reflection / upkeep usage per segment, so `summary.json` sums all segments.
+
+Operational flags (evaluator, hosts, GPUs, `--parallel-problems`, `--compile-jobs`) may change between segments.
+
+### Idempotency
+
+Records written to the shared knowledge carry deterministic ids derived from (problem, run id, rollout, step):
+
+- implementation-store records;
+- v1 outcome-log lines and v2 `outcomes` rows;
+- the seed records.
+
+A replayed step that finds its record already written (the segment died after writing it but before
+its checkpoint) skips the write, together with the v2 stats update and hypothesis attempt that go
+with it. v1 `ClaimStore.observe` is idempotent by outcome id (`meta.observed`). `claims.json` is
+saved with every checkpoint, before `state.json`.
+
+A step's commit runs without an `await`, from the bandit update through the store / outcome
+writes, merge, steps log and rollout state to the checkpoint. A checkpoint written by another
+rollout therefore never contains half a step. The LLM usage counters include a response exactly
+once, whether it was counted before the kill or is counted on replay.
+
+### Refusals and restarts
+
+- **Configuration changed.** `run_multislot.py` exits 3 when `--out` holds a journal with another
+  configuration or a changed problem. `--force-restart` discards the journals and results there.
+  The knowledge directory is cumulative and is not rolled back.
+- **`--resume`.** It is the explicit form of the default. Without a journal, it starts fresh.
+
+### Signals
+
+- **First SIGTERM / SIGINT / SIGHUP.** No new steps start. In-flight steps get `--stop-grace`
+  seconds to finish (default 120, env `KB_STOP_GRACE_S`) and are then cancelled. The journals are
+  flushed, and the evaluators are closed: persistent hosts stopped and remote files removed. The
+  segment is marked `interrupted` in `run.json`, and the run exits **75**.
+- **Second signal.** Exits at once with **76**. The journals are consistent at every instant, so this is also resumable.
+
+### Remote leftovers
+
+With `--evaluator ssh`, `OUT/remote.jsonl` records what each process staged:
+
+- the one-shot binaries;
+- its partial data.bin transfer name;
+- the remote pid of every persistent host it started (`KB_HOST_PID`).
+
+A resumed run's evaluator removes exactly these entries from earlier pids (`SSHEvaluator.cleanup_previous`):
+
+- it kills a recorded pid only while it is a `kbhost_` process running in the remote dir;
+- it reuses content-named host binaries / shared objects and verified data.bin copies;
+- it leaves other runs' files alone.
+
+Orphan hosts also exit on their own when their ssh channel's stdin closes. GPU locks are flocks in
+`/dev/shm` and die with their process.
+
+### Telemetry across segments
+
+Each segment is its own telemetry run in `telemetry.jsonl`, with run id `<id>.s<n>`. A `resume`
+event marks each boundary. The sink is flushed with every checkpoint and every journaled LLM
+response, so the events of completed work survive a kill.
+
+`step` counts completed steps, so a replayed step counts once. `scripts/telemetry_report.py OUT`
+combines the segments: steps, LLM calls and tokens sum to the totals of an uninterrupted run, plus
+any call that was in flight at a kill. Responses reused from the journal count as `llm.replayed`,
+and `result.json` has `resume.llm_replayed`.
+
+### Tests
+
+`tests/test_resume.py` runs `run_multislot.py` as a subprocess with a deterministic stub LLM and a
+GPU-free evaluator (`tests/fixtures/resume_plugin.py`, `--evaluator plugin`). It SIGKILLs the run:
+
+- between steps;
+- in the baseline;
+- inside a codegen call and inside a fix call;
+- evaluating a candidate, a confirm run and a fix attempt;
+- in the final composite;
+- twice in a row.
+
+Each time it resumes and checks the results against an uninterrupted run: steps, best sources,
+LLM calls and usage, outcome log, store, claims tallies and bandit are equal, and the paid calls
+are the reference's plus the one lost in flight.
+
+The other tests cover:
+
+- random-time kills with two concurrent rollouts (no lost or repeated step, no duplicate record, usage equal to the journaled responses');
+- knowledge v2 (outcome rows and stats equal);
+- configuration and problem-change refusal, and `--force-restart`;
+- skipping a completed problem;
+- SIGTERM (exit 75, then resume equal to the reference with no lost call) and a second signal (exit 76);
+- telemetry sums across segments;
+- the ssh cleanup of only the killed segment's files and hosts.
+
 ## NCU
 
 `--ncu best|all` profiles slots with NCU (`knowledge/ncu.py`): one run over `regex:mbslot_`

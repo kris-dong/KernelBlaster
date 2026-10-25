@@ -896,8 +896,13 @@ class SSHEvaluator(LocalEvaluator):
 
     def __init__(self, host, *, arch: str, remote_dir, ssh_key: Optional[str] = None,
                  cuda_visible_devices=None, remote_path: str = "/usr/local/cuda/bin", ssh: str = "ssh",
-                 scp: str = "scp", rsync: Optional[str] = "rsync", keep_data: Optional[bool] = None, **kw):
+                 scp: str = "scp", rsync: Optional[str] = "rsync", keep_data: Optional[bool] = None,
+                 remote_manifest: Optional[Path] = None, **kw):
         super().__init__(arch, **kw)
+        # resume: what this run staged / started on the hosts (one JSON line each), so a
+        # resumed run removes exactly the leftovers of its killed segment (cleanup_previous)
+        self.remote_manifest = Path(remote_manifest) if remote_manifest else None
+        self._noted: set = set()
         self.hosts = [host] if isinstance(host, str) else list(host)
         if not self.hosts:
             raise ValueError("SSHEvaluator needs at least one host")
@@ -1147,10 +1152,71 @@ class SSHEvaluator(LocalEvaluator):
             return None
         return out
 
+    def _note_remote(self, host: str, kind: str, **kw) -> None:
+        """Append to the remote manifest (before the remote side exists)."""
+        if self.remote_manifest is None:
+            return
+        key = (host, kind, tuple(sorted(kw.items())))
+        if key in self._noted:
+            return
+        self._noted.add(key)
+        if kind != "segment":
+            self._note_remote(host, "segment", tmp=self._data_tmp_name())
+        from ..agents.journal import append_jsonl
+        try:
+            append_jsonl(self.remote_manifest, {"pid": os.getpid(), "host": host, "kind": kind,
+                                                "rdir": self.remote_dirs.get(host, self.remote_dir), **kw})
+        except OSError as e:
+            _log().warning(f"remote manifest {self.remote_manifest}: {e}")
+
+    async def cleanup_previous(self) -> dict:
+        """Remove what earlier (killed) processes of this run left on the hosts: the
+        one-shot binaries they staged, their partial data.bin transfers, and their
+        persistent hosts if still alive (by recorded pid, only a ``kbhost_`` process
+        running in the remote dir). Content-named host binaries / shared objects
+        (``kbhost_*``, ``kbso_*``) and verified data.bin copies are reused, and removed
+        by ``close()`` as usual. Other runs' files are never touched."""
+        from ..agents.journal import atomic_write_text, read_jsonl
+        if self.remote_manifest is None or getattr(self, "_cleaned", False):
+            return {}
+        self._cleaned = True
+        rows = read_jsonl(self.remote_manifest)
+        old = [r for r in rows if r.get("pid") != os.getpid()]
+        if not old:
+            return {}
+        q = shlex.quote
+        by: dict = {}
+        for r in old:
+            by.setdefault((r["host"], r["rdir"]), []).append(r)
+        done = {"hosts": 0, "files": 0, "pids": 0}
+        for (h, rdir), rs in by.items():
+            files = sorted({r["name"] for r in rs if r["kind"] == "file"})
+            tmps = sorted({r["tmp"] for r in rs if r["kind"] == "segment" and r.get("tmp")})
+            pids = sorted({int(r["host_pid"]) for r in rs if r["kind"] == "host" and r.get("host_pid")})
+            cmd = [f"cd {q(rdir)} || exit 0"]
+            if files:
+                cmd.append("rm -f " + " ".join(q(f) for f in files))
+            for t in tmps:
+                cmd.append(f"rm -f data_*/{q(t)}")
+            for pid in pids:
+                cmd.append(f'if grep -q kbhost_ /proc/{pid}/cmdline 2>/dev/null && '
+                           f'[ "$(readlink /proc/{pid}/cwd)" = "$(pwd -P)" ]; then kill {pid}; fi')
+            rc, out = await self._sh(self.ssh, *self._ssh_base(), h, "; ".join(cmd) + "; true", timeout=60)
+            done["hosts"] += 1
+            done["files"] += len(files)
+            done["pids"] += len(pids)
+            if rc != 0:
+                _log().warning(f"{h}: cleanup of the earlier segment's files failed: {out[-200:]!r}")
+        keep = [r for r in rows if r.get("pid") == os.getpid()]
+        atomic_write_text(self.remote_manifest, "".join(json.dumps(r) + "\n" for r in keep))
+        _log().info(f"resume: removed the earlier segment's remote leftovers: {done}")
+        return done
+
     async def _stage(self, exe: Path, host: str, problem=None) -> tuple[Optional[str], Optional[str], Optional[str]]:
         """Copy exe to ``host`` -> (remote name, rsync basis or None, error text or None)."""
         rdir = self.remote_dirs.get(host, self.remote_dir)
         name = f"{exe.parent.name}_{exe.name}_{uuid.uuid4().hex[:6]}"
+        self._note_remote(host, "file", name=name)
         basis = self._basis(problem) if host in self._rsync_hosts else None
         err = await self._send(exe, host, rdir, name, basis)
         return name, basis, err
@@ -1316,15 +1382,20 @@ class SSHEvaluator(LocalEvaluator):
                 # the host maps data.bin once at start-up: MB_DATA_PATH is the process's
                 envs = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in
                                 {**dev.env(), **({"MB_DATA_PATH": data} if data else {})}.items())
+                # KB_HOST_PID: the remote pid, recorded so a resumed run can stop an orphan
                 remote = (f"cd {shlex.quote(rdir)} && export PATH={shlex.quote(self.remote_path)}:$PATH && "
-                          f"exec env {envs} ./{hname}")
+                          f"echo KB_HOST_PID $$ && exec env {envs} ./{hname}")
+                self._note_remote(host, "segment", tmp=self._data_tmp_name())
                 h = await self._hosts.get(key, dev.key, lambda: HostClient(
                     [self.ssh, *self._ssh_base(), host, remote], label=f"{problem.name}@{dev.label()}",
                     start_timeout=self.timeout_s, device=dev.label()))
+
                 # dlopen searches the library path for a bare name: ./ (the host runs in rdir)
                 rep = await h.request(f"./{names[so]}", ref=f"./{names[ref]}" if ref else None, env=env,
                                       lock=gpu_lock_file(dev.ident), lock_wait=self.timeout_s, timeout=self.timeout_s)
                 self._hosts.stats.note(rep, dev.label())
+                if getattr(h, "remote_pid", None):
+                    self._note_remote(host, "host", host_pid=h.remote_pid)
                 # ssh itself failing (rc 255 before the host printed anything) is the link, not the candidate
                 link_down = rep.status in ("crash", "start_failed") and rep.rc == 255 and \
                     not re.search(r"^MB_", rep.text, re.M)
