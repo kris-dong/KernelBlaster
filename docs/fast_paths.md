@@ -270,7 +270,7 @@ or NCU pass at a time:
   copies the binary there *before* leasing a GPU, so no GPU waits on a copy.
 - ssh connections are multiplexed (`ControlMaster`; `KERNELBLASTER_SSH_MUX=0` turns it off).
 - When both ends have rsync, the binary goes as a delta against the problem's previous binary
-  on that host, kept as `.kb_basis_<problem>`; `close()` removes it. Candidates differ in one
+  on that host, kept as `.kb_basis_<problem>` in the evaluator's stage dir; `close()` removes it. Candidates differ in one
   slot while the linked `data.bin` dominates the size, so a 117 MB ResNet binary matches
   completely and sends almost no literal data. `KERNELBLASTER_SSH_RSYNC=0` falls back to scp.
 - Hosts that are unreachable at start-up are skipped. The remote directory is created.

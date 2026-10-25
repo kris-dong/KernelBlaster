@@ -454,7 +454,8 @@ def test_ssh_multi_host_dispatch(tmp_path, monkeypatch):
     # rsync deltas against each host's last binary of the problem; only that basis stays behind
     assert ev.transfer == {"rsync": 15, "scp": 0}
     for h in ("u@h1", "u@h2"):
-        assert [f.name.startswith(".kb_basis_") for f in (tmp_path / f"remote_{h}").iterdir()] == [True]
+        assert [f.name for f in (tmp_path / f"remote_{h}").iterdir()] == [ev._own]       # its own stage dir
+        assert [f.name.startswith(".kb_basis_") for f in (tmp_path / f"remote_{h}" / ev._own).iterdir()] == [True]
     asyncio.run(ev.close())
     assert not list((tmp_path / "remote_u@h1").iterdir()) and not list((tmp_path / "remote_u@h2").iterdir())
 
@@ -469,6 +470,8 @@ def test_ssh_scp_without_rsync(tmp_path, monkeypatch):
         return await asyncio.gather(*[ev.evaluate(prob, {}, f"c{i}") for i in range(4)])
     assert all(r.ok for r in asyncio.run(go()))
     assert ev.transfer == {"rsync": 0, "scp": 4}
+    assert not list((tmp_path / "remote_u@h1" / ev._own).iterdir())        # each binary removed after its run
+    asyncio.run(ev.close())
     assert not list((tmp_path / "remote_u@h1").iterdir())
     assert {d.label() for d in ev._pool.devices} == {"u@h1:2", "u@h1:3"}
 
@@ -496,6 +499,60 @@ def test_ssh_unreachable_host_is_skipped(tmp_path, monkeypatch):
     ev = _fake_ssh_evaluator(tmp_path, ["u@h1", "u@h2"], cuda_visible_devices="all")
     pool = asyncio.run(ev.pool())
     assert {d.host for d in pool.devices} == {"u@h1"} and len(pool) == 4
+
+
+def _running_copy(path: Path):
+    """``path`` (a copy of ``sleep``) running, as a persistent host binary would be."""
+    p = subprocess.Popen([str(path), "60"])
+    time.sleep(0.2)
+    assert p.poll() is None
+    return p
+
+
+def test_ssh_shared_remote_dir_never_copies_over_a_running_host(tmp_path, monkeypatch):
+    """Two processes on one remote dir (a flow's KernelBlaster run and ModelBlaster's
+    re-measurement of a hint): the second one stages the same content-named host
+    binary while the first one's host runs it. It used to be copied over the running
+    executable -- ``scp: dest open ...: Failure`` (ETXTBSY), three infrastructure
+    failures, the GPU quarantined and the re-measurement lost -- and either's close()
+    removed the other's binaries and shared objects."""
+    _fake_ssh_env(tmp_path, monkeypatch, {"u@h1": 0})
+    host_bin = tmp_path / "kbhost_src"
+    shutil.copy(shutil.which("sleep"), host_bin)
+    so = tmp_path / "cand.so"
+    so.write_text("shared object")
+    a = _fake_ssh_evaluator(tmp_path, ["u@h1"], cuda_visible_devices="2")
+    b = _fake_ssh_evaluator(tmp_path, ["u@h1"], cuda_visible_devices="2")
+    rdir = tmp_path / "remote_u@h1"
+    assert a._stage_dir("u@h1") != b._stage_dir("u@h1")
+    assert asyncio.run(a._stage_file("u@h1", host_bin, "kbhost_1d16bff26c55e4fd", set())) is None
+    assert asyncio.run(a._stage_file("u@h1", so, "kbso_x.so", set())) is None
+    running = _running_copy(Path(a._stage_dir("u@h1")) / "kbhost_1d16bff26c55e4fd")
+    try:
+        # the same content-named binary while a's host runs it: b's own copy
+        assert asyncio.run(b._stage_file("u@h1", host_bin, "kbhost_1d16bff26c55e4fd", set())) is None
+        assert asyncio.run(b._stage_file("u@h1", so, "kbso_x.so", set())) is None
+        assert (Path(b._stage_dir("u@h1")) / "kbhost_1d16bff26c55e4fd").exists()
+        assert not [f for f in Path(b._stage_dir("u@h1")).iterdir() if ".part." in f.name]   # renamed into place
+        asyncio.run(b.close())                         # b done: a's files and host untouched
+        assert not Path(b._stage_dir("u@h1")).exists()
+        assert {f.name for f in Path(a._stage_dir("u@h1")).iterdir()} == {"kbhost_1d16bff26c55e4fd", "kbso_x.so"}
+        assert running.poll() is None
+    finally:
+        running.kill()
+        running.wait()
+    asyncio.run(a.close())
+    assert not list(rdir.iterdir())
+
+
+def test_ssh_copy_error_text_keeps_the_cause(tmp_path, monkeypatch):
+    """A failed copy's error names its cause (scp's first line), on one line."""
+    from kernelblaster.knowledge.slots import _copy_err
+    out = ('scp: dest open "/r/kbhost_1d16bff26c55e4fd": Failure\r\n'
+           "scp: failed to upload file /very/long/local/path/" + "x" * 150 + ".host to /r/kbhost_1d16bff26c55e4fd\r\n")
+    txt = _copy_err(out)
+    assert txt.startswith('scp: dest open "/r/kbhost_1d16bff26c55e4fd": Failure | scp: failed to upload')
+    assert "\r" not in txt and "\n" not in txt
 
 
 def _gpu_arch():
@@ -834,6 +891,40 @@ def test_ssh_runtime_data_driver_runs(tmp_path, monkeypatch, runtime):
     assert not bad.ok and "cannot open /nonexistent/kb_test/data.bin" in bad.error_text(2000)
     assert ev.data_transfer["copies"] == 1 and len(_copies(tmp_path)) == 1
     assert not list((tmp_path / "remote_u@h1").iterdir())
+
+
+@needs_gpu
+@needs_rsync
+def test_ssh_two_processes_share_a_remote_dir_with_live_hosts(tmp_path, monkeypatch):
+    """The re-measurement failure, on this GPU through the local fake ssh: a second
+    evaluator (ModelBlaster's re-measurement) times the problem a first one (the flow's
+    KernelBlaster run) has a persistent host running for, in the same remote dir. Both pass,
+    and the second one's close() leaves the first one's host and files alone."""
+    from kernelblaster.knowledge.slots import SSHEvaluator
+    _data_env(tmp_path, monkeypatch, {})
+    rdir = tmp_path / "remote_u@h1"
+    rdir.mkdir()
+    monkeypatch.setenv("KERNELBLASTER_ALLOW_SHARED_GPU", "1")
+    p = _lenet_runtime_data(tmp_path)
+    seeds = p.seed_sources()
+
+    def ev(name):
+        return SSHEvaluator(["u@h1"], arch=ARCH, remote_dir=str(rdir), ssh=str(tmp_path / "ssh"),
+                            scp=str(tmp_path / "scp"), rsync=str(tmp_path / "rsync"), work_root=tmp_path / name,
+                            runtime="host", cuda_visible_devices="all")
+    a, b = ev("a"), ev("b")
+
+    async def go():
+        ra = await a.evaluate(p, seeds, "kb_run")                # a's host stays up until a.close()
+        rb = await b.evaluate(p, seeds, "remeasure")
+        await b.close()
+        ra2 = await a.evaluate(p, {**seeds, "relu": seeds["relu"] + "\n// cand\n"}, "kb_run2")
+        await a.close()
+        return ra, rb, ra2
+    ra, rb, ra2 = asyncio.run(go())
+    for r in (ra, rb, ra2):
+        assert r.ok and r.runtime == "host", r.error_text(500)
+    assert not list(rdir.iterdir())
 
 
 # ---------------------------------------------------------------- servers

@@ -147,6 +147,9 @@ def _wrap(cls_name: str, meth: str, stage: str, fn):
             if ok is None and isinstance(res, tuple) and len(res) == 2:      # profile(): (by_slot, err)
                 ok = res[1] is None
             sp.set(ok=ok, stage=getattr(res, "stage", None))
+            if ok is False and hasattr(res, "error_text"):        # why it failed, in the telemetry too
+                err = res.error_text(300)
+                sp.set(error=err, infra="[infra]" in err or "MB_ERROR [infra]" in (getattr(res, "log", "") or ""))
             core.count(f"eval.{sp.attrs.get('purpose') or 'other'}")
         elif is_exec:
             add_driver_phases(sp, driver_phases(res))

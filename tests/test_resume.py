@@ -354,3 +354,38 @@ def test_stops_when_parent_dies(tmp_path):
     assert run["segments"][0]["status"] == "interrupted", (tmp_path / "child.log").read_text()[-2000:]
     r = _run(tmp_path, out)
     assert r.returncode == 0, r.stderr[-3000:]
+
+
+def test_ssh_cleanup_previous_removes_the_segments_stage_dir(tmp_path, monkeypatch):
+    """Rows of an evaluator with a stage dir (``sdir``): the resumed run stops the killed
+    segment's host running in that dir and removes the dir; another process's stage dir
+    in the same remote dir (and its running host) stays."""
+    import asyncio
+    from test_loadbalance import _fake_ssh_env, _fake_ssh_evaluator
+    from kernelblaster.agents.journal import append_jsonl
+
+    _fake_ssh_env(tmp_path, monkeypatch, {"u@h1": 0})
+    rdir = tmp_path / "remote_u@h1"
+    old, live = rdir / "kbp_me_1_aaaaaa", rdir / "kbp_other_2_bbbbbb"
+    for d in (old, live):
+        d.mkdir()
+        (d / "kbhost_abc").write_text("x")
+        (d / "kbso_def.so").write_text("x")
+    orphan = subprocess.Popen(["bash", "-c", "exec -a kbhost_abc sleep 60"], cwd=old)
+    theirs = subprocess.Popen(["bash", "-c", "exec -a kbhost_abc sleep 60"], cwd=live)
+    try:
+        time.sleep(0.3)
+        man = tmp_path / "remote.jsonl"
+        for rec in ({"kind": "file", "name": "p_problem_aaaaaa"}, {"kind": "host", "host_pid": str(orphan.pid)},
+                    {"kind": "host", "host_pid": str(theirs.pid)}):
+            append_jsonl(man, {"pid": 1, "host": "u@h1", "rdir": str(rdir), "sdir": str(old), **rec})
+        ev = _fake_ssh_evaluator(tmp_path, ["u@h1"], remote_manifest=man)
+        done = asyncio.run(ev.cleanup_previous())
+        assert done == {"hosts": 1, "files": 1, "pids": 2}
+        assert not old.exists() and (live / "kbhost_abc").exists() and (live / "kbso_def.so").exists()
+        assert orphan.wait(timeout=10) != 0
+        assert theirs.poll() is None                                        # its cwd is another stage dir
+    finally:
+        for p in (orphan, theirs):
+            if p.poll() is None:
+                p.kill()
