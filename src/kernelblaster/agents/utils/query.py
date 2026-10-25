@@ -26,6 +26,7 @@ from dataclasses import dataclass, asdict
 
 from ...config import config
 from ...telemetry.llm import backoff as _telemetry_backoff, llm_traced as _llm_traced
+from ...trace import llm_recorded as _trace_llm
 from .llm_relay import RelayFatalError as _RelayFatalError
 
 __all__ = [
@@ -447,8 +448,9 @@ async def generate_code_openai(client, messages, n_tasks, model: str) -> LLMResp
 
 
 @_llm_traced
+@_trace_llm
 async def generate_code(messages, n_tasks=1, model=None) -> LLMResponse:
-    """Every LLM call goes through here (telemetry wraps it once).
+    """Every LLM call goes through here (telemetry and the trace store wrap it once).
 
     With ``KB_LLM_SERVER_URL`` set the request is relayed to an LLM relay
     server that makes the provider call (``llm_relay.py``,

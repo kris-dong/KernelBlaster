@@ -178,7 +178,8 @@ async def _post(messages, n_tasks, model) -> tuple[dict, float]:
     import aiohttp
     url = server_url()
     role, run_id = _context()
-    rid = uuid.uuid4().hex
+    from ...trace import request_id as _trace_request_id
+    rid = _trace_request_id() or uuid.uuid4().hex      # the trace record's id when tracing
     payload = {"messages": messages, "n_tasks": n_tasks, "model": model, "role": role,
                "client": _client_name(), "run_id": run_id, "request_id": rid}
     from .query import TIMEOUT

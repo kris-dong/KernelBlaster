@@ -24,6 +24,9 @@ Writes OUT/<problem>/result.json and best/slots/*.cu, OUT/summary.json, and
 (with --export-winners) the store's winners for ModelBlaster's kb_ingest.
 OUT/telemetry.jsonl has the span and LLM-call events (docs/telemetry.md;
 ``scripts/telemetry_report.py OUT``); KB_TELEMETRY=0 turns telemetry off.
+OUT/trace/ has the full trace -- every prompt, response, candidate source,
+build, driver and NCU output, decision (docs/trace.md; ``scripts/trace_view.py
+OUT``); ``--trace meta|off`` (env KB_TRACE) keeps hashes only / nothing.
 
 Load balancing (docs/fast_paths.md, "Load balancing"): problems run
 ``--parallel-problems`` at a time (default: the GPUs in the pool) over one
@@ -70,6 +73,7 @@ sys.path.insert(0, str(ROOT))
 from loguru import logger  # noqa: E402
 
 from kernelblaster import telemetry as tel  # noqa: E402
+from kernelblaster import trace  # noqa: E402
 from kernelblaster.agents import journal as J  # noqa: E402
 from kernelblaster.agents.model_router import ModelRouter  # noqa: E402
 from kernelblaster.agents.opt_multislot import MultiSlotAgent  # noqa: E402
@@ -204,6 +208,9 @@ async def _run(args) -> int:
             await asyncio.sleep(0.5)
     seg = len((J.read_json(out / "run.json") or {}).get("segments", [])) if not args.force_restart else 0
     tel.configure(out / "telemetry.jsonl", run_id=f"{tel.run_id()}.s{seg}" if seg else None)
+    # the trace store (docs/trace.md): prompts, responses, candidates, builds, driver / NCU output;
+    # a resumed segment appends to the same store
+    trace.configure(out / "trace", level=args.trace, run_id=tel.run_id())
     task = asyncio.current_task()
     stopper.install(asyncio.get_running_loop(), task)
     with tel.span("kb.run", collect=True, laps=True, segment=seg) as sp:
@@ -213,6 +220,12 @@ async def _run(args) -> int:
             if not stopper.event.is_set():
                 raise
             rc = J.EXIT_INTERRUPTED
+        finally:
+            ts = trace.close()
+            if ts:
+                logger.info(f"trace: {ts['records']} records, {ts['blobs']} blobs "
+                            f"({ts['bytes_stored'] / 1e6:.1f} MB stored of {ts['bytes_in'] / 1e6:.1f} MB, "
+                            f"{ts['blob_hits']} dedup hits, {ts['seconds']:.2f}s) in {out / 'trace'}")
     tel.close()
     return rc
 
@@ -607,6 +620,9 @@ def main():
                     help="v2: ModelBlaster graph_hints.json whose accepted/rejected decisions are synced into the "
                          "graph hypotheses at the start of the run (repeatable; env KB_GRAPH_HINTS, ':'-separated)")
     ap.add_argument("--export-winners", default=None, help="dir for winners.json (ModelBlaster ingest)")
+    ap.add_argument("--trace", choices=["off", "meta", "full"], default=trace.core._env_level("full"),
+                    help="trace store OUT/trace (docs/trace.md): full = prompts, responses, sources, build / driver "
+                         "/ NCU output (deduplicated, gzip); meta = hashes and sizes only; off (env KB_TRACE)")
     ap.add_argument("--plugin", action="append", default=[],
                     help="python file run before the problems (e.g. it registers stub: models); repeatable")
     sys.exit(asyncio.run(_run(ap.parse_args())))

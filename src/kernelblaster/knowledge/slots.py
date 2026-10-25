@@ -31,6 +31,8 @@ from pathlib import Path
 from collections import OrderedDict
 from typing import Mapping, Optional
 
+from .. import trace
+
 FORMAT = "mb-kb-problem/1"
 
 
@@ -253,6 +255,7 @@ class EvalResult:
 
 
 def parse_driver_output(text: str) -> EvalResult:
+    trace.output("driver", text)              # the raw run output (process, host, server, ssh)
     passed = bool(re.search(r"^passed$", text, re.M))
     r = EvalResult(ok=passed, stage="ok" if passed else "check", log=text[-4000:])
     r.errors = re.findall(r"^MB_ERROR (.*)$", text, re.M)
@@ -382,11 +385,14 @@ class Evaluator:
         # telemetry spans on evaluate / profile and the build / run stages (telemetry/evaluator.py)
         super().__init_subclass__(**kw)
         from ..telemetry.evaluator import instrument_class
+        trace.instrument_evaluator(cls)       # trace records of evaluate / profile (inside the eval span)
         instrument_class(cls)
 
 
 def _ncu_result(text: str):
     from .ncu import ncu_error, profile_by_slot
+
+    trace.output("ncu", text)                 # the raw ncu CSV
 
     err = ncu_error(text)
     if err:
@@ -527,14 +533,18 @@ class LocalEvaluator(Evaluator):
         return self._cache
 
     async def _nvcc(self, args: list[str]) -> tuple[int, str]:
+        t0 = time.time()
         proc = await asyncio.create_subprocess_exec(self.nvcc, *args, stdout=asyncio.subprocess.PIPE,
                                                     stderr=asyncio.subprocess.STDOUT)
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), self.timeout_s)
         except asyncio.TimeoutError:
             proc.kill()
+            trace.tool("nvcc", [self.nvcc, *args], -1, f"timed out after {self.timeout_s}s", time.time() - t0)
             return -1, f"nvcc timed out after {self.timeout_s}s"
-        return proc.returncode, out.decode(errors="replace")
+        text = out.decode(errors="replace")
+        trace.tool("nvcc", [self.nvcc, *args], proc.returncode, text, time.time() - t0)
+        return proc.returncode, text
 
     async def _build_units(self, problem, sources, work: Path) -> bool:
         """The incremental build: every slot / the tail / the driver as its
@@ -588,12 +598,14 @@ class LocalEvaluator(Evaluator):
         # the one-shot build of the assembled TU is authoritative (errors,
         # and anything the per-slot split cannot express)
         (work / "kernels.cu").write_text(problem.assemble(sources))
+        cmd = [self.nvcc, *self._flags(), *self._driver_flags(), "-o", str(work / "problem"),
+               str(work / "kernels.cu"), str(problem.driver_path)]
+        t0 = time.time()
         async with self._sem:
             proc = await asyncio.create_subprocess_exec(
-                self.nvcc, *self._flags(), *self._driver_flags(), "-o", str(work / "problem"),
-                str(work / "kernels.cu"), str(problem.driver_path),
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
             out, _ = await asyncio.wait_for(proc.communicate(), self.timeout_s)
+        trace.tool("nvcc", cmd, proc.returncode, out.decode(errors="replace"), time.time() - t0)
         if proc.returncode != 0:
             return EvalResult(ok=False, stage="compile", errors=[_compile_errors(out.decode())],
                               log=out.decode()[-4000:])
@@ -1465,6 +1477,7 @@ class ServerEvaluator(Evaluator):
             return cu, Path(await compile_cu(problem.driver_path, cu, self.gpu, timeout=self.timeout_s,
                                              job_name=str(cu))), None
         except FeedbackError as e:
+            trace.tool("compile_server", None, 1, str(e))
             return cu, None, EvalResult(ok=False, stage="compile", errors=[_compile_errors(str(e))],
                                         log=str(e)[-4000:])
 
@@ -1599,12 +1612,13 @@ class OpenCLLocalEvaluator(LocalEvaluator):
         if bad is not None:
             return bad
         (work / "kernels.cpp").write_text(problem.assemble(sources))
+        cmd = [self.cxx, *OPENCL_CXXFLAGS.split(), "-o", str(work / "problem"), str(work / "kernels.cpp"),
+               str(problem.driver_path), *OPENCL_LDFLAGS.split()]
         async with self._sem:
             proc = await asyncio.create_subprocess_exec(
-                self.cxx, *OPENCL_CXXFLAGS.split(), "-o", str(work / "problem"), str(work / "kernels.cpp"),
-                str(problem.driver_path), *OPENCL_LDFLAGS.split(),
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
             out, _ = await asyncio.wait_for(proc.communicate(), self.timeout_s)
+        trace.tool("cxx", cmd, proc.returncode, out.decode(errors="replace"))
         if proc.returncode != 0:
             return EvalResult(ok=False, stage="compile", errors=[_compile_errors(out.decode())],
                               log=out.decode()[-4000:])
