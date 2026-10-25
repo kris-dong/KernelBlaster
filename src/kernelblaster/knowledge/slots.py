@@ -254,6 +254,12 @@ class EvalResult:
         return txt[-limit:]
 
 
+def _copy_err(err: str, limit: int = 600) -> str:
+    """A failed copy's scp / rsync output for an error message: one line (no ``\\r``), its
+    tail -- scp names the cause first (``dest open "...": Failure``), then the file."""
+    return " | ".join(x.strip() for x in str(err).replace("\r", "\n").splitlines() if x.strip())[-limit:]
+
+
 def parse_driver_output(text: str) -> EvalResult:
     trace.output("driver", text)              # the raw run output (process, host, server, ssh)
     passed = bool(re.search(r"^passed$", text, re.M))
@@ -904,7 +910,17 @@ class SSHEvaluator(LocalEvaluator):
     delta against the problem's previous binary on that host, which stays
     there as ``.kb_basis_<problem>`` (``close()`` removes them): candidates
     differ in one slot while the linked data dominates the size, so a 100 MB
-    binary costs a few hundred KB. Otherwise it is scp'd."""
+    binary costs a few hundred KB. Otherwise it is scp'd.
+
+    Several processes may share a remote dir (a flow's KernelBlaster run and
+    ModelBlaster's re-measurement of a hint, both on the same hosts): what an
+    evaluator stages -- binaries, the persistent host binaries and shared
+    objects, the rsync bases -- goes to its own subdirectory
+    ``<remote_dir>/kbp_<host>_<pid>_<id>`` (``stage_dirs``), which ``close()``
+    removes, so one process never copies over (a running host binary:
+    ``scp: dest open ...: Failure``, ETXTBSY), maps a half-written or removes
+    another one's files. Only the verified, content-addressed data.bin copies
+    are shared (``<remote_dir>/data_<sha12>``)."""
 
     def __init__(self, host, *, arch: str, remote_dir, ssh_key: Optional[str] = None,
                  cuda_visible_devices=None, remote_path: str = "/usr/local/cuda/bin", ssh: str = "ssh",
@@ -922,6 +938,11 @@ class SSHEvaluator(LocalEvaluator):
         self.remote_dirs = {h: str(remote_dir[h] if isinstance(remote_dir, Mapping) else remote_dir).rstrip("/")
                             for h in self.hosts}
         self.remote_dir = self.remote_dirs[self.host]
+        # this evaluator's own staging subdirectory of each remote dir (see the class doc)
+        self._own = (f"kbp_{re.sub(r'[^A-Za-z0-9_.-]', '_', socket.gethostname())}_{os.getpid()}_"
+                     f"{uuid.uuid4().hex[:6]}")
+        self.stage_dirs = {h: f"{d}/{self._own}" for h, d in self.remote_dirs.items()}
+        self._stage_made: set = set()            # hosts whose stage dir was created (close() removes it)
         self.cvd = {h: (cuda_visible_devices.get(h) if isinstance(cuda_visible_devices, Mapping)
                         else cuda_visible_devices) for h in self.hosts}
         self.key, self.remote_path, self.ssh, self.scp = ssh_key, remote_path, ssh, scp
@@ -970,17 +991,34 @@ class SSHEvaluator(LocalEvaluator):
         devs = []
         for h in self.hosts:
             rc, out = await self._sh(self.ssh, *self._ssh_base(), h,
-                                     f"mkdir -p {shlex.quote(self.remote_dirs[h])} && "
+                                     f"mkdir -p {shlex.quote(self.remote_dirs[h])} "
+                                     f"{shlex.quote(self.stage_dirs[h])} && "
                                      "{ command -v rsync >/dev/null && echo KB_HAS_RSYNC; true; }", timeout=60)
             if rc != 0:
                 _log().warning(f"{h}: unreachable or {self.remote_dirs[h]} not writable, skipped: {out[-200:]}")
                 continue
+            self._stage_made.add(h)
             if "KB_HAS_RSYNC" in out and self.rsync:
                 self._rsync_hosts.add(h)
             devs += await remote_devices(h, self.cvd[h], ssh_key=self.key, ssh=self.ssh, logger=_log())
         if not devs:
             raise NoDevice(f"no usable GPU on {', '.join(self.hosts)}")
         return devs
+
+    def _stage_dir(self, host: str) -> str:
+        """This evaluator's own directory on ``host`` for what it stages."""
+        return self.stage_dirs.get(host) or f"{self.remote_dirs.get(host, self.remote_dir)}/{self._own}"
+
+    async def _make_stage_dir(self, host: str) -> Optional[str]:
+        """Create the stage dir on ``host`` (once; normally done with the inventory) -> error or None."""
+        if host in self._stage_made:
+            return None
+        rc, out = await self._sh(self.ssh, *self._ssh_base(), host,
+                                 f"mkdir -p {shlex.quote(self._stage_dir(host))}", timeout=60)
+        if rc != 0:
+            return f"mkdir of {self._stage_dir(host)} on {host} failed (rc {rc}): {out[-300:]}"
+        self._stage_made.add(host)
+        return None
 
     @staticmethod
     def _basis(problem) -> Optional[str]:
@@ -1177,17 +1215,19 @@ class SSHEvaluator(LocalEvaluator):
         from ..agents.journal import append_jsonl
         try:
             append_jsonl(self.remote_manifest, {"pid": os.getpid(), "host": host, "kind": kind,
-                                                "rdir": self.remote_dirs.get(host, self.remote_dir), **kw})
+                                                "rdir": self.remote_dirs.get(host, self.remote_dir),
+                                                "sdir": self._stage_dir(host), **kw})
         except OSError as e:
             _log().warning(f"remote manifest {self.remote_manifest}: {e}")
 
     async def cleanup_previous(self) -> dict:
         """Remove what earlier (killed) processes of this run left on the hosts: the
-        one-shot binaries they staged, their partial data.bin transfers, and their
         persistent hosts if still alive (by recorded pid, only a ``kbhost_`` process
-        running in the remote dir). Content-named host binaries / shared objects
-        (``kbhost_*``, ``kbso_*``) and verified data.bin copies are reused, and removed
-        by ``close()`` as usual. Other runs' files are never touched."""
+        running in that process's stage dir), then that stage dir (binaries, host
+        binaries, shared objects, rsync bases) and their partial data.bin transfers
+        (rows from before stage dirs: their one-shot binaries in the remote dir).
+        Verified data.bin copies are reused, and removed by ``close()`` as usual.
+        Other runs' files are never touched."""
         from ..agents.journal import atomic_write_text, read_jsonl
         if self.remote_manifest is None or getattr(self, "_cleaned", False):
             return {}
@@ -1202,20 +1242,28 @@ class SSHEvaluator(LocalEvaluator):
             by.setdefault((r["host"], r["rdir"]), []).append(r)
         done = {"hosts": 0, "files": 0, "pids": 0}
         for (h, rdir), rs in by.items():
-            files = sorted({r["name"] for r in rs if r["kind"] == "file"})
+            # rows of an evaluator with a stage dir (``sdir``) name its files relative to it;
+            # older rows, relative to the remote dir
+            own = [r["sdir"] for r in rs if r.get("sdir") and "/kbp_" in r["sdir"]]
+            sdirs = sorted({d for d in own if d.startswith(rdir.rstrip("/") + "/")})
+            files = sorted({r["name"] for r in rs if r["kind"] == "file" and not r.get("sdir")})
             tmps = sorted({r["tmp"] for r in rs if r["kind"] == "segment" and r.get("tmp")})
-            pids = sorted({int(r["host_pid"]) for r in rs if r["kind"] == "host" and r.get("host_pid")})
+            pids = sorted({(int(r["host_pid"]), r.get("sdir") or rdir) for r in rs
+                           if r["kind"] == "host" and r.get("host_pid")})
             cmd = [f"cd {q(rdir)} || exit 0"]
+            for pid, cwd in pids:                # first: a host still running keeps its files open
+                cmd.append(f'if grep -q kbhost_ /proc/{pid}/cmdline 2>/dev/null && '
+                           f'[ "$(readlink /proc/{pid}/cwd)" = "$(cd {q(cwd)} 2>/dev/null && pwd -P)" ]; '
+                           f'then kill {pid}; fi')
             if files:
                 cmd.append("rm -f " + " ".join(q(f) for f in files))
+            for d in sdirs:
+                cmd.append(f"rm -rf {q(d)}")
             for t in tmps:
                 cmd.append(f"rm -f data_*/{q(t)}")
-            for pid in pids:
-                cmd.append(f'if grep -q kbhost_ /proc/{pid}/cmdline 2>/dev/null && '
-                           f'[ "$(readlink /proc/{pid}/cwd)" = "$(pwd -P)" ]; then kill {pid}; fi')
             rc, out = await self._sh(self.ssh, *self._ssh_base(), h, "; ".join(cmd) + "; true", timeout=60)
             done["hosts"] += 1
-            done["files"] += len(files)
+            done["files"] += len(files) + sum(1 for r in rs if r["kind"] == "file" and r.get("sdir"))
             done["pids"] += len(pids)
             if rc != 0:
                 _log().warning(f"{h}: cleanup of the earlier segment's files failed: {out[-200:]!r}")
@@ -1226,7 +1274,9 @@ class SSHEvaluator(LocalEvaluator):
 
     async def _stage(self, exe: Path, host: str, problem=None) -> tuple[Optional[str], Optional[str], Optional[str]]:
         """Copy exe to ``host`` -> (remote name, rsync basis or None, error text or None)."""
-        rdir = self.remote_dirs.get(host, self.remote_dir)
+        rdir = self._stage_dir(host)
+        if (err := await self._make_stage_dir(host)) is not None:
+            return None, None, err
         name = f"{exe.parent.name}_{exe.name}_{uuid.uuid4().hex[:6]}"
         self._note_remote(host, "file", name=name)
         basis = self._basis(problem) if host in self._rsync_hosts else None
@@ -1237,7 +1287,7 @@ class SSHEvaluator(LocalEvaluator):
                            device=None) -> Optional[str]:
         from ..servers.utils.resources import gpu_lock_wrap
 
-        rdir = self.remote_dirs.get(host, self.remote_dir)
+        rdir = self._stage_dir(host)
         envs = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in
                         {**(device.env() if device is not None else {}), **(env or {})}.items())
         q = shlex.quote(name)
@@ -1262,10 +1312,10 @@ class SSHEvaluator(LocalEvaluator):
         host = device.host if device is not None and device.host else self.host
         data, err = await self._ensure_data(problem, host) if problem is not None else (None, None)
         if err is not None:
-            return f"MB_ERROR [infra] copy of data.bin to {host} failed: {err[-300:]}\nfailed\n"
+            return f"MB_ERROR [infra] copy of data.bin to {host} failed: {_copy_err(err)}\nfailed\n"
         name, basis, err = await self._stage(exe, host, problem)
         if err is not None:
-            return f"MB_ERROR [infra] copy to {host} failed: {err[-300:]}\nfailed\n"
+            return f"MB_ERROR [infra] copy to {host} failed: {_copy_err(err)}\nfailed\n"
         return await self._exec_staged(host, name, basis, {**(env or {}), **({"MB_DATA_PATH": data} if data else {})},
                                        prefix, device)
 
@@ -1289,7 +1339,7 @@ class SSHEvaluator(LocalEvaluator):
                 what = "the binary"
                 name, basis, err = await self._stage(exe, host, problem)
             if err is not None:
-                text = f"MB_ERROR [infra] copy of {what} to {host} failed: {err[-300:]}\nfailed\n"
+                text = f"MB_ERROR [infra] copy of {what} to {host} failed: {_copy_err(err)}\nfailed\n"
                 pool.unreserve(host)
                 pool.host_failure(host)
             else:
@@ -1320,15 +1370,17 @@ class SSHEvaluator(LocalEvaluator):
             for (h, _), f in self._data_made.items():
                 data.setdefault(h, []).append(f)
         tmp = self._data_tmp_name()
-        for h in sorted(self._rsync_hosts | set(self._staged) | {h for h, _ in self._data_at} |
+        for h in sorted(self._stage_made | self._rsync_hosts | set(self._staged) | {h for h, _ in self._data_at} |
                         {h for h, _ in self._data_err}):
-            rm = [f"cd {q(self.remote_dirs[h])} && rm -f .kb_basis_* kbhost_* kbso_*.so",
+            # this evaluator's stage dir only: another process sharing the remote dir keeps its files
+            rm = [f"cd {q(self.remote_dirs[h])} && rm -rf ./{q(self._own)}",
                   f"rm -f data_*/{q(tmp)}"]
             for f in data.get(h, []):          # the directory only goes if nothing else is in it
                 d = f.rsplit("/", 1)[0]
                 rm.append(f"rm -f {q(f)}; rmdir {q(d)} 2>/dev/null")
             await self._sh(self.ssh, *self._ssh_base(), h, "; ".join(rm) + "; true", timeout=60)
         self._staged.clear()
+        self._stage_made.clear()
         if not self.keep_data:
             for k in self._data_made:
                 self._data_at.pop(k, None)
@@ -1345,8 +1397,18 @@ class SSHEvaluator(LocalEvaluator):
         if name in staged:
             staged.move_to_end(name)
             return None
-        rdir = self.remote_dirs.get(host, self.remote_dir)
-        err = await self._send(path, host, rdir, name, None)
+        rdir = self._stage_dir(host)
+        if (err := await self._make_stage_dir(host)) is not None:
+            return err
+        # to a temporary name, then renamed into place: a concurrent request of this process
+        # never execs / maps a half-written file, and an older copy in use keeps its inode
+        part = f".{name}.part.{uuid.uuid4().hex[:6]}"
+        err = await self._send(path, host, rdir, part, None)
+        if err is None:
+            q = shlex.quote
+            rc, out = await self._sh(self.ssh, *self._ssh_base(), host,
+                                     f"cd {q(rdir)} && mv -f {q(part)} {q(name)}", timeout=120)
+            err = None if rc == 0 else f"rename of {name} on {host} failed (rc {rc}): {out[-300:]}"
         if err is not None:
             return err
         staged[name] = True
@@ -1372,7 +1434,7 @@ class SSHEvaluator(LocalEvaluator):
         await self._problem_data(problem)
         for attempt in range(self.infra_retries + 1):
             host = pool.pick_host(group, avoid_hosts=bad_hosts, prefer_hosts=self._data_hosts(problem)) or self.host
-            rdir = self.remote_dirs.get(host, self.remote_dir)
+            rdir = self._stage_dir(host)
             data, err = await self._ensure_data(problem, host)
             what = "data.bin" if err is not None else "the host binary / shared objects"
             if err is None:
@@ -1381,7 +1443,7 @@ class SSHEvaluator(LocalEvaluator):
                 if err is None:
                     err = await self._stage_file(host, path, name, set(names.values()))
             if err is not None:
-                rep = HostReply(f"MB_ERROR [infra] copy of {what} to {host} failed: {err[-300:]}\nfailed\n",
+                rep = HostReply(f"MB_ERROR [infra] copy of {what} to {host} failed: {_copy_err(err)}\nfailed\n",
                                 "done", rc=1)
                 pool.unreserve(host)
                 pool.host_failure(host)

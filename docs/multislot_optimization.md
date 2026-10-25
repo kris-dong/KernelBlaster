@@ -157,8 +157,9 @@ process per run).
   driver's output for the same `MB_*` variables, then `MB_HOST_DONE`.
 - **GPU lock.** The host takes the GPU's flock (`resources.gpu_lock_file`) for each request
   only. An idle host does not block other runs on its GPU.
-- **SSH.** The host runs as `ssh host ./kbhost_<sha>` over the multiplexed connection. Its
-  binary is copied once per problem and host. Shared objects (about 1 MB) are copied per
+- **SSH.** The host runs as `ssh host ./kbhost_<sha>` over the multiplexed connection, in the
+  evaluator's own stage dir `<remote_dir>/kbp_<host>_<pid>_<id>` (see "Remote leftovers"). Its
+  binary is copied once per problem and host, to a temporary name renamed into place. Shared objects (about 1 MB) are copied per
   candidate, and at most 48 are kept per host. A `data.bin` too big to link is copied once per
   host and data sha1, and the host is started with `MB_DATA_PATH` pointing at the copy.
 - **Failures** are runtime errors of the candidate, and the next request starts a new host:
@@ -297,11 +298,23 @@ With `--evaluator ssh`, `OUT/remote.jsonl` records what each process staged:
 - its partial data.bin transfer name;
 - the remote pid of every persistent host it started (`KB_HOST_PID`).
 
+Several processes may share a remote dir: a flow's KernelBlaster run and ModelBlaster's
+re-measurement of a hint (`scripts/time_problems.py`) run on the same hosts at the same time.
+Each evaluator stages its binaries, persistent host binaries, shared objects and rsync bases in
+its own subdirectory `<remote_dir>/kbp_<host>_<pid>_<id>` (`SSHEvaluator.stage_dirs`, recorded
+as `sdir` in `remote.jsonl`), and `close()` removes only that. Before, both staged the same
+content-named `kbhost_<sha>` in the remote dir: the second copy over the running executable
+failed (`scp: dest open ...: Failure`, ETXTBSY), three such infrastructure failures quarantined
+the GPU and the re-measurement had no run; and one process's `close()` removed the other's shared
+objects (`cannot load ./kbso_<sha>.so: No such file`). Only verified data.bin copies are shared
+(`<remote_dir>/data_<sha12>`).
+
 A resumed run's evaluator removes exactly these entries from earlier pids (`SSHEvaluator.cleanup_previous`):
 
-- it kills a recorded pid only while it is a `kbhost_` process running in the remote dir;
-- it reuses content-named host binaries / shared objects and verified data.bin copies;
-- it leaves other runs' files alone.
+- it kills a recorded pid only while it is a `kbhost_` process running in that pid's stage dir;
+- it then removes that stage dir (older rows without one: their one-shot binaries in the remote dir);
+- it reuses verified data.bin copies;
+- it leaves other runs' files and stage dirs alone.
 
 Orphan hosts also exit on their own when their ssh channel's stdin closes. GPU locks are flocks in
 `/dev/shm` and die with their process.
