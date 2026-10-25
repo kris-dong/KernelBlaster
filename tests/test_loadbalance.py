@@ -927,6 +927,60 @@ def test_ssh_two_processes_share_a_remote_dir_with_live_hosts(tmp_path, monkeypa
     assert not list(rdir.iterdir())
 
 
+def test_staged_missing_names_files_removed_under_us():
+    from kernelblaster.knowledge.slots import SSHEvaluator
+    names = {"kbhost_1d16bff26c55e4fd", "kbso_b378842e59fe1919.so", "kbso_aaaa.so"}
+    so = ("MB_ERROR cannot load incumbent ./kbso_b378842e59fe1919.so: ./kbso_b378842e59fe1919.so: "
+          "cannot open shared object file: No such file or directory\nfailed\n")
+    assert SSHEvaluator._staged_missing(so, names) == {"kbso_b378842e59fe1919.so"}
+    host = "KB_HOST_PID 1488285\nenv: \u2018./kbhost_1d16bff26c55e4fd\u2019: No such file or directory\n"
+    assert SSHEvaluator._staged_missing(host, names) == {"kbhost_1d16bff26c55e4fd"}
+    assert SSHEvaluator._staged_missing("MB_ERROR cannot load ./kbso_aaaa.so: undefined symbol: foo\n", names) == set()
+    assert SSHEvaluator._staged_missing(None, names) == set()
+
+
+@needs_gpu
+@needs_rsync
+def test_ssh_staged_files_removed_under_us_are_restaged(tmp_path, monkeypatch):
+    """A host binary / shared object this evaluator staged and that went missing on the
+    host (removed by another process): an infrastructure failure, staged again and
+    retried -- never the candidate's runtime error (the FP16 run's
+    ``cannot load incumbent ./kbso_<sha>.so: No such file``, which failed a whole
+    KernelBlaster run)."""
+    from kernelblaster.knowledge.slots import SSHEvaluator
+    _data_env(tmp_path, monkeypatch, {})
+    rdir = tmp_path / "remote_u@h1"
+    rdir.mkdir()
+    monkeypatch.setenv("KERNELBLASTER_ALLOW_SHARED_GPU", "1")
+    p = _lenet_runtime_data(tmp_path)
+    seeds = p.seed_sources()
+    ev = SSHEvaluator(["u@h1"], arch=ARCH, remote_dir=str(rdir), ssh=str(tmp_path / "ssh"),
+                      scp=str(tmp_path / "scp"), rsync=str(tmp_path / "rsync"), work_root=tmp_path / "w",
+                      runtime="host", cuda_visible_devices="all")
+    seen = []
+    orig = SSHEvaluator._staged_missing
+
+    def spy(text, names):
+        seen.append(orig(text, names))
+        return seen[-1]
+    monkeypatch.setattr(SSHEvaluator, "_staged_missing", staticmethod(spy))
+
+    async def go():
+        r1 = await ev.evaluate(p, seeds, "seed")
+        await ev._hosts.close()                                   # the next request starts a host
+        gone = [f for f in Path(ev._stage_dir("u@h1")).iterdir() if f.name.startswith(("kbso_", "kbhost_"))]
+        assert gone
+        for f in gone:                                            # removed under us
+            f.unlink()
+        r2 = await ev.evaluate(p, seeds, "again")                 # the same (still "staged") names
+        await ev.close()
+        return r1, r2
+    r1, r2 = asyncio.run(go())
+    assert r1.ok and r2.ok, (r1.error_text(500), r2.error_text(500))
+    assert any(seen), seen                                         # detected, restaged, retried
+    assert not list(rdir.iterdir())
+
+
 # ---------------------------------------------------------------- servers
 
 def test_exec_server_gpu_ids(monkeypatch):

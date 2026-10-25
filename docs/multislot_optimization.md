@@ -116,6 +116,7 @@ v2 metrics, and the proposals.
 | v2 outcome | the reward is the end-to-end gain, the same unit as before (a fraction of the partition); `extra.e2e` holds the decision | unchanged schema |
 | `result.json` | `reward`, `baseline_e2e_us`, `final_e2e_us`, `e2e_speedup`, `final_e2e_ratio` (final vs seeds, paired), `runtime` (baseline/final `partition_runtime`, evaluator host stats), `attr_op_us`, per slot `baseline_attr_us` / `final_attr_us` / `launches`; steps `reward_basis`, `e2e_before`, `e2e_after` | old fields unchanged (`speedup` is still eager) |
 | `summary.json` | `reward`, `baseline_e2e_us`, `final_e2e_us`, `e2e_speedup`; `load_balance.cuda.runtime` | |
+| `result.json` | `final_error` (why the final run failed, one line), `final_infra` (it was the GPU, the link or the staging -- `MB_ERROR [infra]` or a CUDA-device / ssh pattern -- not the composite); both `None` when `final_ok` | absent in older runs |
 | `result.json` | `gpu`: the GPU the final (else the baseline) numbers were timed on: `name` (model), `uuid`, `host`, `label`, `index`, `arch` (`EvalResult.gpu`) | absent in older runs; ModelBlaster then cannot match the model's timing to it |
 
 ### The hardware a number belongs to
@@ -166,6 +167,11 @@ process per run).
   - a crash ends the stream;
   - a hang is killed at the timeout;
   - a sticky CUDA error is reported by the host itself (`poisoned=1`).
+
+  A staged host binary or shared object that went missing on the host (`cannot load
+  ./kbso_<sha>.so: ... No such file`, `env: './kbhost_<sha>': No such file or directory`: removed
+  under the process) is not the candidate's failure: it is forgotten, staged again and the
+  request retried as an infrastructure failure (`SSHEvaluator._staged_missing`).
 - **Recycling.** The host exits by itself after 500 requests, after 1 GiB of leaked device
   memory, or when its stdin closes.
 - **Fallback.** A host that cannot be built or started falls back to one process per run.
