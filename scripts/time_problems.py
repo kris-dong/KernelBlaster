@@ -13,7 +13,8 @@ KernelBlaster runs that optimised the components.
     python scripts/time_problems.py JOBS.json --out OUT.json --arch 89 \\
         [--evaluator local --gpus auto|all|0,2 | --evaluator ssh --ssh-host H [--ssh-host H2] \\
          --remote-dir DIR [--cuda-visible-devices auto|ids] [--ssh-key K]] \\
-        [--runtime auto|host|process] [--gpu-model 'NVIDIA L40S'] [--devices 1] [--timeout 1800]
+        [--runtime auto|host|process] [--gpu-model 'NVIDIA L40S'] [--devices 1] [--timeout 1800] \\
+        [--driver-env MB_WALL=1 ...]
 
 ``JOBS.json``: ``{"jobs": [{"id", "problem": DIR, "sources": {slot: text} | null (the problem's
 own slot files), "incumbent": {slot: text} | null, "reps": N}], "order": "rounds" | "jobs"}``.
@@ -43,6 +44,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from kernelblaster import telemetry as tel  # noqa: E402
+from kernelblaster.knowledge import slots as _slots  # noqa: E402
 from kernelblaster.knowledge.slots import LocalEvaluator, SlotProblem, SSHEvaluator  # noqa: E402
 
 FORMAT = "kernelblaster.time_problems/v1"
@@ -120,6 +122,11 @@ async def main_async(a) -> int:
     res = {"format": FORMAT, "evaluator": a.evaluator, "arch": f"sm_{a.arch}", "runtime": a.runtime,
            "gpu_model": a.gpu_model, "devices": a.devices, "jobs": {}, "error": None}
     t0 = time.time()
+    for kv in a.driver_env or []:                # e.g. MB_WALL=1: added to every driver run
+        k, _, v = kv.partition("=")
+        if not k.startswith("MB_") or not _:
+            raise SystemExit(f"--driver-env {kv!r}: expected MB_<NAME>=<value>")
+        _slots.EXTRA_DRIVER_ENV[k] = v
     tel.configure(Path(a.telemetry) if a.telemetry else None)
     ev = make_evaluator(a)
     with tel.span("kb.time_problems", collect=True, jobs=len(jobs), evaluator=a.evaluator) as sp:
@@ -164,6 +171,9 @@ def main():
     ap.add_argument("--timeout", type=int, default=1800)
     ap.add_argument("--work", default="time_problems_work")
     ap.add_argument("--telemetry", default=None, help="telemetry.jsonl for this process's spans")
+    ap.add_argument("--driver-env", action="append", default=[],
+                    help="MB_<NAME>=<value> for every driver run (repeatable), e.g. MB_WALL=1: host wall clock "
+                         "and throughput per timed body (EvalResult.timing)")
     sys.exit(asyncio.run(main_async(ap.parse_args())))
 
 
