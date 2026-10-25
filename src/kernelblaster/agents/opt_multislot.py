@@ -124,6 +124,11 @@ def techniques_for(op_class: str, techniques: Optional[dict] = None,
 BUFFER_BYTES = {"f32": 4, "f16": 2, "i32": 4, "i64": 8}
 
 
+def _is_infra(text: Optional[str]) -> bool:
+    from ..servers.utils.resources import is_infra_failure
+    return bool(text) and (is_infra_failure(text) or "MB_ERROR [infra]" in text)
+
+
 def _nbytes(buf: dict) -> float:
     return float(BUFFER_BYTES.get(buf.get("dtype", "f32"), 4) * buf["numel"])
 
@@ -1706,6 +1711,10 @@ class MultiSlotAgent:
                     "final": {sid: self._ncu_of(sid, b.source) for sid, b in self.best.items()
                               if self._ncu_of(sid, b.source)}},
             "baseline_partition_us": base.partition_us, "final_ok": final.ok,
+            # why the final run failed, and whether the GPU / link / staging failed rather than
+            # the composite (ModelBlaster leaves a hint undecided then instead of rejecting it)
+            "final_error": None if final.ok else " ".join(final.error_text(800).split()),
+            "final_infra": None if final.ok else _is_infra(final.log or final.error_text(3000)),
             "final_partition_us": final.partition_us, "op_us": final.op_us,
             "speedup": (base.partition_us / final.partition_us) if final.ok and final.partition_us else None,
             # end to end as deployed (CUDA graph where capturable): the reward's basis

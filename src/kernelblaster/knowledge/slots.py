@@ -1113,6 +1113,18 @@ class SSHEvaluator(LocalEvaluator):
         return bool(remote and text) and (f"MB_ERROR cannot open {remote}" in text or
                                           f"MB_ERROR cannot map {remote}" in text)
 
+    @staticmethod
+    def _staged_missing(text: Optional[str], names) -> set:
+        """The staged files (host binary, shared objects) a reply says are gone from the
+        remote dir -- removed under us, not the candidate's fault: the shared object's
+        ``MB_ERROR cannot load [incumbent] ./kbso_<sha>.so: ...: No such file``, the host
+        binary's ``env: './kbhost_<sha>': No such file or directory``."""
+        if not text:
+            return set()
+        return {n for n in names
+                if re.search(rf"MB_ERROR cannot load (?:incumbent )?\./{re.escape(n)}: .*No such file", text)
+                or re.search(rf"\./{re.escape(n)}\W{{0,3}}: No such file or directory", text)}
+
     async def _stage_data(self, host: str, path: Path, sha: str, size: int) -> tuple[Optional[str], Optional[str]]:
         """Make ``<rdir>/data_<sha12>/data.bin`` on ``host`` hold ``path``
         (reuse a valid copy, else copy to a temporary name, verify, rename)
@@ -1474,10 +1486,17 @@ class SSHEvaluator(LocalEvaluator):
                 link_down = rep.status in ("crash", "start_failed") and rep.rc == 255 and \
                     not re.search(r"^MB_", rep.text, re.M)
                 missing = self._data_missing(rep.text, data)       # the copy was removed under us
-                lease.infra_error = link_down or missing or \
+                gone = self._staged_missing(rep.text, {hname, *names.values()})
+                lease.infra_error = link_down or missing or bool(gone) or \
                     (is_infra_failure(rep.text) and not re.search(r"^passed$", rep.text, re.M))
             if missing:
                 self._forget_data(host, data)
+            if gone:                                   # staged again by the next attempt
+                for n in gone:
+                    self._staged.get(host, {}).pop(n, None)
+                rep = HostReply(rep.text + f"MB_ERROR [infra] staged {', '.join(sorted(gone))} missing on "
+                                f"{host} (removed under this process)\nfailed\n", rep.status, rc=rep.rc,
+                                poisoned=rep.poisoned, wall_s=rep.wall_s, started=rep.started, start_s=rep.start_s)
             if not lease.infra_error:
                 return rep
             await self._hosts.drop(key)

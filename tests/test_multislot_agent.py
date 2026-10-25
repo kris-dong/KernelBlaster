@@ -129,3 +129,32 @@ def test_store_seed_reused_in_a_later_run(tmp_path):
     r = store.retrieve(target="cuda", arch=f"sm_{ARCH}", op="relu", op_class="elementwise",
                        signature=p2.slots["relu"].signature, shapes=p2.slots["relu"].shapes())
     assert r["seed"] is not None
+
+
+@needs_gpu
+def test_final_failure_cause_in_result(tmp_path):
+    """A final run that failed says why in result.json (``final_error``) and whether it was
+    the infrastructure (``final_infra``: ModelBlaster then leaves a hint undecided)."""
+    from kernelblaster.knowledge.slots import parse_driver_output
+
+    class FinalInfra(LocalEvaluator):
+        async def evaluate(self, problem, sources, tag, **kw):
+            if tag.startswith("final_"):
+                return parse_driver_output("MB_ERROR [infra] copy of the host binary / shared objects to u@h "
+                                           'failed: scp: dest open "/r/kbhost_x": Failure\nfailed\n')
+            return await super().evaluate(problem, sources, tag, **kw)
+
+    prob_dir = tmp_path / "lenet"
+    shutil.copytree(FIX, prob_dir)
+    agentic_llm.register_stub("same", lambda msgs: "```cuda\n" + extract_code(
+        msgs[-1]["content"].split("Current source:")[-1]) + "```")
+    try:
+        agent = MultiSlotAgent(SlotProblem(prob_dir), FinalInfra(ARCH, work_root=tmp_path / "work"),
+                               model="stub:same", out_dir=tmp_path / "out", arch=ARCH, rollouts=1, steps=1,
+                               min_share=0.0, seed=1)
+        res = asyncio.run(agent.run())
+    finally:
+        agentic_llm.unregister_stub("same")
+    assert not res["final_ok"] and res["final_infra"] is True
+    assert 'dest open "/r/kbhost_x": Failure' in res["final_error"]
+    assert json.loads((tmp_path / "out" / "result.json").read_text())["final_infra"] is True
