@@ -218,6 +218,9 @@ class EvalResult:
     eval_wall_s: Optional[float] = None
     # the GPU the run was timed on (pool evaluators): host, label, index, uuid, name (model), arch
     gpu: Optional[dict] = None
+    # driver MB_WALL=1 (MB docs/gpu_harness_perf.md, "Against PyTorch"): per timed body (eager,
+    # graph, ref) the event and host wall-clock distributions and the steady-state throughput (us)
+    timing: dict = field(default_factory=dict)
 
     @property
     def deployed_us(self) -> Optional[float]:
@@ -324,6 +327,25 @@ def _parse_e2e(text: str, r: EvalResult) -> None:
     if m:
         r.launch_overhead_us, r.launch_overhead_frac = float(m.group(1)), float(m.group(3))
         r.launch_overhead_graph_us = float(m.group(2)) if m.group(2) else None
+    r.timing = parse_timing(text)
+
+
+def parse_timing(text: str) -> dict:
+    """``MB_TIMING <body> gpu_med=.. wall_med=.. thru_wall=.. ...`` lines (driver ``MB_WALL=1``)
+    -> {body: {"gpu": {med, mean, min, max, std, n}, "wall": {...}, "thru_wall_us", "thru_gpu_us",
+    "thru_n"}}; none -> {}."""
+    out = {}
+    for m in re.finditer(r"^MB_TIMING (\S+) (.*)$", text, re.M):
+        kv = dict(x.split("=", 1) for x in m.group(2).split() if "=" in x)
+        d = {}
+        for side in ("gpu", "wall"):
+            d[side] = {k: (int(kv[f"{side}_{k}"]) if k == "n" else float(kv[f"{side}_{k}"]))
+                       for k in ("med", "mean", "min", "max", "std", "n") if f"{side}_{k}" in kv}
+        d.update(thru_wall_us=float(kv["thru_wall"]) if "thru_wall" in kv else None,
+                 thru_gpu_us=float(kv["thru_gpu"]) if "thru_gpu" in kv else None,
+                 thru_n=int(kv["thru_n"]) if "thru_n" in kv else None)
+        out[m.group(1)] = d
+    return out
 
 
 # ---------------------------------------------------------------- driver run options
@@ -332,13 +354,18 @@ def _env_on(name: str, default: str) -> bool:
     return os.getenv(name, default).lower() not in ("0", "false", "no", "off", "")
 
 
+# driver variables added to every run of this process (``time_problems.py --driver-env``,
+# e.g. MB_WALL=1 for ModelBlaster's comparison against PyTorch); empty in the agent loop
+EXTRA_DRIVER_ENV: dict = {}
+
+
 def driver_env(only_slots=None, screen: bool = False) -> dict:
     """Environment for one run of a ModelBlaster CUDA driver (MB docs/gpu_harness_perf.md):
     ``only_slots`` -> ``MB_ONLY_SLOTS`` (isolated-op checks for those slots'
     ops only; the partition outputs are still checked, the partition and every
     op still timed), ``screen`` -> ``MB_SCREEN=1`` (short timing budgets).
     Drivers that predate these variables ignore them and run in full."""
-    env = {}
+    env = dict(EXTRA_DRIVER_ENV)
     if only_slots:
         env["MB_ONLY_SLOTS"] = ",".join(only_slots)
     if screen:

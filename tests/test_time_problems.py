@@ -135,3 +135,35 @@ def test_time_problems_refuses_another_gpu_model(tmp_path):
     assert cp.returncode == 1
     assert res["error"].startswith("NoDevice") and "H100" in res["error"]
     assert res["jobs"] == {}
+
+
+def test_driver_timing_lines_and_extra_env(monkeypatch):
+    """MB_TIMING (driver MB_WALL=1) -> EvalResult.timing; --driver-env reaches every run's env."""
+    from kernelblaster.knowledge import slots
+
+    r = slots.parse_driver_output(
+        "MB_TIMING graph gpu_med=50.0 gpu_mean=50.2 gpu_min=49.9 gpu_max=52.0 gpu_std=0.3 gpu_n=200 "
+        "wall_med=58.5 wall_mean=58.9 wall_min=57.0 wall_max=70.0 wall_std=1.1 wall_n=200 "
+        "thru_wall=51.0 thru_gpu=50.5 thru_n=100\npassed\n")
+    assert r.timing["graph"]["gpu"] == {"med": 50.0, "mean": 50.2, "min": 49.9, "max": 52.0, "std": 0.3, "n": 200}
+    assert r.timing["graph"]["wall"]["med"] == 58.5 and r.timing["graph"]["thru_n"] == 100
+    assert slots.parse_driver_output("passed\n").timing == {}
+    monkeypatch.setattr(slots, "EXTRA_DRIVER_ENV", {"MB_WALL": "1"})
+    assert slots.driver_env(["relu"], screen=True) == {"MB_WALL": "1", "MB_ONLY_SLOTS": "relu", "MB_SCREEN": "1"}
+
+
+@needs_gpu
+def test_time_problems_driver_env_wall_clock(tmp_path):
+    jobs = {"jobs": [{"id": "plain", "problem": str(FIX), "sources": None, "reps": 1}]}
+    cp, res = _script(tmp_path, jobs, "--driver-env", "MB_WALL=1", "--driver-env", "MB_THRU_N=20")
+    assert cp.returncode == 0, cp.stdout[-2000:] + cp.stderr[-2000:]
+    t = res["jobs"]["plain"]["runs"][0]["timing"]
+    assert set(t) == {"eager", "graph"}
+    assert t["graph"]["wall"]["med"] > 0 and t["graph"]["gpu"]["n"] == t["graph"]["wall"]["n"]
+    assert t["graph"]["thru_n"] == 20 and t["graph"]["thru_gpu_us"] > 0
+    (tmp_path / "out.json").unlink()
+    cp = subprocess.run([sys.executable, str(ROOT / "scripts" / "time_problems.py"), str(tmp_path / "jobs.json"),
+                         "--out", str(tmp_path / "out.json"), "--driver-env", "WALL"],
+                        capture_output=True, text=True, timeout=600, cwd=str(ROOT))
+    assert cp.returncode != 0 and "expected MB_<NAME>=<value>" in cp.stderr
+    assert not (tmp_path / "out.json").exists()
