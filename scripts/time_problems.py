@@ -3,10 +3,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Check and time ModelBlaster problems with KernelBlaster's evaluators, outside the agent loop.
 
-ModelBlaster's whole-model result (``pipeline/kb_model_run.py``) and its hint re-measurement
-(``kb_proposals.remeasure``) use this, so their numbers come from the same evaluators -- local
-GPU pool and locks, or SSH to remote GPUs, persistent driver host -- and the same GPU model as
-the KernelBlaster runs that optimised the components.
+ModelBlaster's whole-model result (``pipeline/kb_model_run.py``), its hint re-measurement
+(``kb_proposals.remeasure``) and the graph optimiser's per-round profiles and final verification
+(``kb_eval.run_problem``: a full run whose per-op times, attribution and checks are read from the
+``EvalResult``) use this, so their numbers come from the same evaluators -- local GPU pool and
+locks, or SSH to remote GPUs, persistent driver host -- and the same GPU model as the
+KernelBlaster runs that optimised the components.
 
     python scripts/time_problems.py JOBS.json --out OUT.json --arch 89 \\
         [--evaluator local --gpus auto|all|0,2 | --evaluator ssh --ssh-host H [--ssh-host H2] \\

@@ -18,7 +18,7 @@ the full list of design decisions are in ModelBlaster's
 | `src/kernelblaster/knowledge/{outcomes,claims,reflect,semantic}.py` | outcome records and the semantic update pass (`docs/semantic_update_pass.md`) |
 | `src/kernelblaster/agents/utils/agentic_llm.py` | `claude-code:<model>` (Claude Code CLI, no key) and `stub:<name>` (tests) providers |
 | `scripts/run_multislot.py` | runner |
-| `scripts/time_problems.py` | check + time problems with the local / ssh evaluators outside the agent loop (ModelBlaster's model result and hint re-measurement), paired with an incumbent; on one GPU of a required model |
+| `scripts/time_problems.py` | check + time problems with the local / ssh evaluators outside the agent loop (ModelBlaster's model result, hint re-measurement, graph-optimiser profiles and final verification), paired with an incumbent; on one GPU of a required model |
 
 ## Running
 
@@ -134,9 +134,14 @@ v2 metrics, and the proposals.
   - Output (`kernelblaster.time_problems/v1`): every `EvalResult`, the device of each, the pool
     and the host statistics.
 - **Who uses it.** ModelBlaster's `kb_model_run` (the whole-model result) and, with
-  `--ssh-host`, `kb_graph_opt`'s re-measurement. Both run it on the GPU model the
-  KernelBlaster runs recorded, so the model number and the component numbers share the
-  hardware (ModelBlaster `docs/gpu_harness_perf.md`, "The model's result").
+  `--ssh-host`, every other GPU step of `kb_graph_opt`: the per-round whole-model profiles
+  (per-op times, CUPTI attribution and launch overhead from the `EvalResult` of a full run,
+  `reps` = the profile runs), the hint re-measurement and the final model-level verification
+  (one full run: the driver checks every output and op against the references linked into the
+  problem). All of them run on one GPU model -- the one the KernelBlaster runs recorded, or the
+  first profile's -- so the plan, the decisions, the check and the model number share the
+  hardware (ModelBlaster `docs/graph_optimizer.md`, "Where the GPU steps run", and
+  `docs/gpu_harness_perf.md`, "The model's result").
 
 ### Persistent runtime (`knowledge/runtime_host.py`)
 
