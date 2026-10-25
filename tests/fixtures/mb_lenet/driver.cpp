@@ -227,6 +227,55 @@ static std::vector<std::vector<float>> time_multi(const std::vector<std::functio
     for (auto &x : e) cudaEventDestroy(x);
     return ms;
 }
+// MB_WALL=1: next to the event times of time_multi, for every body (k: eager, graph,
+// ref), the host wall clock per forward pass -- from issuing it to the return of
+// cudaDeviceSynchronize, the GPU idle before each, as many reps as the events got, round
+// robin -- and the steady-state throughput: MB_THRU_N (default: the reps, at least 10)
+// passes back to back after one warm pass, one sync at the end, per pass (wall and
+// events). One MB_TIMING line per body (us; med is the driver's upper median).
+static double stdev(const std::vector<float> &v) {
+    if (v.size() < 2) return 0;
+    double m = 0, q = 0;
+    for (float x : v) m += x;
+    m /= v.size();
+    for (float x : v) q += (x - m) * (x - m);
+    return std::sqrt(q / (v.size() - 1));
+}
+static void time_wall(const std::vector<std::function<void()>> &bodies, const std::vector<cudaStream_t> &st,
+                      const std::vector<const char *> &names, const std::vector<std::vector<float>> &gpu) {
+    size_t n = bodies.size();
+    int reps = (int)gpu[0].size(), thru = (int)env_num("MB_THRU_N", std::max(10, reps));
+    std::vector<std::vector<float>> wall(n);
+    cudaDeviceSynchronize();
+    for (int r = 0; r < reps; ++r)
+        for (size_t k = 0; k < n; ++k) {
+            double t0 = mb_now_ms();
+            bodies[k]();
+            cudaDeviceSynchronize();
+            wall[k].push_back((float)(mb_now_ms() - t0));
+        }
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0); cudaEventCreate(&e1);
+    for (size_t k = 0; k < n; ++k) {
+        bodies[k](); cudaDeviceSynchronize();
+        double t0 = mb_now_ms();
+        cudaEventRecord(e0, st[k]);
+        for (int i = 0; i < thru; ++i) bodies[k]();
+        cudaEventRecord(e1, st[k]);
+        cudaEventSynchronize(e1);
+        cudaDeviceSynchronize();
+        double tw = mb_now_ms() - t0;
+        float tg = 0; cudaEventElapsedTime(&tg, e0, e1);
+        Dist g = dist(gpu[k]), w = dist(wall[k]);
+        printf("MB_TIMING %s gpu_med=%.3f gpu_mean=%.3f gpu_min=%.3f gpu_max=%.3f gpu_std=%.3f gpu_n=%d "
+               "wall_med=%.3f wall_mean=%.3f wall_min=%.3f wall_max=%.3f wall_std=%.3f wall_n=%d "
+               "thru_wall=%.3f thru_gpu=%.3f thru_n=%d\n", names[k],
+               1000.0 * g.med, 1000.0 * g.mean, 1000.0 * g.min, 1000.0 * g.max, 1000.0 * stdev(gpu[k]), (int)gpu[k].size(),
+               1000.0 * w.med, 1000.0 * w.mean, 1000.0 * w.min, 1000.0 * w.max, 1000.0 * stdev(wall[k]), (int)wall[k].size(),
+               1000.0 * tw / thru, 1000.0 * tg / thru, thru);
+    }
+    cudaEventDestroy(e0); cudaEventDestroy(e1);
+}
 // MB_GRAPH=1: the partition captured once on the per-thread default stream and
 // checked (outputs of a replay on zeroed buffers). Not capturable (a slot
 // syncs, allocates, copies to the host, launches on the legacy stream, ...) or
@@ -403,7 +452,7 @@ static int mb_eval() {
     for (int i = 0; i < NOPS; ++i) sel_op[i] = sel_slot[OP_SLOT[i]];
     bool screen = env_num("MB_SCREEN", 0) != 0;
     double budget = env_num("MB_TIME_MS", screen ? 20.0 : 200.0);
-    int warm = screen ? 1 : 2, min_reps = screen ? 1 : 3, max_reps = 200;
+    int warm = (int)env_num("MB_WARM", screen ? 1 : 2), min_reps = screen ? 1 : 3, max_reps = 200;
     int op_cap = (int)env_num("MB_OP_REPS", screen ? 5 : 20);
     phase("alloc");
 
@@ -469,6 +518,12 @@ static int mb_eval() {
         if (have_ref && gr) { bodies.push_back([&] { cudaGraphLaunch(gr, cudaStreamPerThread); }); st.push_back(cudaStreamPerThread); }
         else if (have_ref) { bodies.push_back([] { K_REF.launch(dev); }); st.push_back(TS); }
         std::vector<std::vector<float>> tm = time_multi(bodies, st, warm, min_reps, max_reps, budget);
+        if (env_num("MB_WALL", 0) != 0) {
+            std::vector<const char *> names{"eager"};
+            if (ge) names.push_back("graph");
+            if (have_ref) names.push_back("ref");
+            time_wall(bodies, st, names, tm);
+        }
         MB_RANGE_END();
         const std::vector<float> &pms = tm[0];
         Dist d = dist(pms);
@@ -626,7 +681,7 @@ int main() {
 // MB_HOST_MAX_EVALS requests (recycle=1), the host exits; the client starts a
 // new one. A crash ends the stream without MB_HOST_DONE.
 static const char *HOST_VARS[] = {"MB_MODE", "MB_ONLY_SLOTS", "MB_SCREEN", "MB_TIME_MS", "MB_OP_REPS", "MB_GRAPH",
-                                  "MB_ATTR", "MB_OP_US_PASS"};
+                                  "MB_ATTR", "MB_OP_US_PASS", "MB_WALL", "MB_WARM", "MB_THRU_N"};
 static bool load_so(const char *path, MbKernels &k, std::string &err) {
     void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
     if (!h) { err = dlerror(); return false; }
