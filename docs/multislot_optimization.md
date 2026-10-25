@@ -433,3 +433,18 @@ such as `BEDROCK_MAX_TOKENS` are then read on the server. See [llm_server.md](ll
 - `KERNELBLASTER_ALLOW_SHARED_GPU=1` lets the exec server start when other processes use the
   GPU (single-GPU dev boxes); timings are noisier, which is why wins are re-measured.
 - `GPUType.TITAN_RTX` (sm_75) was added for the dev box.
+
+## Trace store
+
+`OUT/trace/` keeps everything needed to replay or audit a run (docs/trace.md, `--trace
+full|meta|off`). It records:
+
+- every prompt and raw response
+- every candidate, winning and losing
+- every fix attempt
+- the build commands and compiler output
+- the raw driver and NCU output
+- each step's decision, linked to `result.json` `steps[]`, the outcome id and the
+  telemetry span
+
+To view it, run `scripts/trace_view.py OUT --list`, or `--failed --diff`.

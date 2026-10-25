@@ -276,3 +276,11 @@ Inside the 158 s KernelBlaster run: llm_wait 69 %, compile 25 %, everything else
     matches `StepLog.seconds`; result.json totals match `llm_usage` (no double counting); the JSONL rebuilds the
     same counts;
   - the same flow with telemetry disabled.
+
+## Trace store
+
+Telemetry records timing and token counts, never content. To see the content, use the
+trace store (`OUT/trace/`, docs/trace.md). It holds the prompts, responses, candidate
+sources, compiler and driver output, and decisions. Each trace record carries
+`tel_span`, the id of the telemetry span it was made in. Each LLM record carries the
+`request_id` that the LLM relay server logs.

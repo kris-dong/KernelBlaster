@@ -44,6 +44,7 @@ from typing import Any, Optional
 from loguru import logger as _default_logger
 
 from .. import telemetry as tel
+from .. import trace
 from ..knowledge import ncu as ncu_mod
 from ..knowledge.impl_store import ImplStore, shape_bucket
 from ..knowledge.outcomes import (COMPILE_ERROR, IMPROVED, NEUTRAL, REGRESSED, RUNTIME_ERROR, WRONG_OUTPUT,
@@ -493,9 +494,9 @@ def build_fix_messages(*, problem: SlotProblem, sid: str, source: str, error: st
 @tel.traced("extract")
 def extract_code(text: str) -> Optional[str]:
     blocks = re.findall(r"```(?:cuda|cpp|c\+\+|cu|c)?\s*\n(.*?)```", text, re.S)
-    if not blocks:
-        return None
-    return max(blocks, key=len).strip() + "\n"
+    code = max(blocks, key=len).strip() + "\n" if blocks else None
+    trace.on_extract(text, code)              # the step's candidate (or that the response had none)
+    return code
 
 
 def diff_excerpt(a: str, b: str, max_lines: int = 80) -> str:
@@ -835,6 +836,7 @@ class MultiSlotAgent:
             if hit is not None and (digest is None or hit.get("digest") == digest):
                 self.llm_replayed += 1
                 tel.count("llm.replayed")
+                trace.llm_replayed(key, hit, role=role, model=model)   # not stored as a second call
                 if key not in self._counted:          # paid in a segment that died before its checkpoint
                     self._count_usage(hit.get("usage") or {}, hit.get("model", model), hit.get("role", role), key)
                 return hit.get("text", "")
@@ -876,10 +878,12 @@ class MultiSlotAgent:
     def _outcome(self, **kw) -> OutcomeRecord:
         sid = kw.pop("sid")
         s = self.p.slots[sid]
-        return OutcomeRecord(target=self.p.target, arch=self.arch_label, problem_id=self.problem_id,
-                             run_id=self.run_id, slot=sid, op_kind=s.op, op_class=s.op_class,
-                             shape_bucket=shape_bucket(s.op_class, s.shapes()[0] if s.instances else {}),
-                             dtype=self.p.dtype, **kw)
+        rec = OutcomeRecord(target=self.p.target, arch=self.arch_label, problem_id=self.problem_id,
+                            run_id=self.run_id, slot=sid, op_kind=s.op, op_class=s.op_class,
+                            shape_bucket=shape_bucket(s.op_class, s.shapes()[0] if s.instances else {}),
+                            dtype=self.p.dtype, **kw)
+        trace.link(outcome_id=rec.id)
+        return rec
 
     def _rid(self, *parts) -> str:
         """Deterministic record id of this run (impl store / outcome log idempotency key)."""
@@ -1025,7 +1029,8 @@ class MultiSlotAgent:
         """One step inside a telemetry ``step`` span; its breakdown goes into the step's context."""
         n = len(self.steps_log)
         with tel.span("step", collect=True, laps=True, rollout=ridx, step=step,
-                      **({"replay": True} if f"{ridx},{step}" in self._replay else {})) as sp:
+                      **({"replay": True} if f"{ridx},{step}" in self._replay else {})) as sp, \
+                trace.scope(rollout=ridx, step=step) as tsc:
             try:
                 await self._step_body(ridx, step, cur, cur_us, meta)
             finally:
@@ -1036,6 +1041,7 @@ class MultiSlotAgent:
                 if s.rollout == ridx and s.step == step:
                     s.context["telemetry"] = summ
                     break
+        trace.step_done(self, ridx, step, n, sp, tsc)     # the decision record (docs/trace.md)
 
     async def _step_body(self, ridx: int, step: int, cur: dict[str, str], cur_us: dict[str, float],
                          meta: Optional[dict] = None) -> None:
@@ -1120,6 +1126,7 @@ class MultiSlotAgent:
         else:
             ktext, tried = self._knowledge(sid, state, tech)
         tel.lap("prompt.build")
+        trace.step_input(slot=sid, technique=tech, source=cur[sid], state=state, choice_kind=getattr(choice, "kind", None))
         part_us = (meta.get("e2e") if e2e else None) or sum(cur_us.values())
         neigh = [(n, self.p.slots[n].signature) for n in self.p.neighbours(sid)]
         best_note = (f"Best verified so far for this slot: {self.best[sid].slot_us:.1f} us."
@@ -1165,6 +1172,7 @@ class MultiSlotAgent:
             if other_bad:                                         # shouldn't happen: only `sid` changed
                 break
             fixes += 1
+            trace.attempt(fixes)
             fmodel, frole = self.router.fix(attempt=fixes, max_attempts=self.max_fix)
             fix_models.append(fmodel)
             if capture:
@@ -1601,7 +1609,8 @@ class MultiSlotAgent:
     # ---- run
     async def run(self) -> dict:
         """``_run`` inside a telemetry ``problem`` span; result.json gets its breakdown."""
-        with tel.span("problem", collect=True, problem=self.problem_id, segment=self.segment) as sp:
+        with tel.span("problem", collect=True, problem=self.problem_id, segment=self.segment) as sp, \
+                trace.scope(run=self.run_id, problem=self.problem_id):
             result = await self._run()
         summ = tel.full_summary(sp)
         if summ is not None and not result.get("resume", {}).get("skipped"):
