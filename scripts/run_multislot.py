@@ -142,6 +142,16 @@ def _budget(p, args) -> tuple:
             b.get("stop_patience", args.stop_patience))
 
 
+def _pause_at(p, steps: int, spec: Optional[dict]) -> Optional[int]:
+    """Halfway sync (``--pause-spec``): the step at which problem ``p`` parks = ceil(steps * frac) when the spec names
+    it and 0 < that < steps (else None: runs through). Not part of the run config (operational, like the GPUs)."""
+    if not spec or p.name not in (spec.get("problems") or []):
+        return None
+    import math
+    n = math.ceil(int(steps) * float(spec.get("frac", 0.5)) - 1e-9)
+    return n if 0 < n < int(steps) else None
+
+
 def run_config(args, router) -> dict:
     """What a resumed run must share with the journal (operational flags -- evaluator,
     hosts, GPUs, parallelism -- may change between segments)."""
@@ -420,6 +430,11 @@ async def _run_inner(args, run_span) -> int:
             run_j.set_usage("upkeep", dict(kv.usage), segment)
     targets = {p.target for p in problems}
     results: list = [None] * len(problems)
+    pause_spec = None                              # halfway sync (--pause-spec): {"frac": .5, "problems": [names]}
+    paused: dict = {}
+    if args.pause_spec:
+        pause_spec = J.read_json(Path(args.pause_spec))
+        (out / "paused.json").unlink(missing_ok=True)
     t_all = time.time()
     tel.lap("problems")
     try:
@@ -444,6 +459,7 @@ async def _run_inner(args, run_span) -> int:
                 if hasattr(ev, "cleanup_previous") and resuming:     # remote leftovers of the killed segment
                     await ev.cleanup_previous()
                 b_rollouts, b_steps, b_patience = _budget(p, args)
+                pause_at = _pause_at(p, b_steps, pause_spec)
                 agent = MultiSlotAgent(p, ev, model=args.model, router=router, journal=jr,
                                        stop_event=stopper.event, on_checkpoint=on_checkpoint,
                                        out_dir=out / p.name, arch=arch_for(p.target), impl_store=store,
@@ -451,9 +467,15 @@ async def _run_inner(args, run_span) -> int:
                                        rollouts=b_rollouts, steps=b_steps,
                                        max_fix_attempts=args.max_fix, seed=args.seed, logger=logger, ncu=args.ncu,
                                        knowledge_v2=kv, reward=args.reward, e2e_accept_pct=args.e2e_accept_pct,
-                                       stop_patience=b_patience)
+                                       stop_patience=b_patience, pause_at=pause_at)
                 try:
                     res = await agent.run()
+                except J.RunPaused as e:                   # halfway sync: parked; the run exits EXIT_PAUSED below
+                    logger.info(str(e))
+                    paused[p.name] = {"steps_done": len(agent.steps_log), "pause_at": pause_at,
+                                      "rollouts": b_rollouts, "steps": b_steps}
+                    results[i] = {"problem": p.name, "paused": True, "steps_done": len(agent.steps_log)}
+                    return
                 except J.RunInterrupted as e:
                     logger.warning(str(e))
                     results[i] = {"problem": p.name, "interrupted": True, "steps_done": len(agent.steps_log)}
@@ -474,6 +496,18 @@ async def _run_inner(args, run_span) -> int:
         tel.lap("finish")
         if stopper.event.is_set():
             raise J.RunInterrupted("stopped on a signal")
+        if paused:                                 # halfway sync: the knowledge is brought up to date, then park
+            if updater is not None:
+                try:
+                    await updater.maybe_reflect(force=True)
+                except Exception as e:
+                    logger.warning(f"pause: semantic update failed: {e!r}")
+            elif kv is not None and len(kv.outcomes) > int(kv.db.get_meta("upkeep_cursor", 0) or 0):
+                try:
+                    await kv.maybe_upkeep(force=True)
+                except Exception as e:
+                    logger.warning(f"pause: knowledge-v2 upkeep failed: {e!r}")
+            raise J.RunPaused("halfway pause")
         if n_par > 1:
             # a problem's final forced pass may have overlapped another's; catch up on the rest
             if updater is not None:
@@ -486,7 +520,7 @@ async def _run_inner(args, run_span) -> int:
                     await kv.maybe_upkeep(force=True)
                 except Exception as e:
                     logger.warning(f"final knowledge-v2 upkeep failed: {e!r}")
-    except (J.RunInterrupted, asyncio.CancelledError) as e:
+    except (J.RunInterrupted, J.RunPaused, asyncio.CancelledError) as e:
         interrupted = e
     else:
         interrupted = None
@@ -500,6 +534,15 @@ async def _run_inner(args, run_span) -> int:
                 except Exception as e:
                     logger.warning(f"closing {type(ev).__name__} failed: {e!r}")
         on_checkpoint(None)
+    if isinstance(interrupted, J.RunPaused):
+        # every pausing problem is parked with its journal flushed: out/paused.json says where, exit EXIT_PAUSED
+        done = sum(1 for r in results if r and not r.get("paused") and not r.get("error"))
+        J.atomic_write_text(out / "paused.json", json.dumps({"ts": time.time(), "segment": segment, "problems": paused,
+                                                              "finished": done}, indent=1))
+        run_j.end(segment, "paused", problems_paused=len(paused), problems_done=done)
+        logger.info(f"paused: {len(paused)} problem(s) parked, {done} finished; rerun the same command (without "
+                    f"--pause-spec) to continue (exit {J.EXIT_PAUSED})")
+        return J.EXIT_PAUSED
     if interrupted is not None:
         n_done = sum(1 for r in results if r and not r.get("interrupted") and not r.get("error"))
         run_j.end(segment, "interrupted", signal=stopper.signal, problems_done=n_done)
@@ -640,6 +683,13 @@ def build_parser() -> argparse.ArgumentParser:
                          "--stop-patience 8), safe / off (no patience: the behaviour before the rules). Without "
                          "this flag and --stop-patience, a resumed out dir keeps the setting it was started with "
                          "(off for one from before the rules)")
+    ap.add_argument("--pause-spec", default=None,
+                    help="halfway sync (ModelBlaster --knowledge-global-halfway): a JSON file {\"frac\": 0.5, "
+                         "\"problems\": [names]}; each named problem parks once every rollout has completed "
+                         "ceil(steps*frac) steps (rollout state, composite, counters and journals kept); when all "
+                         "problems are parked or finished the run writes OUT/paused.json and exits 77. Rerun the "
+                         "same command without the flag to continue exactly where each rollout stopped. Not part "
+                         "of the run config; absent = unchanged")
     ap.add_argument("--stop-patience", type=int, default=None,
                     help="stop a problem after N consecutive committed steps (commit order across its parallel "
                          "rollouts) without a new slot best: no new step starts, in-flight steps finish; 0 = off; "

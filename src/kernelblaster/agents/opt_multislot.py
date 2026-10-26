@@ -776,8 +776,14 @@ class MultiSlotAgent:
                  knowledge_v2: Any = None, router: Optional[ModelRouter] = None, reward: Optional[str] = None,
                  e2e_accept_pct: Optional[float] = None, journal: Any = None,
                  stop_event: Optional[asyncio.Event] = None, on_checkpoint: Any = None,
-                 stop_patience: int = 0):
+                 stop_patience: int = 0, pause_at: Optional[int] = None):
         self.p, self.ev, self.model = problem, evaluator, model
+        # halfway sync (run_multislot --pause-spec): no rollout starts step ``pause_at`` or later; when every rollout
+        # has completed that many steps the problem raises RunPaused (journal flushed; a rerun without it continues
+        # from each rollout's own state). None = off (unchanged).
+        self.pause_at = int(pause_at) if pause_at else None
+        self._pause_mark: Optional[dict] = None         # set when this segment parks (journaled), cleared once resumed
+        self._paused_from: Optional[dict] = None        # the mark of the segment that parked (restored from the journal)
         # E7 patience (patience_trigger): stop starting steps after this many consecutive committed steps
         # without a new slot best; 0 = off (the class default; run_multislot.py defaults to 8, --efficiency-rules)
         self.stop_patience = max(0, int(stop_patience or 0))
@@ -1837,6 +1843,8 @@ class MultiSlotAgent:
                 break
             if self._external_stop():               # ModelBlaster graph search: the slot's ops were fused away
                 break
+            if self.pause_at is not None and step >= self.pause_at:     # halfway sync: park here
+                break
             if step > 0:
                 self._maybe_resync(ridx, step, cur, cur_us, meta)
             try:
@@ -1954,6 +1962,7 @@ class MultiSlotAgent:
             "baseline": self._er(self.baseline), "partition_us": self.partition_us, "e2e_us": self.e2e_us,
             "last_full": self._er(self.last_full), "runtime_info": self.runtime_info,
             "composite_version": getattr(self, "composite_version", 0),
+            **({"paused": self._pause_mark} if self._pause_mark else {}),
             "best": {sid: {**asdict(b), "source": ref(b.source)} for sid, b in self.best.items()},
             "slot_tries": self.slot_tries, "slot_stall": self.slot_stall,
             "steps_log": [asdict(x) for x in self.steps_log],
@@ -1983,6 +1992,7 @@ class MultiSlotAgent:
         self.last_full = self._er_load(st.get("last_full"))
         self.runtime_info = st.get("runtime_info") or {}
         self.composite_version = st.get("composite_version", 0)
+        self._paused_from, self._pause_mark = st.get("paused"), None
         self.best = {sid: SlotBest(**{**b, "source": code[b["source"]]}) for sid, b in st.get("best", {}).items()}
         self.slot_tries.update(st.get("slot_tries", {}))
         self.slot_stall.update(st.get("slot_stall", {}))
@@ -2078,6 +2088,24 @@ class MultiSlotAgent:
         self.resume_info.update(verify=info)
         self._checkpoint()
 
+    def _resume_from_own_pause(self) -> bool:
+        """The journal was parked by a halfway pause (``pause_at``) on this very host: nothing about the GPU, the clocks or
+        the sources changed since the last measurement, so the restored states need no re-measurement (a crash resume or a
+        resume elsewhere still verifies; ``KB_PAUSE_VERIFY=1`` always does)."""
+        import socket
+        m = self._paused_from
+        return bool(m) and m.get("host") == socket.gethostname() and \
+            os.getenv("KB_PAUSE_VERIFY", "").lower() not in ("1", "true", "yes", "on")
+
+    def _pause_due(self) -> bool:
+        """Every rollout completed ``pause_at`` steps and the problem was not stopped by patience / an external stop
+        (then it simply finishes: nothing is left to sync for)."""
+        if self.pause_at is None or self.pause_at >= self.steps or self.patience_stop is not None \
+                or getattr(self, "external_stop", None) is not None:
+            return False
+        return len(self._rstate) >= self.rollouts and all(
+            st["next_step"] >= self.pause_at for st in self._rstate.values())
+
     # ---- run
     async def run(self) -> dict:
         """``_run`` inside a telemetry ``problem`` span; result.json gets its breakdown."""
@@ -2091,7 +2119,7 @@ class MultiSlotAgent:
         return result
 
     async def _run(self) -> dict:
-        from .journal import RunInterrupted
+        from .journal import RunInterrupted, RunPaused
         st = self.journal.state if self.journal is not None else None
         self.phase, self.segments = None, []
         if st:
@@ -2115,12 +2143,24 @@ class MultiSlotAgent:
                 await self.initialize()
             self._checkpoint("rollouts")
         elif self.phase == "rollouts":
-            await self._verify_restored()
+            if self._resume_from_own_pause():
+                self.log.info(f"[{self.p.name}] resuming from a halfway pause on the same host: restored composite and "
+                              f"rollout states are the ones just measured (no re-verification; KB_PAUSE_VERIFY=1 forces it)")
+                self.resume_info.update(verify={"skipped": "own pause, same host"})
+            else:
+                await self._verify_restored()
         if self.phase == "rollouts":
             await asyncio.gather(*[self._rollout(i) for i in range(self.rollouts)])
             if self.stopping:
                 self._checkpoint()
                 raise RunInterrupted(f"{self.p.name}: stopped after {len(self.steps_log)} step(s)")
+            if self._pause_due():
+                import socket
+                self._pause_mark = {"host": socket.gethostname(), "ts": time.time(), "pause_at": self.pause_at}
+                self._checkpoint()                  # phase stays "rollouts": the rerun restores every rollout's state
+                self.log.info(f"[{self.p.name}] halfway pause: {len(self.steps_log)} step(s) committed, "
+                              f"every rollout at step {self.pause_at}")
+                raise RunPaused(f"{self.p.name}: paused after {len(self.steps_log)} step(s)")
             self._checkpoint("final")
         final = await self.ev.evaluate(self.p, self._sources(), "final_composite",
                                        **self._eval_kw(self.p.seed_sources()))
