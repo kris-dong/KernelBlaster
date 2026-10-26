@@ -118,6 +118,23 @@ class ExperimentTool:
         self.ev, self.p, self.arch, self.work = evaluator, problem, str(arch), Path(work)
         self.nvcc = getattr(evaluator, "nvcc", None) or nvcc
         self.n = 0
+        self._nvcc_ver: Optional[dict] = None             # X-145 v1.1: nvcc version, read once (only when recording)
+
+    @staticmethod
+    def _recording() -> bool:
+        from ..knowledge.v2 import experiments
+        return experiments.record_enabled()
+
+    async def _nvcc_info(self, flags: list) -> dict:
+        if self._nvcc_ver is None:
+            self._nvcc_ver = {}
+            try:
+                cp = await _proc([self.nvcc, "--version"], cwd=self.work, timeout=20, env=None)
+                m = re.search(r"release (\d+\.\d+), V(\d+\.\d+\.\d+)", cp["out"])
+                self._nvcc_ver = {"release": m.group(1), "version": m.group(2)} if m else {"version": None}
+            except Exception:                              # noqa: BLE001 -- never break an experiment
+                self._nvcc_ver = {"version": None}
+        return {**self._nvcc_ver, "flags": [f for f in flags if f != "-o" and not f.endswith(("exp", "exp.cu"))]}
 
     async def run(self, code: str, seconds_left: float) -> dict:
         """-> {ok, stage (refused|compile|run), exit, out (tail), wall_s}"""
@@ -133,14 +150,17 @@ class ExperimentTool:
         t0 = time.time()
         arch = self.arch.removeprefix("sm_")
         flag = f"-arch=sm_{arch}" + ("a" if arch in ("90", "100") else "")
-        cp = await _proc([self.nvcc, "-O3", "-std=c++17", flag, "-lineinfo", "-o", str(d / "exp"), str(d / "exp.cu")],
-                         cwd=d, timeout=min(COMPILE_CAP_S, max(5.0, seconds_left)), env=None)
+        cmd = [self.nvcc, "-O3", "-std=c++17", flag, "-lineinfo", "-o", str(d / "exp"), str(d / "exp.cu")]
+        cp = await _proc(cmd, cwd=d, timeout=min(COMPILE_CAP_S, max(5.0, seconds_left)), env=None)
+        nv = await self._nvcc_info(cmd[1:]) if self._recording() else None
         if cp["exit"] != 0:
             return {"ok": False, "stage": "compile", "exit": cp["exit"], "out": cp["out"][-OUT_TAIL:],
-                    "wall_s": round(time.time() - t0, 2)}
+                    "wall_s": round(time.time() - t0, 2), **({"nvcc": nv} if nv else {})}
         left = max(2.0, seconds_left - (time.time() - t0))
         res = await self._run_leased(d, min(RUN_CAP_S, left))
         res["wall_s"] = round(time.time() - t0, 2)
+        if nv:
+            res["nvcc"] = nv
         return res
 
     async def _run_leased(self, d: Path, limit: float) -> dict:
@@ -153,12 +173,39 @@ class ExperimentTool:
             dev = lease.device
             env = {**os.environ, **dev.env()}
             lk = await acquire_lock_file(gpu_lock_file(dev.ident), getattr(self.ev, "gpu_lock_wait_s", 900.0))
+            clock = await self._clock("probe_pre", lease) if self._recording() else None    # v1.1: GPU state at probe time
             try:
                 r = await _proc([str(d / "exp")], cwd=d, timeout=limit, env=env, ulimit_cpu=int(limit) + 5)
             finally:
                 lk.release()
-        return {"ok": r["exit"] == 0, "stage": "run", "exit": r["exit"], "out": r["out"][-OUT_TAIL:],
-                "timed_out": r.get("timed_out", False), "device": dev.label()}
+            if clock is not None:
+                post = await self._clock("probe_post", lease)
+                clock = {**clock, **({"post": post["pre"]} if post else {})}
+        out = {"ok": r["exit"] == 0, "stage": "run", "exit": r["exit"], "out": r["out"][-OUT_TAIL:],
+               "timed_out": r.get("timed_out", False), "device": dev.label()}
+        if clock is not None:
+            out["clock"] = {k: v for k, v in clock.items() if k in ("pre", "post")}
+            out["gpu_uuid"] = dev.ident if dev.ident and str(dev.ident).startswith("GPU-") else None
+        return out
+
+    async def _clock(self, phase: str, lease) -> Optional[dict]:
+        """The leased GPU's clocks (the clock guard's query and classification; knowledge/clock_guard.py), as
+        ``{"pre": ClockVerdict dict}``; None when the evaluator has no way to run a command on the GPU's host. A suspect
+        reading with the guard on also quarantines the GPU (as before a timed step)."""
+        run = getattr(self.ev, "_clock_run", None)
+        obj = getattr(self.ev, "_clock_obj", None)
+        if run is None or obj is None:
+            return None
+        try:
+            dev = lease.device
+            v = await obj().check(lambda cmd: run(dev, cmd), ident=dev.ident, index=dev.index, phase=phase, key=dev.key,
+                                  label=dev.label())
+            from ..knowledge import clock_guard as cg
+            if v.suspect and cg.enabled() and hasattr(self.ev, "_clock_flag"):
+                self.ev._clock_flag(lease, v, "around an experiment probe")
+            return {"pre": v.to_dict()}
+        except Exception:                                  # noqa: BLE001 -- never break an experiment
+            return None
 
 
 async def _proc(cmd, *, cwd, timeout, env, ulimit_cpu: Optional[int] = None) -> dict:
@@ -252,7 +299,8 @@ async def converse(llm, messages: list[dict], tool: ExperimentTool, b: dict, *, 
                 rec = {"turn": turn, "idx": ei, "purpose": purposes[ei] if ei < len(purposes) else "",
                        "program": code, "stage": r["stage"], "ok": r.get("ok"), "exit": r.get("exit"),
                        "out": r.get("out") or "", "wall_s": r.get("wall_s"), "timed_out": r.get("timed_out", False),
-                       "device": r.get("device"), "conclusion": ""}
+                       "device": r.get("device"), "conclusion": "", "clock": r.get("clock"),
+                       "gpu_uuid": r.get("gpu_uuid"), "nvcc": r.get("nvcc")}
                 log.records.append(rec)
                 pending.append(rec)
         conv += [{"role": "assistant", "content": text},
