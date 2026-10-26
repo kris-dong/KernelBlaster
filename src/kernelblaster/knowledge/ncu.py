@@ -68,7 +68,7 @@ def ncu_command(*, prefix: str = "mbslot_", slot: Optional[str] = None, slots=No
     secs = " ".join(f"--section={s}" for s in SECTIONS)
     if os.getenv("KB_NCU_ACCESS_METRICS", "1").lower() not in ("0", "false", "no", "off"):
         secs += " --metrics " + ",".join(ACCESS_METRICS)
-    return (f"ncu --kernel-name-base demangled --print-kernel-base demangled -k regex:'{rx}' "
+    return (f"ncu --kernel-name-base demangled --print-kernel-base mangled -k regex:'{rx}' "
             f"--launch-count {launch_count} --page details {secs} --csv")
 
 
@@ -135,6 +135,12 @@ def parse_ncu_csv(text: str) -> list[KernelProfile]:
 
 
 def slot_of(kernel_name: str, prefix: str = "mbslot_") -> Optional[str]:
+    """Slot id of a kernel row. Mangled names (``_ZN<len>mbslot_<id>...``: ncu >= 2024 drops the namespace
+    from demangled names, so the command prints mangled ones) or demangled ``mbslot_<id>::`` names."""
+    m = re.match(r"_ZN(\d+)" + re.escape(prefix), kernel_name)
+    if m:
+        ident = kernel_name[m.start(1) + len(m.group(1)):][:int(m.group(1))]
+        return ident[len(prefix):] or None
     m = re.search(rf"{prefix}(\w+?)::", kernel_name)
     return m.group(1) if m else None
 

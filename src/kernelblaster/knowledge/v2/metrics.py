@@ -105,6 +105,7 @@ class RooflineInput:
     work_items: Optional[float] = None  # largest instance's output elements
     launches: int = 1                 # kernel calls in the slot time (>= instances)
     launch_frac: Optional[float] = None  # measured share of launch/idle overhead (runtime attribution)
+    peak_gflops: Optional[float] = None  # overrides the target peak (fp16 tensor-core ops on tensor-core GPUs)
 
 
 def roofline_vector(t: Target, est: RooflineInput) -> MetricVector:
@@ -116,8 +117,9 @@ def roofline_vector(t: Target, est: RooflineInput) -> MetricVector:
         bw = min(100.0, 100.0 * est.bytes / sec / 1e9 / t.peak_gbps)
         out["bw_util"] = metric(bw, ESTIMATED, "bytes/time/peak")
         out["mem_util"] = metric(bw, ESTIMATED, "= bw_util (estimate)")
-    if t.peak_gflops:
-        out["compute_util"] = metric(min(100.0, 100.0 * est.flops / sec / 1e9 / t.peak_gflops),
+    peak_f = est.peak_gflops or t.peak_gflops
+    if peak_f:
+        out["compute_util"] = metric(min(100.0, 100.0 * est.flops / sec / 1e9 / peak_f),
                                      ESTIMATED, "flops/time/peak")
     if est.work_items:
         out["parallel_fill"] = metric(min(1.0, est.work_items / t.width), ESTIMATED,

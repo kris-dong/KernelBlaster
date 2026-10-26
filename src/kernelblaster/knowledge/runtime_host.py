@@ -36,10 +36,11 @@ import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 HOST_MARKER = "MB_HOST_READY"
 DONE_PREFIX = "MB_HOST_DONE"
+LOCKED_MARKER = "MB_HOST_LOCKED"       # optional: the host holds the GPU lock; the request's clock starts
 
 
 def supports_host(driver_text: str) -> bool:
@@ -50,13 +51,14 @@ def supports_host(driver_text: str) -> bool:
 @dataclass
 class HostReply:
     text: str                      # the driver lines of this request
-    status: str                    # "done" | "crash" | "timeout" | "start_failed"
+    status: str                    # "done" | "crash" | "timeout" | "start_failed" | "lock_timeout"
     rc: Optional[int] = None
     poisoned: bool = False
     recycle: bool = False
     wall_s: float = 0.0
     started: bool = False          # this request started the host (paid its start-up)
     start_s: float = 0.0
+    limit_s: float = 0.0           # the run timeout of this request (set by the evaluator)
 
     @property
     def crashed(self) -> bool:
@@ -68,8 +70,17 @@ class HostClient:
     EVAL and reads the reply; one request at a time."""
 
     def __init__(self, argv: list[str], *, env: Optional[dict] = None, label: str = "host",
-                 start_timeout: float = 600.0, device: Optional[str] = None):
+                 start_timeout: float = 600.0, device: Optional[str] = None, client_lock: bool = False,
+                 remote_kill: Optional[Callable[[str], Awaitable]] = None):
         self.argv, self.env, self.label, self.start_timeout = list(argv), env, label, start_timeout
+        # client_lock: this process (not the host) takes the GPU flock for a request, so the wait
+        # for the lock is never part of the request's timeout and the lock is dropped the moment
+        # the request ends -- including when the host is killed. Only where the host is local.
+        self.client_lock = client_lock
+        # remote_kill(pid): stops the host's remote process (ssh hosts: killing the local ssh
+        # does not stop a host stuck in a kernel, and it would keep the GPU's flock)
+        self.remote_kill = remote_kill
+        self.remote_pid: Optional[str] = None
         self.device = device             # telemetry: the GPU the host's requests run on
         self.proc: Optional[asyncio.subprocess.Process] = None
         self.ready = ""
@@ -96,6 +107,7 @@ class HostClient:
         """Start the process and wait for MB_HOST_READY; None, or why not."""
         await self.kill()
         self.loop = asyncio.get_running_loop()
+        self.remote_pid = None
         self.proc = await asyncio.create_subprocess_exec(
             *self.argv, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT, env=self.env, limit=1 << 24)
@@ -107,6 +119,8 @@ class HostClient:
                 await self.kill()
                 return "".join(out)[-3000:] or ("timed out" if line is None else "exited")
             out.append(line)
+            if line.startswith("KB_HOST_PID "):
+                self.remote_pid = line.split()[1].strip()
             if line.startswith(HOST_MARKER):
                 self.ready = line.strip()
                 for x in out:                          # ssh hosts print their remote pid first
@@ -147,8 +161,23 @@ class HostClient:
                     return HostReply(why, "start_failed", started=True, start_s=start_s)
                 started = True
             with tel.span("run.exec", device=self.device, runtime="host") as sp:
-                rep = await self._request(so, ref=ref, env=env, lock=lock, lock_wait=lock_wait, timeout=timeout,
-                                          started=started, start_s=start_s)
+                held = None
+                if lock and self.client_lock:
+                    # wait for the GPU outside the request's clock; the host is told no lock
+                    from ..servers.utils.resources import GpuLockTimeout, acquire_lock_file
+                    try:
+                        held = await acquire_lock_file(lock, lock_wait)
+                    except GpuLockTimeout as e:
+                        tel.count("host.lock_timeout")
+                        return HostReply(f"MB_ERROR [lock] {e}\n", "lock_timeout", started=started,
+                                         start_s=start_s)
+                    lock = None
+                try:
+                    rep = await self._request(so, ref=ref, env=env, lock=lock, lock_wait=lock_wait,
+                                              timeout=timeout, started=started, start_s=start_s)
+                finally:
+                    if held is not None:
+                        held.release()
                 add_driver_phases(sp, driver_phases(rep.text))
                 sp.set(status=rep.status)
                 if rep.crashed:
@@ -171,6 +200,8 @@ class HostClient:
             await self.proc.stdin.drain()
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass                                       # the read below sees the EOF
+        # a host that takes the lock itself (lock= sent) gets the wait on top of the run's timeout,
+        # unless it says when it has the lock (MB_HOST_LOCKED): the run's clock starts then
         out, deadline = [], t0 + timeout + (lock_wait if lock else 0)
         while True:
             line = await self._readline(deadline)
@@ -187,6 +218,8 @@ class HostClient:
                                  started=started, start_s=start_s)
             if line.startswith(f"{DONE_PREFIX} {nonce} "):
                 break
+            if line.startswith(LOCKED_MARKER) and lock:
+                deadline = time.monotonic() + timeout
             out.append(line)
         rep = HostReply("".join(out), "done", rc=0 if " rc=0" in line else 1, poisoned="poisoned=1" in line,
                         recycle="recycle=1" in line, wall_s=time.monotonic() - t0, started=started,
@@ -210,6 +243,12 @@ class HostClient:
                 await asyncio.wait_for(p.wait(), 30)
             except asyncio.TimeoutError:
                 pass
+            if self.remote_kill is not None and self.remote_pid:
+                # the ssh client is gone; the remote host (and the GPU lock it holds) is not necessarily
+                try:
+                    await asyncio.wait_for(self.remote_kill(self.remote_pid), 60)
+                except Exception:
+                    pass
 
     async def close(self):
         if self.alive:

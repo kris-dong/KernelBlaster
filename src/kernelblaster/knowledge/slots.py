@@ -393,6 +393,19 @@ def _leased(dev) -> None:
     _LEASED.set(dev)
 
 
+# what the run of the current evaluate() call used: {"limit": run timeout (s), "wall": run wall (s)}
+_RUNINFO: contextvars.ContextVar = contextvars.ContextVar("kb_run_info", default=None)
+
+
+def _runinfo(**kw) -> None:
+    d = _RUNINFO.get()
+    if d is not None:
+        d.update(kw)
+
+
+EVAL_TIMEOUT_MODES = ("fixed", "adaptive")
+
+
 class Evaluator:
     """Compile an assembled candidate with the problem's driver and run it.
 
@@ -469,7 +482,10 @@ class LocalEvaluator(Evaluator):
                  incremental: Optional[bool] = None, cache_dir: Optional[Path] = None,
                  build_jobs: Optional[int] = None, gpus=None, pool=None, infra_retries: int = 2,
                  graph: Optional[bool] = None, runtime: Optional[str] = None, hosts_per_device: int = 3,
-                 gpu_model: Optional[str] = None, max_devices: Optional[int] = None):
+                 gpu_model: Optional[str] = None, max_devices: Optional[int] = None,
+                 eval_timeout_mode: str = "fixed", eval_timeout_min_s: float = 60.0,
+                 eval_timeout_factor: float = 20.0, build_timeout_s: Optional[float] = None,
+                 gpu_lock_wait_s: Optional[float] = None):
         from ..servers.utils.resources import build_limiter
         from .runtime_host import HostPool
 
@@ -480,6 +496,16 @@ class LocalEvaluator(Evaluator):
         self._host_off: dict = {}                # problem root -> why the host is not used
 
         self.arch, self.nvcc, self.timeout_s, self.keep = arch, nvcc, timeout_s, keep
+        # evaluation timeouts. ``timeout_s`` bounds one candidate run (the cap in adaptive mode); nvcc
+        # has ``build_timeout_s`` and the wait for a GPU's lock ``gpu_lock_wait_s`` (both default to
+        # ``timeout_s``: the one timeout that used to cover all of them)
+        if eval_timeout_mode not in EVAL_TIMEOUT_MODES:
+            raise ValueError(f"eval_timeout_mode must be fixed|adaptive, not {eval_timeout_mode!r}")
+        self.eval_timeout_mode = eval_timeout_mode
+        self.eval_timeout_min_s, self.eval_timeout_factor = float(eval_timeout_min_s), float(eval_timeout_factor)
+        self.build_timeout_s = timeout_s if build_timeout_s is None else build_timeout_s
+        self.gpu_lock_wait_s = timeout_s if gpu_lock_wait_s is None else gpu_lock_wait_s
+        self._inc_wall: dict = {}                # problem root -> wall (s) of the last good incumbent run
         # also time the partition as a CUDA graph (MB_PARTITION_GRAPH_US): every
         # launch on the per-thread default stream so the driver can capture it
         self.graph = _env_on("KERNELBLASTER_MULTISLOT_GRAPH", "0") if graph is None else graph
@@ -495,6 +521,36 @@ class LocalEvaluator(Evaluator):
         self.incremental = _incremental_default() if incremental is None else incremental
         self._cache_dir = Path(cache_dir) if cache_dir else None
         self._cache = None
+
+    # ---- evaluation timeouts
+    def note_incumbent_wall(self, problem, wall_s: Optional[float]) -> None:
+        """The measured wall time of a successful run of the problem's baseline / current composite:
+        what the adaptive run timeout scales."""
+        if wall_s and wall_s > 0:
+            self._inc_wall[str(getattr(problem, "root", problem))] = float(wall_s)
+
+    def run_timeout(self, problem=None, profiling: bool = False) -> float:
+        """The timeout (s) of one candidate run (not nvcc, not the wait for the GPU lock). Fixed mode:
+        ``timeout_s``. Adaptive: clamp(max(min, factor x incumbent wall), min, timeout_s); until an
+        incumbent run has been measured, 5 x min. A profiler run (ncu replays every kernel many
+        times) always gets the cap."""
+        cap = float(self.timeout_s)
+        if self.eval_timeout_mode != "adaptive" or profiling:
+            return cap
+        lo = min(self.eval_timeout_min_s, cap)
+        wall = self._inc_wall.get(str(getattr(problem, "root", problem)))
+        want = self.eval_timeout_factor * wall if wall else 5 * lo
+        return max(lo, min(cap, max(self.eval_timeout_min_s, want)))
+
+    def _timeout_error(self, limit: Optional[float], restarted: bool = False) -> str:
+        from .. import telemetry as tel
+
+        tel.count("eval.timeout")
+        n = int(round(limit if limit else self.timeout_s))
+        if self.eval_timeout_mode == "adaptive":
+            tel.count("eval.timeout.adaptive")
+            return f"timeout after {n}s (kernel presumed hung; adaptive limit)"
+        return f"timeout after {n}s" + (" (the runtime was restarted)" if restarted else "")
 
     # ---- GPUs
     async def _devices(self) -> list:
@@ -547,7 +603,7 @@ class LocalEvaluator(Evaluator):
         return work
 
     def _flags(self) -> list[str]:
-        return ["-O3", f"-arch=sm_{self.arch}", "-std=c++17", "-lineinfo",
+        return ["-O3", f"-arch={_arch_flag(self.arch)}", "-std=c++17", "-lineinfo",
                 *(["--default-stream", "per-thread"] if getattr(self, "graph", False) else [])]
 
     def _driver_flags(self) -> list[str]:
@@ -570,11 +626,11 @@ class LocalEvaluator(Evaluator):
         proc = await asyncio.create_subprocess_exec(self.nvcc, *args, stdout=asyncio.subprocess.PIPE,
                                                     stderr=asyncio.subprocess.STDOUT)
         try:
-            out, _ = await asyncio.wait_for(proc.communicate(), self.timeout_s)
+            out, _ = await asyncio.wait_for(proc.communicate(), self.build_timeout_s)
         except asyncio.TimeoutError:
             proc.kill()
-            trace.tool("nvcc", [self.nvcc, *args], -1, f"timed out after {self.timeout_s}s", time.time() - t0)
-            return -1, f"nvcc timed out after {self.timeout_s}s"
+            trace.tool("nvcc", [self.nvcc, *args], -1, f"timed out after {self.build_timeout_s}s", time.time() - t0)
+            return -1, f"nvcc timed out after {self.build_timeout_s}s"
         text = out.decode(errors="replace")
         trace.tool("nvcc", [self.nvcc, *args], proc.returncode, text, time.time() - t0)
         return proc.returncode, text
@@ -611,10 +667,10 @@ class LocalEvaluator(Evaluator):
         objs = await asyncio.gather(*jobs, return_exceptions=True)
         if any(isinstance(o, BaseException) for o in objs):
             return False
-        link_key = cache_key("nvcc-link", self.nvcc, f"-arch=sm_{self.arch}", *[k for k, _ in objs])
+        link_key = cache_key("nvcc-link", self.nvcc, f"-arch={_arch_flag(self.arch)}", *[k for k, _ in objs])
 
         async def link(tmp: Path):
-            rc, _ = await self._nvcc([f"-arch=sm_{self.arch}", *[str(p) for _, p in objs], "-o", str(tmp)])
+            rc, _ = await self._nvcc([f"-arch={_arch_flag(self.arch)}", *[str(p) for _, p in objs], "-o", str(tmp)])
             if rc != 0:
                 raise _Failed("link")
         try:
@@ -637,7 +693,7 @@ class LocalEvaluator(Evaluator):
         async with self._sem:
             proc = await asyncio.create_subprocess_exec(
                 *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
-            out, _ = await asyncio.wait_for(proc.communicate(), self.timeout_s)
+            out, _ = await asyncio.wait_for(proc.communicate(), self.build_timeout_s)
         trace.tool("nvcc", cmd, proc.returncode, out.decode(errors="replace"), time.time() - t0)
         if proc.returncode != 0:
             return EvalResult(ok=False, stage="compile", errors=[_compile_errors(out.decode())],
@@ -647,21 +703,46 @@ class LocalEvaluator(Evaluator):
     async def _run(self, exe: Path, env: Optional[dict] = None, prefix: str = "", device=None,
                    problem=None) -> Optional[str]:
         """Run exe (optionally under a prefix command, e.g. ncu) on ``device``
-        (holding its cross-process lock); stdout+stderr, None on timeout."""
-        from ..servers.utils.resources import gpu_lock_wrap
+        (holding its cross-process lock); stdout+stderr, None on timeout. The wait for the lock
+        (``gpu_lock_wait_s``) is not part of the run's timeout (``run_timeout``); on a timeout the
+        whole process group is killed and the lock released at once."""
+        import signal
+
+        from ..servers.utils.resources import GpuLockTimeout, acquire_gpu_lock, gpu_lock_file
 
         cmd = f"{prefix} {shlex.quote(str(exe))}" if prefix else shlex.quote(str(exe))
-        if device is not None:
-            cmd = gpu_lock_wrap(cmd, device.ident, wait_s=self.timeout_s)
-        proc = await asyncio.create_subprocess_shell(
-            cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-            env={**os.environ, **(device.env() if device is not None else {}), **(env or {})})
+        limit = self.run_timeout(problem, profiling=bool(prefix))
+        held = None
+        if device is not None and gpu_lock_file(device.ident):
+            try:
+                held = await acquire_gpu_lock(device.ident, self.gpu_lock_wait_s)
+            except GpuLockTimeout as e:
+                return f"MB_ERROR [lock] {e}\nfailed\n"
         try:
-            out, _ = await asyncio.wait_for(proc.communicate(), self.timeout_s)
-        except asyncio.TimeoutError:
-            proc.kill()
-            return None
-        return out.decode(errors="replace")
+            t0 = time.monotonic()
+            proc = await asyncio.create_subprocess_shell(
+                cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, start_new_session=True,
+                env={**os.environ, **(device.env() if device is not None else {}), **(env or {})})
+            try:
+                out, _ = await asyncio.wait_for(proc.communicate(), limit)
+            except BaseException as e:
+                try:                                   # the shell and what it started
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    proc.kill()
+                if isinstance(e, asyncio.TimeoutError):
+                    _runinfo(limit=limit, wall=time.monotonic() - t0)
+                    try:                               # reap it (the pipe closes with the group)
+                        await asyncio.wait_for(proc.communicate(), 5)
+                    except Exception:
+                        pass
+                    return None
+                raise
+            _runinfo(limit=limit, wall=time.monotonic() - t0)
+            return out.decode(errors="replace")
+        finally:
+            if held is not None:
+                held.release()
 
     def gpu_info(self, dev) -> Optional[dict]:
         """What a result records of the device it was timed on."""
@@ -674,13 +755,21 @@ class LocalEvaluator(Evaluator):
 
     async def evaluate(self, problem, sources, tag, *, only_slots=None, screen=False, incumbent=None):
         tok = _LEASED.set(None)
+        info: dict = {}
+        tok2 = _RUNINFO.set(info)
         try:
             res = await self._evaluate(problem, sources, tag, only_slots, screen, incumbent)
             if res is not None and res.gpu is None:
                 res.gpu = self.gpu_info(_LEASED.get())
+            if res is not None and res.ok:
+                if res.eval_wall_s is None and info.get("wall") is not None:
+                    res.eval_wall_s = round(info["wall"], 3)
+                if tag == "baseline":                   # the first incumbent run; the agent updates it
+                    self.note_incumbent_wall(problem, res.eval_wall_s)
             return res
         finally:
             _LEASED.reset(tok)
+            _RUNINFO.reset(tok2)
 
     async def _evaluate(self, problem, sources, tag, only_slots, screen, incumbent):
         if self._use_host(problem):
@@ -694,7 +783,8 @@ class LocalEvaluator(Evaluator):
                 return bad
             text = await self._timed_run(problem, work / "problem", self._run_env(only_slots, screen))
             if text is None:
-                return EvalResult(ok=False, stage="run", errors=[f"timeout after {self.timeout_s}s"])
+                return EvalResult(ok=False, stage="run",
+                                  errors=[self._timeout_error((_RUNINFO.get() or {}).get("limit"))])
             return parse_driver_output(text)
         finally:
             if not self.keep:
@@ -741,7 +831,7 @@ class LocalEvaluator(Evaluator):
 
     def _so_flags(self) -> list[str]:
         """The candidate's shared object: always the per-thread default stream (graph capture)."""
-        return ["-O3", f"-arch=sm_{self.arch}", "-std=c++17", "-lineinfo", "--default-stream", "per-thread",
+        return ["-O3", f"-arch={_arch_flag(self.arch)}", "-std=c++17", "-lineinfo", "--default-stream", "per-thread",
                 "-Xcompiler", "-fPIC"]
 
     async def _build_so(self, problem, sources, work: Path) -> tuple[Optional[Path], Optional[EvalResult]]:
@@ -773,11 +863,11 @@ class LocalEvaluator(Evaluator):
                 jobs.append(obj(work / name, text))
             objs = await asyncio.gather(*jobs, return_exceptions=True)
             if not any(isinstance(o, BaseException) for o in objs):
-                link_key = cache_key("nvcc-so", self.nvcc, f"-arch=sm_{self.arch}", *[k for k, _ in objs])
+                link_key = cache_key("nvcc-so", self.nvcc, f"-arch={_arch_flag(self.arch)}", *[k for k, _ in objs])
 
                 async def link(tmp: Path):
                     async with self._sem:
-                        rc, _ = await self._nvcc(["-shared", f"-arch=sm_{self.arch}", *[str(p) for _, p in objs],
+                        rc, _ = await self._nvcc(["-shared", f"-arch={_arch_flag(self.arch)}", *[str(p) for _, p in objs],
                                                   "-o", str(tmp)])
                     if rc != 0:
                         raise _Failed("link")
@@ -809,7 +899,7 @@ class LocalEvaluator(Evaluator):
 
         drv = problem.driver_path
         text = drv.read_text()
-        flags = ["-O3", f"-arch=sm_{self.arch}", "-std=c++17", "-DMB_HOST", *self._driver_flags()]
+        flags = ["-O3", f"-arch={_arch_flag(self.arch)}", "-std=c++17", "-DMB_HOST", *self._driver_flags()]
         key = cache_key("nvcc-host", self.nvcc, *flags, text, *external_inputs(text))
         log = {}
 
@@ -864,7 +954,9 @@ class LocalEvaluator(Evaluator):
         r.runtime, r.eval_wall_s = "host", round(rep.wall_s, 3)
         if rep.status != "done" or rep.poisoned:
             r.ok, r.stage = False, "run"
-            r.errors.append({"timeout": f"timeout after {self.timeout_s}s (the runtime was restarted)",
+            r.errors.append({"timeout": self._timeout_error(rep.limit_s, restarted=True),
+                             "lock_timeout": f"the GPU lock was not free after {int(self.gpu_lock_wait_s)}s "
+                                             f"(not charged to the candidate)",
                              "crash": f"the candidate crashed the runtime (exit {rep.rc}); it was restarted"}.get(
                 rep.status, "the candidate left the CUDA context unusable (sticky CUDA error); the runtime "
                             "was restarted"))
@@ -885,9 +977,11 @@ class LocalEvaluator(Evaluator):
                 key = (str(problem.root), dev.key, str(exe))
                 h = await self._hosts.get(key, dev.key, lambda: HostClient(
                     [str(exe)], env=host_env(dev.env()), label=f"{problem.name}@{dev.label()}",
-                    start_timeout=self.timeout_s, device=dev.label()))
+                    start_timeout=self.build_timeout_s, device=dev.label(), client_lock=True))
+                limit = self.run_timeout(problem)
                 rep = await h.request(str(so), ref=str(ref) if ref else None, env=env,
-                                      lock=gpu_lock_file(dev.ident), lock_wait=self.timeout_s, timeout=self.timeout_s)
+                                      lock=gpu_lock_file(dev.ident), lock_wait=self.gpu_lock_wait_s, timeout=limit)
+                rep.limit_s = limit
                 self._hosts.stats.note(rep, dev.label())
                 lease.infra_error = is_infra_failure(rep.text) and not re.search(r"^passed$", rep.text, re.M)
             if not lease.infra_error:
@@ -1229,13 +1323,13 @@ class SSHEvaluator(LocalEvaluator):
                                      f"cd {q(rdir)} && {{ cp -f {q(basis)} {q(name)} 2>/dev/null; true; }}", timeout=120)
             if rc == 0:
                 rc, out = await self._sh(self.rsync, "-I", "-e", shlex.join([self.ssh, *self._ssh_base()]),
-                                         str(exe), f"{host}:{rdir}/{name}", timeout=self.timeout_s)
+                                         str(exe), f"{host}:{rdir}/{name}", timeout=self.build_timeout_s)
                 if rc == 0:
                     self.transfer["rsync"] += 1
                     return None
             _log().warning(f"rsync to {host} failed ({out[-200:]!r}); using scp")
         rc, out = await self._sh(self.scp, "-q", *self._ssh_base(), str(exe), f"{host}:{rdir}/{name}",
-                                 timeout=self.timeout_s)
+                                 timeout=self.build_timeout_s)
         if rc == 0:
             self.transfer["scp"] += 1
             return None
@@ -1322,8 +1416,12 @@ class SSHEvaluator(LocalEvaluator):
         err = await self._send(exe, host, rdir, name, basis)
         return name, basis, err
 
+    async def _remote_kill(self, host: str, pid) -> None:
+        """Stop a persistent host's remote process (killing the local ssh client does not)."""
+        await self._sh(self.ssh, *self._ssh_base(), host, f"kill -9 {int(pid)} 2>/dev/null; true", timeout=60)
+
     async def _exec_staged(self, host: str, name: str, basis: Optional[str], env=None, prefix="",
-                           device=None) -> Optional[str]:
+                           device=None, problem=None) -> Optional[str]:
         from ..servers.utils.resources import gpu_lock_wrap
 
         rdir = self._stage_dir(host)
@@ -1331,18 +1429,25 @@ class SSHEvaluator(LocalEvaluator):
                         {**(device.env() if device is not None else {}), **(env or {})}.items())
         q = shlex.quote(name)
         keep = f"mv -f ./{q} ./{shlex.quote(basis)} 2>/dev/null || rm -f ./{q}" if basis else f"rm -f ./{q}"
+        limit = self.run_timeout(problem, profiling=bool(prefix))
         run = gpu_lock_wrap(f"env {envs} {prefix} ./{q}", device.ident if device is not None else None,
-                            wait_s=self.timeout_s)
+                            wait_s=self.gpu_lock_wait_s, run_timeout_s=limit)
         remote = (f"cd {shlex.quote(rdir)} && export PATH={shlex.quote(self.remote_path)}:$PATH && "
                   f"{run}; rc=$?; {keep}; exit $rc")
         proc = await asyncio.create_subprocess_exec(self.ssh, *self._ssh_base(), host, remote,
                                                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        t0 = time.monotonic()
         try:
-            out, _ = await asyncio.wait_for(proc.communicate(), self.timeout_s)
+            # the remote `timeout` ends the run itself; this is the backstop (lock wait + run + grace)
+            out, _ = await asyncio.wait_for(proc.communicate(), limit + self.gpu_lock_wait_s + 30)
         except asyncio.TimeoutError:
             proc.kill()
+            _runinfo(limit=limit)
             return None
         text = out.decode(errors="replace")
+        _runinfo(limit=limit, wall=time.monotonic() - t0)
+        if proc.returncode == 124 and not re.search(r"^passed$", text, re.M):      # remote `timeout`
+            return None
         if proc.returncode == 255 and not re.search(r"^passed$", text, re.M):     # ssh itself failed
             text += f"\nMB_ERROR [infra] ssh to {host} failed (rc 255)\n"
         return text
@@ -1356,7 +1461,7 @@ class SSHEvaluator(LocalEvaluator):
         if err is not None:
             return f"MB_ERROR [infra] copy to {host} failed: {_copy_err(err)}\nfailed\n"
         return await self._exec_staged(host, name, basis, {**(env or {}), **({"MB_DATA_PATH": data} if data else {})},
-                                       prefix, device)
+                                       prefix, device, problem)
 
     async def _timed_run(self, problem, exe: Path, env: Optional[dict] = None, prefix: str = "") -> Optional[str]:
         """Copy the binary (and a run-time data.bin, once per host) to the host
@@ -1385,7 +1490,8 @@ class SSHEvaluator(LocalEvaluator):
                 run_env = {**(env or {}), **({"MB_DATA_PATH": data} if data else {})}
                 async with pool.lease(group, host=host) as lease:
                     _leased(lease.device)
-                    text = await self._exec_staged(host, name, basis, run_env, prefix, device=lease.device)
+                    text = await self._exec_staged(host, name, basis, run_env, prefix, device=lease.device,
+                                                   problem=problem)
                     missing = self._data_missing(text, data)
                     lease.infra_error = missing or (text is not None and is_infra_failure(text) and
                                                     not re.search(r"^passed$", text, re.M))
@@ -1501,11 +1607,14 @@ class SSHEvaluator(LocalEvaluator):
                 self._note_remote(host, "segment", tmp=self._data_tmp_name())
                 h = await self._hosts.get(key, dev.key, lambda: HostClient(
                     [self.ssh, *self._ssh_base(), host, remote], label=f"{problem.name}@{dev.label()}",
-                    start_timeout=self.timeout_s, device=dev.label()))
+                    start_timeout=self.build_timeout_s, device=dev.label(),
+                    remote_kill=lambda pid, host=host: self._remote_kill(host, pid)))
+                limit = self.run_timeout(problem)
 
                 # dlopen searches the library path for a bare name: ./ (the host runs in rdir)
                 rep = await h.request(f"./{names[so]}", ref=f"./{names[ref]}" if ref else None, env=env,
-                                      lock=gpu_lock_file(dev.ident), lock_wait=self.timeout_s, timeout=self.timeout_s)
+                                      lock=gpu_lock_file(dev.ident), lock_wait=self.gpu_lock_wait_s, timeout=limit)
+                rep.limit_s = limit
                 self._hosts.stats.note(rep, dev.label())
                 if getattr(h, "remote_pid", None):
                     self._note_remote(host, "host", host_pid=h.remote_pid)
@@ -1523,7 +1632,8 @@ class SSHEvaluator(LocalEvaluator):
                     self._staged.get(host, {}).pop(n, None)
                 rep = HostReply(rep.text + f"MB_ERROR [infra] staged {', '.join(sorted(gone))} missing on "
                                 f"{host} (removed under this process)\nfailed\n", rep.status, rc=rep.rc,
-                                poisoned=rep.poisoned, wall_s=rep.wall_s, started=rep.started, start_s=rep.start_s)
+                                poisoned=rep.poisoned, wall_s=rep.wall_s, started=rep.started, start_s=rep.start_s,
+                                limit_s=rep.limit_s)
             if not lease.infra_error:
                 return rep
             await self._hosts.drop(key)
@@ -1628,6 +1738,12 @@ def _log():
     except ImportError:                       # pragma: no cover
         import logging
         return logging.getLogger(__name__)
+
+
+def _arch_flag(arch) -> str:
+    """nvcc -arch: sm_90a / sm_100a on Hopper / Blackwell (wgmma, tcgen05 need the arch-specific target)."""
+    a = str(arch).removeprefix("sm_").rstrip("af")
+    return f"sm_{a}a" if a in ("90", "100") else f"sm_{a}"
 
 
 def cupti_flags(nvcc: str = "nvcc") -> list[str]:
