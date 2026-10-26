@@ -534,6 +534,7 @@ class Device:
     infra_fail: int = 0                              # consecutive infrastructure failures
     quarantined_until: float = 0.0
     quarantines: int = 0
+    clock_suspect: Optional[str] = None              # X-149: why the clock guard quarantined it (None: not by the guard)
 
     @property
     def key(self) -> tuple:
@@ -615,6 +616,9 @@ class GPUPool:
         if free:
             return min(free, key=lambda d: (d.last_used, d.runs, d.busy_s)), 0.0
         if not healthy:                              # everything quarantined: wait for the first to return
+            soft = [d for d in cands if d.clock_suspect and d.key not in self._busy]
+            if soft:                                 # X-149: every GPU is clock-suspect: use one (results get flagged)
+                return min(soft, key=lambda d: (d.last_used, d.runs, d.busy_s)), 0.0
             return None, max(0.05, min(d.quarantined_until for d in cands) - now)
         return None, 0.0
 
@@ -659,6 +663,25 @@ class GPUPool:
             log.warning(f"[{self.name}] {dev.label()} quarantined for {self.quarantine_s:.0f}s after "
                         f"{self.quarantine_after} infrastructure failures")
 
+    def quarantine(self, dev: Device, seconds: float, reason: str) -> None:
+        """Take ``dev`` out of the rotation for ``seconds`` (the clock guard, X-149); while every device of the pool
+        is out for such a reason, one is still used (see ``_pick``) and its results are flagged."""
+        now = self.clock()
+        dev.quarantined_until = max(dev.quarantined_until, now + seconds)
+        dev.clock_suspect = reason
+        dev.quarantines += 1
+        log.warning(f"[{self.name}] {dev.label()} quarantined for {seconds:.0f}s: {reason}")
+
+    def unquarantine(self, dev: Device) -> None:
+        if dev.clock_suspect:
+            dev.clock_suspect, dev.quarantined_until = None, 0.0
+            log.warning(f"[{self.name}] {dev.label()} clock guard: clean again, back in the rotation")
+
+    def healthy_others(self, dev: Device, group=None) -> list[Device]:
+        """Devices other than ``dev`` that a run of ``group`` could use now-ish (not quarantined)."""
+        now = self.clock()
+        return [d for d in self._candidates(group) if d.key != dev.key and d.quarantined_until <= now]
+
     def host_failure(self, host) -> None:
         """An infrastructure failure that is the host's, not a device's (e.g. the
         copy to it failed): a strike for each of its devices."""
@@ -692,7 +715,8 @@ class GPUPool:
                 self._group_model[group] = dev.name
             return dev
 
-    async def release(self, dev: Device, *, infra_error: bool = False) -> None:
+    async def release(self, dev: Device, *, infra_error: bool = False, clock_suspect: Optional[str] = None,
+                      quarantine_s: float = 0.0) -> None:
         cond = self._condition()
         async with cond:
             now = self.clock()
@@ -704,6 +728,8 @@ class GPUPool:
                 self._strike(dev, now)
             else:
                 dev.infra_fail = 0
+            if clock_suspect:
+                self.quarantine(dev, quarantine_s, clock_suspect)
             cond.notify_all()
 
     @asynccontextmanager
@@ -714,7 +740,11 @@ class GPUPool:
         try:
             yield lease
         finally:
-            await self.release(dev, infra_error=lease.infra_error)
+            if lease.clock_suspect:                  # X-149 (only then the extra keywords: stubs keep working)
+                await self.release(dev, infra_error=lease.infra_error, clock_suspect=lease.clock_suspect,
+                                   quarantine_s=lease.quarantine_s)
+            else:
+                await self.release(dev, infra_error=lease.infra_error)
 
     def pinned_model(self, group) -> Optional[str]:
         return self._group_model.get(group)
@@ -731,6 +761,8 @@ class GPUPool:
 class Lease:
     device: Device
     infra_error: bool = False
+    clock_suspect: Optional[str] = None              # X-149: the clock guard found the GPU locked / throttled
+    quarantine_s: float = 0.0
 
 
 # Driver/runtime messages that mean the device or the link to it failed, not

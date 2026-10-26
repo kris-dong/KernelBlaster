@@ -50,6 +50,7 @@ from ..knowledge.impl_store import ImplStore, shape_bucket
 from ..knowledge.outcomes import (COMPILE_ERROR, IMPROVED, NEUTRAL, REGRESSED, RUNTIME_ERROR, WRONG_OUTPUT,
                                   OutcomeLog, OutcomeRecord, classify_speedup)
 from ..knowledge.slots import EvalResult, Evaluator, SlotProblem, step_eval_options
+from ..knowledge.clock_guard import clock_suspect
 from . import hw_profile
 from . import experiment_tool
 from ..knowledge.v2 import experiments
@@ -1516,6 +1517,17 @@ class MultiSlotAgent:
             speedup = None
             status = {"compile": COMPILE_ERROR, "run": RUNTIME_ERROR}.get(res.stage, WRONG_OUTPUT)
             reward = -0.05 if status == COMPILE_ERROR else -0.1
+        elif clock_suspect(res) or (d is not None and clock_suspect(d.get("res2"))):
+            # X-149: timed on a GPU whose clocks are locked / throttled and no clean GPU was left to re-time on: the
+            # numbers are not evidence. Neutral, no reward, never adopted, never recorded as a regression.
+            res._clock_suspect = True
+            self.clock_suspect_steps = getattr(self, "clock_suspect_steps", 0) + 1
+            self.log.warning(f"[{self.p.name}] r{ridx} s{step}: {sid} {tech} timed on a clock-suspect GPU: step marked "
+                             f"inconclusive (not adopted, not counted as a regression)")
+            tel.count("clock.suspect_step")
+            speedup, status, reward = None, NEUTRAL, 0.0
+            if d is not None:
+                d["keep"], d["merged"] = False, False
         tel.lap("knowledge.record")
         prof_after = None
         if res.ok and (self.ncu == "all" or (self.ncu == "best" and (
@@ -1538,10 +1550,12 @@ class MultiSlotAgent:
         impl_id, parent = None, self.best[sid].impl_id
         cur_prev = cur[sid]                                     # the step's seed source (X-145 reference overlap)
         dsum = diff_summary(cur[sid], code) if code else None
+        csus = bool(getattr(res, "_clock_suspect", False))       # X-149: timed on a clock-suspect GPU
         if res.ok:
             impl_id = self._store(sid, code, after, before, self.best[sid].techniques + [tech], parent,
                                   res.slot_checks.get(sid, {}).get("rel_err"), rid=self._rid("impl", ridx, step))
             keep = d["keep"] if d is not None else after <= before * 1.05   # keep improving/neutral moves
+            keep = keep and not csus
             if keep:
                 cur[sid], cur_us[sid] = code, after
                 meta["ev"][sid] = res.slot_us.get(sid)
@@ -1550,7 +1564,7 @@ class MultiSlotAgent:
         if d is not None:
             merged = d["merged"] and self._merge(sid, code, d, impl_id, tech)
         else:
-            merged = res.ok and after < self.best[sid].slot_us * (1 - self.confirm_pct / 100)
+            merged = res.ok and after < self.best[sid].slot_us * (1 - self.confirm_pct / 100) and not csus
             if merged:
                 self.best[sid] = SlotBest(code, after, impl_id, self.best[sid].techniques + [tech],
                                           event_us=res.slot_us.get(sid))
@@ -1573,7 +1587,9 @@ class MultiSlotAgent:
                    diff_summary=dsum, impl_id=impl_id, parent_impl_id=parent,
                    **(d["outcome"] if d is not None else {"timing_basis": "slot_events"}))
         v2 = None
-        if self.kv is not None:
+        if csus:                                    # X-149: inconclusive timing: nothing is learned from it
+            pass
+        elif self.kv is not None:
             vec_after = (self.kv.vector(self._tkey, estimate=self._roofline_input(sid, after, res if e2e else None),
                                         profile=prof_after, profile_kind=self._profile_kind)
                          if res.ok and after else None)
@@ -1597,7 +1613,7 @@ class MultiSlotAgent:
                "examples": [e.id for e in r["examples"]],
                "claims": ktext.count("\n") + 1 if ktext else 0, "already_tried": bool(tried),
                "ncu": bool(prof_before), "state": state, "model": model, "model_role": role,
-               "model_why": why}
+               "model_why": why, **({"clock_suspect": True, "gpu_clock": (res.gpu or {}).get("clock")} if csus else {})}
         if fix_models:
             ctx["fix_models"] = fix_models
         if capture_defects or (res is not None and self._capture_defect(res)):
@@ -2127,6 +2143,7 @@ class MultiSlotAgent:
             "llm_usage_by_model": sorted(self.llm_usage_by.values(), key=lambda d: (d["role"], d["model"])),
             **({"multiturn": self.mt_stats} if getattr(self, "mt_stats", None) else {}),
             **({"experiments": self._exp.pointer()} if getattr(self, "_exp", None) is not None else {}),
+            **({"clock_suspect": {"steps": self.clock_suspect_steps}} if getattr(self, "clock_suspect_steps", 0) else {}),
             "ncu": {"mode": self.ncu, "runs": self.ncu_runs, "disabled": self.ncu_disabled,
                     "final": {sid: self._ncu_of(sid, b.source) for sid, b in self.best.items()
                               if self._ncu_of(sid, b.source)}},
