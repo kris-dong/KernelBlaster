@@ -587,6 +587,9 @@ class GlobalStore:
         from .knowledge import SEED_VERSION
         from .targets import DATA_DIR
         h = hashlib.sha1(str(SEED_VERSION).encode())
+        from .knowledge import seed_mined_enabled
+        if not seed_mined_enabled():          # a technique-only base (KERNELBLASTER_SEED_MINED=0) is a different cache entry
+            h.update(b"no-mined")
         for f in sorted(DATA_DIR.rglob("*")):
             if f.is_file():
                 h.update(f.name.encode())

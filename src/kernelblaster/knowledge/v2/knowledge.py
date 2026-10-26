@@ -64,10 +64,17 @@ class Choice:
         return self.item_id if self.kind == "hypothesis" else None
 
 
+def seed_mined_enabled() -> bool:
+    """mined.json (outcomes / claims mined from recorded runs) is folded into every fresh knowledge.db unless
+    ``KERNELBLASTER_SEED_MINED`` is 0 / off / false / no (then only targets, states and technique definitions seed it)."""
+    import os
+    return os.environ.get("KERNELBLASTER_SEED_MINED", "1").strip().lower() not in ("0", "off", "false", "no")
+
+
 class KnowledgeV2:
     def __init__(self, root: Path, *, upkeep_model: Optional[str] = None, logger=None,
                  explore_frac: float = EXPLORE_FRAC, kappa: float = 3.0, ucb_c: float = 1.0,
-                 upkeep_every: int = 8, max_new_hypotheses: int = 3, seed_mined: bool = True):
+                 upkeep_every: int = 8, max_new_hypotheses: int = 3, seed_mined: Optional[bool] = None):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.review_path = self.root / "review.jsonl"
@@ -84,6 +91,8 @@ class KnowledgeV2:
         self.ontology = self._load_ontology()
         self.outcomes = SQLiteOutcomeLog(self.db)
         self.claims = SQLiteClaimStore(self.db, registry=self.registry, hierarchy=self.hierarchy)
+        if seed_mined is None:            # KERNELBLASTER_SEED_MINED=0: technique definitions only (no mined.json evidence)
+            seed_mined = seed_mined_enabled()
         if seed_mined:
             self._seed_mined()
         self.stats = HierStats(self.registry, self.db, kappa=kappa)
