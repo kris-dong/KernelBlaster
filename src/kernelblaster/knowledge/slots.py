@@ -32,6 +32,7 @@ from collections import OrderedDict
 from typing import Mapping, Optional
 
 from .. import trace
+from .remote_build import RemoteBuildMixin
 
 FORMAT = "mb-kb-problem/1"
 
@@ -531,6 +532,10 @@ class LocalEvaluator(Evaluator):
         self.incremental = _incremental_default() if incremental is None else incremental
         self._cache_dir = Path(cache_dir) if cache_dir else None
         self._cache = None
+        # compile pool: KERNELBLASTER_BUILD_CACHE=<dir> makes one cache for every problem / process (an explicit
+        # cache_dir keeps the per-problem behaviour); its keys name the toolchain (version), see build_cache.py
+        from ..servers.utils.build_cache import shared_dir
+        self._shared_cache = shared_dir() if self._cache_dir is None else None
 
     # ---- evaluation timeouts
     def note_incumbent_wall(self, problem, wall_s: Optional[float]) -> None:
@@ -628,9 +633,35 @@ class LocalEvaluator(Evaluator):
         from ..servers.utils.build_cache import BuildCache
 
         if self._cache is None:
-            root = self._cache_dir or (self.work_root or problem.root / "kb_work") / ".build_cache"
-            self._cache = BuildCache(root)
+            if self._shared_cache is not None:
+                self._cache = BuildCache(self._shared_cache, shared=True)
+            else:
+                root = self._cache_dir or (self.work_root or problem.root / "kb_work") / ".build_cache"
+                self._cache = BuildCache(root)
         return self._cache
+
+    def _tool_key(self) -> str:
+        """What cache keys name as the compiler: the nvcc command (per-problem cache, as always), or with the shared
+        cache the toolchain's identity (nvcc release / build, host compiler, compiler environment)."""
+        from ..servers.utils.build_cache import tool_id
+
+        return tool_id(self.nvcc) if self._shared_cache is not None else self.nvcc
+
+    def _ext(self, text: str) -> list:
+        """The absolute inputs of a TU as cache-key parts (shared cache: included headers by content)."""
+        from ..servers.utils.build_cache import external_inputs
+
+        return external_inputs(text, content=self._shared_cache is not None)
+
+    async def _compile_obj(self, src: Path, args: list, tmp: Path, text: str = "") -> None:
+        """``nvcc <args> -c src -o tmp`` under the build limiter. A failure raises BuildError (``cacheable`` when it
+        is the source's fault, not a timeout / killed compiler); SSHEvaluator may run this on a pool host."""
+        from ..servers.utils.build_cache import BuildError, deterministic_failure
+
+        async with self._unit_sem:
+            rc, out = await self._nvcc([*args, "-c", str(src), "-o", str(tmp)])
+        if rc != 0:
+            raise BuildError(src.name, out, cacheable=deterministic_failure(rc, out))
 
     async def _nvcc(self, args: list[str]) -> tuple[int, str]:
         t0 = time.time()
@@ -651,22 +682,19 @@ class LocalEvaluator(Evaluator):
         own object, each cached by (flags, text, absolute inputs), then one
         cached link. The same nvcc invocation as the one-shot build, split
         into its compile and link steps. False if any step fails."""
-        from ..servers.utils.build_cache import cache_key, external_inputs, link_or_copy
+        from ..servers.utils.build_cache import BuildError, cache_key, link_or_copy
 
         cache = self._build_cache(problem)
         flags = self._flags()
+        tool = self._tool_key()
 
-        class _Failed(Exception):
-            pass
+        _Failed = BuildError
 
         async def obj(src: Path, text: str, extra=()):
-            key = cache_key("nvcc-c", self.nvcc, *flags, *extra, text, *external_inputs(text))
+            key = cache_key("nvcc-c", tool, *flags, *extra, text, *self._ext(text))
 
             async def build(tmp: Path):
-                async with self._unit_sem:
-                    rc, _ = await self._nvcc([*flags, *extra, "-c", str(src), "-o", str(tmp)])
-                if rc != 0:
-                    raise _Failed(src.name)
+                await self._compile_obj(src, [*flags, *extra], tmp, text)
             return key, (await cache.get_or_build(key, ".o", build))[0]
 
         jobs = []
@@ -678,7 +706,7 @@ class LocalEvaluator(Evaluator):
         objs = await asyncio.gather(*jobs, return_exceptions=True)
         if any(isinstance(o, BaseException) for o in objs):
             return False
-        link_key = cache_key("nvcc-link", self.nvcc, f"-arch={_arch_flag(self.arch)}", *[k for k, _ in objs])
+        link_key = cache_key("nvcc-link", tool, f"-arch={_arch_flag(self.arch)}", *[k for k, _ in objs])
 
         async def link(tmp: Path):
             rc, _ = await self._nvcc([f"-arch={_arch_flag(self.arch)}", *[str(p) for _, p in objs], "-o", str(tmp)])
@@ -697,9 +725,13 @@ class LocalEvaluator(Evaluator):
             return None
         # the one-shot build of the assembled TU is authoritative (errors,
         # and anything the per-slot split cannot express)
-        (work / "kernels.cu").write_text(problem.assemble(sources))
+        tu = problem.assemble(sources)
+        (work / "kernels.cu").write_text(tu)
         cmd = [self.nvcc, *self._flags(), *self._driver_flags(), "-o", str(work / "problem"),
                str(work / "kernels.cu"), str(problem.driver_path)]
+        neg = self._neg_key(problem, tu)
+        if neg is not None and (txt := self._build_cache(problem).neg_lookup(neg)) is not None:
+            return EvalResult(ok=False, stage="compile", errors=[_compile_errors(txt)], log=txt[-4000:])
         t0 = time.time()
         async with self._sem:
             proc = await asyncio.create_subprocess_exec(
@@ -707,9 +739,24 @@ class LocalEvaluator(Evaluator):
             out, _ = await asyncio.wait_for(proc.communicate(), self.build_timeout_s)
         trace.tool("nvcc", cmd, proc.returncode, out.decode(errors="replace"), time.time() - t0)
         if proc.returncode != 0:
+            if neg is not None:
+                from ..servers.utils.build_cache import deterministic_failure
+                if deterministic_failure(proc.returncode, out.decode(errors="replace")):
+                    self._build_cache(problem).neg_store(neg, out.decode(errors="replace"), time.time() - t0)
             return EvalResult(ok=False, stage="compile", errors=[_compile_errors(out.decode())],
                               log=out.decode()[-4000:])
         return None
+
+    def _neg_key(self, problem, tu: str) -> Optional[str]:
+        """Key of the one-shot assembled build's compile error (shared cache only: a negative entry, no product)."""
+        if self._shared_cache is None:
+            return None
+        from ..servers.utils.build_cache import cache_key
+
+        drv = problem.driver_path
+        dtext = drv.read_text()
+        return cache_key("nvcc-oneshot", self._tool_key(), *self._flags(), *self._driver_flags(), tu, dtext,
+                         *self._ext(tu), *self._ext(dtext))
 
     async def _run(self, exe: Path, env: Optional[dict] = None, prefix: str = "", device=None,
                    problem=None) -> Optional[str]:
@@ -848,23 +895,20 @@ class LocalEvaluator(Evaluator):
     async def _build_so(self, problem, sources, work: Path) -> tuple[Optional[Path], Optional[EvalResult]]:
         """The candidate's kernels as a shared object (cached by content):
         slot units + tail linked -shared, else the assembled TU (authoritative errors)."""
-        from ..servers.utils.build_cache import cache_key, external_inputs
+        from ..servers.utils.build_cache import BuildError, cache_key
 
         cache = self._build_cache(problem)
         flags = self._so_flags()
+        tool = self._tool_key()
         work.mkdir(parents=True, exist_ok=True)
 
-        class _Failed(Exception):
-            pass
+        _Failed = BuildError
 
         async def obj(src: Path, text: str):
-            key = cache_key("nvcc-c", self.nvcc, *flags, text, *external_inputs(text))
+            key = cache_key("nvcc-c", tool, *flags, text, *self._ext(text))
 
             async def build(tmp: Path):
-                async with self._unit_sem:
-                    rc, _ = await self._nvcc([*flags, "-c", str(src), "-o", str(tmp)])
-                if rc != 0:
-                    raise _Failed(src.name)
+                await self._compile_obj(src, flags, tmp, text)
             return key, (await cache.get_or_build(key, ".o", build))[0]
 
         if self.incremental:
@@ -874,7 +918,7 @@ class LocalEvaluator(Evaluator):
                 jobs.append(obj(work / name, text))
             objs = await asyncio.gather(*jobs, return_exceptions=True)
             if not any(isinstance(o, BaseException) for o in objs):
-                link_key = cache_key("nvcc-so", self.nvcc, f"-arch={_arch_flag(self.arch)}", *[k for k, _ in objs])
+                link_key = cache_key("nvcc-so", tool, f"-arch={_arch_flag(self.arch)}", *[k for k, _ in objs])
 
                 async def link(tmp: Path):
                     async with self._sem:
@@ -888,30 +932,32 @@ class LocalEvaluator(Evaluator):
                     pass
         text = problem.assemble(sources)
         (work / "kernels.cu").write_text(text)
-        key = cache_key("nvcc-so-tu", self.nvcc, *flags, text, *external_inputs(text))
+        key = cache_key("nvcc-so-tu", tool, *flags, text, *self._ext(text))
         log = {}
 
         async def build_tu(tmp: Path):
+            from ..servers.utils.build_cache import deterministic_failure
+
             async with self._sem:
                 rc, out = await self._nvcc([*flags, "-shared", "-o", str(tmp), str(work / "kernels.cu")])
             if rc != 0:
                 log["out"] = out
-                raise _Failed("kernels.cu")
+                raise _Failed("kernels.cu", out, cacheable=deterministic_failure(rc, out))
         try:
             return (await cache.get_or_build(key, ".so", build_tu))[0], None
-        except _Failed:
-            out = log.get("out", "")
+        except _Failed as e:
+            out = log.get("out") or e.text
             return None, EvalResult(ok=False, stage="compile", errors=[_compile_errors(out)], log=out[-4000:],
                                     runtime="host")
 
     async def _host_exe(self, problem) -> Optional[Path]:
         """driver.cpp built -DMB_HOST (cached by content); None if it does not build."""
-        from ..servers.utils.build_cache import cache_key, external_inputs
+        from ..servers.utils.build_cache import BuildError, cache_key, deterministic_failure
 
         drv = problem.driver_path
         text = drv.read_text()
         flags = ["-O3", f"-arch={_arch_flag(self.arch)}", "-std=c++17", "-DMB_HOST", *self._driver_flags()]
-        key = cache_key("nvcc-host", self.nvcc, *flags, text, *external_inputs(text))
+        key = cache_key("nvcc-host", self._tool_key(), *flags, text, *self._ext(text))
         log = {}
 
         async def build(tmp: Path):
@@ -919,10 +965,11 @@ class LocalEvaluator(Evaluator):
                 rc, out = await self._nvcc([*flags, "-o", str(tmp), str(drv), "-ldl"])
             if rc != 0:
                 log["out"] = out
-                raise RuntimeError("host build failed")
+                raise BuildError("host build failed", out, cacheable=deterministic_failure(rc, out))
         try:
             return (await self._build_cache(problem).get_or_build(key, ".host", build))[0]
-        except RuntimeError:
+        except BuildError as e:
+            log.setdefault("out", e.text)
             self._host_off[str(problem.root)] = "host build failed: " + _compile_errors(log.get("out", ""), 500)
             _log().warning(f"{problem.name}: {self._host_off[str(problem.root)]}; one process per run")
             return None
@@ -1006,13 +1053,17 @@ class LocalEvaluator(Evaluator):
 
     def host_stats(self) -> dict:
         return {"runtime": self.runtime, **self._hosts.stats.to_json(),
-                "fallbacks": {Path(k).name: v for k, v in self._host_off.items()}}
+                "fallbacks": {Path(k).name: v for k, v in self._host_off.items()},
+                **({"build_cache": self._cache.stats()} if self._cache is not None and self._shared_cache is not None
+                   else {})}
 
     async def close(self):
         await self._hosts.close()
+        if self._cache is not None and self._shared_cache is not None:
+            self._cache.flush_stats()
 
 
-class SSHEvaluator(LocalEvaluator):
+class SSHEvaluator(RemoteBuildMixin, LocalEvaluator):
     """Build here, run on remote GPU hosts over ssh (e.g. idle L40S GPUs with
     profiler-counter access). The binary is self-contained (data.bin is
     linked in), so only the executable is copied.
@@ -1058,8 +1109,10 @@ class SSHEvaluator(LocalEvaluator):
     def __init__(self, host, *, arch: str, remote_dir, ssh_key: Optional[str] = None,
                  cuda_visible_devices=None, remote_path: str = "/usr/local/cuda/bin", ssh: str = "ssh",
                  scp: str = "scp", rsync: Optional[str] = "rsync", keep_data: Optional[bool] = None,
-                 remote_manifest: Optional[Path] = None, **kw):
+                 remote_manifest: Optional[Path] = None, remote_build: Optional[bool] = None,
+                 remote_build_jobs: Optional[int] = None, **kw):
         super().__init__(arch, **kw)
+        self._rb_init(remote_build, remote_build_jobs)
         # resume: what this run staged / started on the hosts (one JSON line each), so a
         # resumed run removes exactly the leftovers of its killed segment (cleanup_previous)
         self.remote_manifest = Path(remote_manifest) if remote_manifest else None
@@ -1655,7 +1708,8 @@ class SSHEvaluator(LocalEvaluator):
         return rep
 
     def host_stats(self) -> dict:
-        return {**super().host_stats(), "transfer": dict(self.transfer), "data": dict(self.data_transfer)}
+        return {**super().host_stats(), "transfer": dict(self.transfer), "data": dict(self.data_transfer),
+                **({"remote_build": self.remote_build_stats()} if self.remote_build else {})}
 
 
 class ServerEvaluator(Evaluator):
