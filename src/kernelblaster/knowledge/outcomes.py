@@ -28,7 +28,7 @@ NEUTRAL_PCT = 2.0
 
 # op classes (ModelBlaster tags each KernelSpec with one; KernelBench
 # problems without a tag use OTHER)
-OP_CLASSES = ("gemm", "conv", "reduction", "elementwise", "data_movement", "attention", "scan", "other")
+OP_CLASSES = ("gemm", "conv", "reduction", "elementwise", "data_movement", "attention", "scan", "recurrent", "other")
 
 
 def classify_speedup(speedup: Optional[float]) -> str:

@@ -249,6 +249,47 @@
      "how": "Load the transposed operand's tile with threads along its contiguous dimension and transpose while storing into on-chip memory (pad to avoid bank conflicts)."
     }
    ]
+  },
+  {
+   "id": "fold_transpose_into_load",
+   "level": "universal",
+   "aliases": [
+    "strided_operand_gemm",
+    "layout_folding",
+    "transpose_free_gemm"
+   ],
+   "mechanism": "read GEMM operands and write its result through their real strides (transposed / per-head views of a fused buffer) instead of materialising permute/split copies: each folded copy is a full read + write of an operand that disappears",
+   "predicts": {
+    "bw_util": "down_or_flat",
+    "launch_frac": "down"
+   },
+   "risks": [
+    "a column-major operand loaded row-wise is uncoalesced: switch the tile loader (ldmatrix.trans) instead",
+    "two batch levels: index b0*s0 + b1*s1, not a flat batch stride"
+   ],
+   "states": [],
+   "op_classes": [
+    "gemm"
+   ],
+   "op_kinds": [
+    "bmm_strided",
+    "bmm_strided_f16"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.15,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "node:simt_gpu",
+     "how": "Pick the tile loader per operand from the unit stride: a_sk==1 row-major A tile, a_sm==1 transposed load; same for B (b_sn / b_sk) and the C store (c_sn / c_sm). The composite seed's strided_copy calls and their workspace are then deleted."
+    },
+    {
+     "scope": "target:cuda:sm_80+",
+     "how": "cp.async 16-byte chunks along the unit-stride dimension into swizzled smem, ldmatrix (unit stride along K) or ldmatrix.trans (unit stride along M/N) into mma.sync.m16n8k16 fragments; epilogue through smem so C rows with c_sm != N are still stored as full 16-byte segments."
+    }
+   ]
   }
  ]
 }

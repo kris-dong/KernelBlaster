@@ -136,12 +136,60 @@ _TC = [
 ]
 
 
+# Attention-class (fused attention slots, e.g. ModelBlaster's attention_f16), fp16 tensor cores.
+_TC_ATTENTION = [
+    (80, "fa2_register_online_softmax", "FlashAttention-2 structure: per CTA 64-128 query rows, Q fragments kept in "
+                                        "registers, K/V tiles streamed through cp.async double-buffered smem, "
+                                        "S = QK^T and O += PV with mma.sync.m16n8k16 (fp32 accumulate), running "
+                                        "row max / sum in fp32 via quad shuffles on the accumulator fragments, P "
+                                        "re-packed to fp16 A-fragments in registers; normalise O once at the end."),
+    (80, "causal_tile_skipping", "With a causal mask stop each query tile's key loop at the diagonal tile and apply "
+                                 "the mask only there: half the FLOPs of the dense loop."),
+    (80, "strided_qkv_in_place", "Read q/k/v straight out of the fused projection buffer through their row / head "
+                                 "strides and write O in the consumer's layout: no split / transpose copies."),
+]
+
+
+# Recurrent class (gru_seq / lstm_seq with ModelBlaster --recurrent-class on), fp16: the per-step h W_hh^T product.
+_TC_RECURRENT = [
+    (80, "whh_mma_fragments_in_registers", "Load each block's W_hh slice once as mma.sync.m16n8k16 A-fragments kept "
+                                           "in registers for all timesteps; build h_{t-1} B-fragments from the "
+                                           "exchange buffer; fp32 accumulators feed the gate math directly."),
+]
+
+
+def recurrent_text(arch: Optional[str]) -> str:
+    """Notes for a slot of the recurrent class: what bounds a sequence recurrence on this GPU."""
+    h = info(arch) if arch else None
+    sms = f"{h['sms']} SMs" if h else "all SMs"
+    return ("## Recurrent op notes\n"
+            "This op is a sequence recurrence: T timesteps, each depending on the previous hidden state. Its time is "
+            "T x (latency of one step), not FLOPs or DRAM bytes; the roofline percentages above will look tiny. "
+            "What costs time per step: waiting for other blocks' h_{t-1} through L2 (a few hundred cycles per "
+            "round trip), the h W_hh^T product, the gate math, and publishing h_t. Measured on a fast L40S GRU kernel "
+            "(1,650 cycles/step): ~640 waiting on L2 for h, ~215 mma + barrier, ~600 gate math + publish.\n"
+            "- Keep W_hh and h on chip across steps (one persistent launch); hoist the input projection X W_ih^T for "
+            "all steps into one GEMM; exchange h point-to-point (tagged words / flags with release/acquire), not with "
+            "grid-wide barriers.\n"
+            f"- Spinning blocks must all be co-resident: size the persistent grid to the resident capacity of the SMs "
+            f"you may use ({sms} when the op runs alone; call mb_sm_budget() when the harness declares it, since the "
+            "op may run beside a concurrent sibling such as the other direction). A non-resident producer = deadlock.\n"
+            "- Scratch (gate buffers, flags, step counters) must be slot-owned and safe to reuse across calls "
+            "(epoch / step tags instead of resets), because the op is called repeatedly and may be captured in a "
+            "CUDA graph.")
+
+
 def tensor_core_techniques(arch: str, dtype: str, op_class: str) -> list[tuple[str, str]]:
-    """GEMM-class techniques valid on ``arch`` (empty unless fp16 gemm/conv/attention on sm_80+)."""
+    """GEMM-class techniques valid on ``arch`` (empty unless fp16 gemm/conv/attention on sm_80+; the recurrent
+    class gets only its W_hh fragment technique)."""
     sm = _sm(arch)
+    if op_class == "recurrent":
+        return [(n, d) for lo, n, d in _TC_RECURRENT if sm >= lo] if dtype == "fp16" else []
     if dtype != "fp16" or op_class not in ("gemm", "conv", "attention") or sm < 80:
         return []
     out = [(n, d) for lo, n, d in _TC if sm >= lo]
+    if op_class == "attention":         # flash-style structure first: the GEMM techniques apply inside it
+        out = [(n, d) for lo, n, d in _TC_ATTENTION if sm >= lo] + out
     if sm >= 100:   # mma.sync-era techniques that tcgen05 kernels replace
         drop = {"register_fragment_double_buffering"}
         out = [t for t in out if t[0] not in drop]

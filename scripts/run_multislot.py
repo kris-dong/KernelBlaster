@@ -44,6 +44,11 @@ configuration is refused (exit 3) unless --force-restart. SIGTERM / SIGINT stop
 new steps, let in-flight ones finish (--stop-grace), flush and exit 75; a second
 signal exits 76 at once.
 
+Efficiency rules (docs/multislot_optimization.md, "Efficiency rules"; default ON since X-129):
+``--efficiency-rules on`` (default) stops a problem after ``--stop-patience`` 8 consecutive committed
+steps without a new slot best (no new step starts, in-flight steps finish); ``--efficiency-rules off``
+(or ``--stop-patience 0``) runs every planned step, as before. A resumed out dir keeps its setting.
+
 OpenCL problems (manifest target "opencl", Qualcomm Adreno): ``--evaluator
 board`` builds and runs on the board over ssh (``--board-host``, default
 $KERNELBLASTER_ADRENO_BOARD_HOST), ``local`` on this host's OpenCL GPU,
@@ -128,13 +133,46 @@ def _start_servers(gpu_name: str, log_dir: Path):
     return gpu, procs
 
 
+def _budget(p, args) -> tuple:
+    """(rollouts, steps, stop_patience) of one problem: the run's flags, unless the problem's manifest carries an
+    ``mb_budget`` ({"rollouts", "steps", "stop_patience"}; ModelBlaster's graph search: survival-weighted plan
+    budgets, successive-halving rungs of hint decisions in the same run). Absent = the flags (unchanged)."""
+    b = (getattr(p, "manifest", None) or {}).get("mb_budget") or {}
+    return (int(b.get("rollouts", args.rollouts)), int(b.get("steps", args.steps)),
+            b.get("stop_patience", args.stop_patience))
+
+
 def run_config(args, router) -> dict:
     """What a resumed run must share with the journal (operational flags -- evaluator,
     hosts, GPUs, parallelism -- may change between segments)."""
     return {"models": router.describe(), "rollouts": args.rollouts, "steps": args.steps, "max_fix": args.max_fix,
             "seed": args.seed, "reward": args.reward, "e2e_accept_pct": args.e2e_accept_pct,
             "knowledge": args.knowledge, "ncu": args.ncu, "arch": args.arch,
-            "knowledge_dir": str(Path(args.knowledge_dir).resolve()) if args.knowledge_dir else None}
+            "knowledge_dir": str(Path(args.knowledge_dir).resolve()) if args.knowledge_dir else None,
+            # E7 patience: only when on, so an out dir from before the rule (or with it off) keeps its config
+            **({"stop_patience": args.stop_patience} if args.stop_patience else {})}
+
+
+# E7 efficiency rules (docs/multislot_optimization.md "Efficiency rules"; ModelBlaster pipeline/kb_efficiency.py):
+# run_multislot has the patience rule only (late min-share is ModelBlaster's plan selection)
+EFFICIENCY_PATIENCE = {"on": 8, "safe": 0, "off": 0}
+
+
+def resolve_efficiency(args, recorded: Optional[dict]) -> dict:
+    """``args.stop_patience`` from --stop-patience / --efficiency-rules; without either, a resumed out dir
+    keeps its recorded patience (run.json config; none recorded = a run from before the rule: off)."""
+    if args.efficiency_rules is not None or args.stop_patience is not None:
+        sp = args.stop_patience if args.stop_patience is not None else EFFICIENCY_PATIENCE[args.efficiency_rules]
+        rules = args.efficiency_rules or ("on" if sp == EFFICIENCY_PATIENCE["on"] else "off" if not sp else "custom")
+        eff = {"rules": rules, "stop_patience": max(0, int(sp)), "source": "explicit"}
+    elif recorded is not None:
+        sp = int(recorded.get("stop_patience") or 0)
+        eff = {"rules": "on" if sp == EFFICIENCY_PATIENCE["on"] else "custom" if sp else "off",
+               "stop_patience": sp, "source": "resumed" if "stop_patience" in recorded else "legacy"}
+    else:
+        eff = {"rules": "on", "stop_patience": EFFICIENCY_PATIENCE["on"], "source": "default"}
+    args.stop_patience = eff["stop_patience"]
+    return eff
 
 
 class Stopper:
@@ -328,6 +366,11 @@ async def _run_inner(args, run_span) -> int:
     # continues where it stopped when the configuration and the problems match
     stopper = getattr(args, "_stopper", None) or Stopper(args.stop_grace)
     run_j = J.RunJournal(out)
+    eff = resolve_efficiency(args, None if args.force_restart or run_j.data is None
+                             else run_j.data.get("config", {}))
+    logger.info(f"efficiency rules: {eff['rules']} ({eff['source']}): patience "
+                f"{eff['stop_patience'] or 'off'} (stop a problem after that many consecutive committed steps "
+                f"without a new slot best)")
     config = run_config(args, router)
     phashes = {p.name: J.problem_hash(p) for p in problems}
     journals = {p.name: J.ProblemJournal(out / p.name / "journal") for p in problems}
@@ -345,7 +388,7 @@ async def _run_inner(args, run_span) -> int:
             st = journals[p.name].state
             if st and st.get("problem_hash") not in (None, phashes[p.name]):
                 why.append(f"problem {p.name}: journal hash {st.get('problem_hash')} != {phashes[p.name]}")
-            if st and not run_j.exists and (st.get("steps"), st.get("rollouts")) != (args.steps, args.rollouts):
+            if st and not run_j.exists and (st.get("steps"), st.get("rollouts")) != _budget(p, args)[1::-1]:
                 why.append(f"problem {p.name}: journal has {st.get('rollouts')}x{st.get('steps')} rollouts x steps")
         if why:
             logger.error(f"{out} holds a run with another configuration; refusing to resume (--force-restart "
@@ -400,13 +443,15 @@ async def _run_inner(args, run_span) -> int:
                 ev = evaluator_for(p.target)
                 if hasattr(ev, "cleanup_previous") and resuming:     # remote leftovers of the killed segment
                     await ev.cleanup_previous()
+                b_rollouts, b_steps, b_patience = _budget(p, args)
                 agent = MultiSlotAgent(p, ev, model=args.model, router=router, journal=jr,
                                        stop_event=stopper.event, on_checkpoint=on_checkpoint,
                                        out_dir=out / p.name, arch=arch_for(p.target), impl_store=store,
                                        outcome_log=olog, claims=claims, semantic_updater=updater,
-                                       rollouts=args.rollouts, steps=args.steps,
+                                       rollouts=b_rollouts, steps=b_steps,
                                        max_fix_attempts=args.max_fix, seed=args.seed, logger=logger, ncu=args.ncu,
-                                       knowledge_v2=kv, reward=args.reward, e2e_accept_pct=args.e2e_accept_pct)
+                                       knowledge_v2=kv, reward=args.reward, e2e_accept_pct=args.e2e_accept_pct,
+                                       stop_patience=b_patience)
                 try:
                     res = await agent.run()
                 except J.RunInterrupted as e:
@@ -484,6 +529,16 @@ async def _run_inner(args, run_span) -> int:
         summary.append({"knowledge_v2": {"upkeep_model": args.upkeep_model, "upkeep_usage": upk,
                                          **{k: v for k, v in kv.summary().items() if k != "upkeep_usage"}}})
     summary.append({"models": router.describe()})
+    effs = [r.get("efficiency") or {} for r in results if r and r.get("efficiency")]
+    eff_sum = {**eff, "problems": len(effs),
+               "patience_stopped": sum(1 for e in effs if e.get("stopped") == "patience"),
+               "steps_planned": sum(int(e.get("steps_planned") or 0) for e in effs),
+               "steps_committed": sum(int(e.get("steps_committed") or 0) for e in effs)}
+    eff_sum["steps_not_run"] = max(eff_sum["steps_planned"] - eff_sum["steps_committed"], 0)
+    summary.append({"efficiency": eff_sum})
+    logger.info(f"efficiency: patience {eff['stop_patience'] or 'off'} stopped {eff_sum['patience_stopped']} of "
+                f"{eff_sum['problems']} problem(s); {eff_sum['steps_committed']} of {eff_sum['steps_planned']} "
+                f"planned steps ran")
     summary.append({"resume": {"segment": segment, "segments": segment + 1, "resumed": resuming,
                                "llm_replayed": sum((r.get("resume_info") or {}).get("llm_replayed", 0)
                                                    for r in results if r)}})
@@ -512,7 +567,7 @@ async def _run_inner(args, run_span) -> int:
 def _summary_row(res: dict) -> dict:
     row = {k: res.get(k) for k in ("problem", "baseline_partition_us", "final_partition_us", "speedup", "final_ok",
                                    "llm_calls", "llm_usage", "seconds", "reward", "baseline_e2e_us", "final_e2e_us",
-                                   "e2e_speedup")}
+                                   "e2e_speedup", "efficiency")}
     if res.get("resume"):
         row["resume_info"] = {k: v for k, v in res["resume"].items() if k != "run_segments"}
     if res.get("telemetry"):
@@ -580,6 +635,15 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--rollouts", type=int, default=3)
     ap.add_argument("--steps", type=int, default=5)
     ap.add_argument("--max-fix", type=int, default=2)
+    ap.add_argument("--efficiency-rules", choices=sorted(EFFICIENCY_PATIENCE), default=None,
+                    help="E7 cost-efficiency rules (docs/multislot_optimization.md): on (default for a new out dir: "
+                         "--stop-patience 8), safe / off (no patience: the behaviour before the rules). Without "
+                         "this flag and --stop-patience, a resumed out dir keeps the setting it was started with "
+                         "(off for one from before the rules)")
+    ap.add_argument("--stop-patience", type=int, default=None,
+                    help="stop a problem after N consecutive committed steps (commit order across its parallel "
+                         "rollouts) without a new slot best: no new step starts, in-flight steps finish; 0 = off; "
+                         "overrides the --efficiency-rules preset")
     ap.add_argument("--compile-jobs", type=int, default=None,
                     help="concurrent nvcc processes (default: adaptive to free CPUs and memory; "
                          "env KERNELBLASTER_MULTISLOT_COMPILE_JOBS)")

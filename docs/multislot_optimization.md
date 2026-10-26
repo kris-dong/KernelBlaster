@@ -216,6 +216,41 @@ in the outcomes, and counted in telemetry (`eval.timeout`, `eval.timeout.adaptiv
 ModelBlaster's `kb_graph_opt` passes `--eval-timeout-s` / `--eval-timeout-mode` (`Config`) when
 they are not the defaults; the others go through `--kb-arg`. Tests: `tests/test_eval_timeout.py`.
 
+## Efficiency rules (patience stop; default ON since X-129)
+
+The E7 replay of the Level 3 sweep (ModelBlaster `l3_farm/analysis/e7_efficiency.md`,
+`efficiency_rules.md`) found that most of a problem's late steps buy nothing. `run_multislot.py`
+therefore stops a problem early by default:
+
+| flag | default | meaning |
+|---|---|---|
+| `--efficiency-rules on\|safe\|off` | `on` | preset: `on` = `--stop-patience 8`; `safe` and `off` = no patience (`off` is exactly the behaviour before X-129) |
+| `--stop-patience N` | from the preset | stop a problem after `N` consecutive committed steps without a new slot best; `0` = off; overrides the preset |
+
+What counts (`agents/opt_multislot.py: patience_trigger`, identical to the replay's rule): steps in
+**commit order** (`steps_log`, across the parallel rollouts). A step is a *new best* iff its status is
+`improved` and its `slot_us_after` is below the running best of its slot; the running best starts at the
+slot's time the rollouts started from (`slot_us_before` of the slot's first committed step-0 step). Every
+other committed step is a miss: neutral, regressed, `improved` but not below the best (a tie included),
+and a compile / run / wrong-output failure after its fix attempts (a step with its fixes is one step).
+Steps that raised (no log entry) do not count. Once `N` misses in a row have committed, no rollout starts
+another step; the steps in flight finish and commit (they may still set a best, which is kept), then the
+problem goes to its final composite run as usual.
+
+Visibility: the log line `efficiency: patience N reached at commit C of P planned steps`, a telemetry
+event `{"t": "efficiency"}`, `result.json` `efficiency` (`stop_patience`, `stopped`, `trigger_commit`,
+`steps_planned`, `steps_committed`, `steps_after_trigger`, `steps_not_run`), the same per row and a
+run-level roll-up in `summary.json`, and the active setting at the start of the run log.
+
+Resume: with neither flag, a resumed out dir keeps the patience it was started with (`run.json`
+config; a run from before X-129 has none and resumes with patience off). An explicit different value
+is a configuration change (refused, exit 3). The patience is in the problem journal too; a restored
+journal's value wins and the trigger is recomputed from its steps. `stop_patience` is in the run config
+only when it is on, so out dirs with the rule off keep their config hash. The agent class
+(`MultiSlotAgent(stop_patience=0)`) defaults to off; the CLI defaults to on. ModelBlaster's
+`kb_graph_opt` always passes `--stop-patience` explicitly: its preset's value for the plan runs, `0` for
+the hint-decision runs (original and variant get the same budget). Tests: `tests/test_efficiency_rules.py`.
+
 ## Proposals
 
 - `fuse`: a producer -> consumer pair where the consumer is elementwise and the only reader of
