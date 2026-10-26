@@ -30,7 +30,7 @@ def test_errors_and_command():
     assert "ERR_NVGPUCTRPERM" in err
     assert ncu.ncu_error("==WARNING== No kernels were profiled.") == "no kernels matched the slot filter"
     cmd = ncu.ncu_command(slot="conv2d")
-    assert "regex:'mbslot_conv2d::'" in cmd and "--print-kernel-base demangled" in cmd and "--csv" in cmd
+    assert "regex:'mbslot_conv2d::'" in cmd and "--print-kernel-base mangled" in cmd and "--csv" in cmd
 
 
 def test_state_and_delta():

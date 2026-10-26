@@ -50,6 +50,7 @@ from ..knowledge.impl_store import ImplStore, shape_bucket
 from ..knowledge.outcomes import (COMPILE_ERROR, IMPROVED, NEUTRAL, REGRESSED, RUNTIME_ERROR, WRONG_OUTPUT,
                                   OutcomeLog, OutcomeRecord, classify_speedup)
 from ..knowledge.slots import EvalResult, Evaluator, SlotProblem, step_eval_options
+from . import hw_profile
 from .cost_tracker import lookup_pricing
 from .model_router import ModelRouter, technique_tier
 from .utils import generate_code_retry
@@ -61,6 +62,7 @@ ARCH_PEAKS = {  # sm: (GFLOP/s, GB/s)
     "86": (35600.0, 936.0),       # RTX 3090
     "89": (91600.0, 864.0),       # L40S
     "90": (67000.0, 3350.0),      # H100 SXM
+    "100": (80000.0, 8000.0),     # B200
 }
 
 # Built-in technique catalog, by op class ("*" applies to every class).
@@ -112,10 +114,13 @@ LAUNCH_TECHNIQUES: list[tuple[str, str]] = [
 
 
 def techniques_for(op_class: str, techniques: Optional[dict] = None,
-                   launch_bound: bool = False) -> list[tuple[str, str]]:
+                   launch_bound: bool = False, arch: Optional[str] = None,
+                   dtype: str = "fp32") -> list[tuple[str, str]]:
     techniques = techniques or TECHNIQUES
     extra = LAUNCH_TECHNIQUES if launch_bound and techniques is TECHNIQUES else []
-    return techniques.get(op_class, []) + techniques["*"] + extra
+    # tensor-core / arch-specific GEMM techniques (hw_profile) go first: they are what the fast kernels use
+    tc = hw_profile.tensor_core_techniques(arch, dtype, op_class) if arch and techniques is TECHNIQUES else []
+    return tc + techniques.get(op_class, []) + techniques["*"] + extra
 
 
 # ---------------------------------------------------------------- roofline
@@ -387,18 +392,20 @@ DTYPE_RULES = {
             "included), integer pointers stay int. Widen on load (`__half2float`, or `__half22float2` on "
             "aligned `half2` pairs), compute and accumulate in fp32, round once on store "
             "(`__float2half_rn`); never accumulate or chain arithmetic in `__half`. Tensor cores "
-            "(`wmma` / `mma.sync` with fp16 inputs and fp32 accumulators) are allowed.\n"
+            "(`wmma`, `mma.sync`, and where the target hardware below has them `wgmma` / `tcgen05`, with fp16 "
+            "inputs and fp32 accumulators) are allowed.\n"
             "- Each op is checked alone against a reference that rounds the exact fp32 result to fp16 "
             "once: max error <= {slot_rel} relative to the largest input/output magnitude (about two fp16 "
             "ulps).",
 }
 
 
-def system_prompt(dtype: str = "fp32", tolerance: Optional[dict] = None) -> str:
+def system_prompt(dtype: str = "fp32", tolerance: Optional[dict] = None, arch: Optional[str] = None) -> str:
     rel = (tolerance or {}).get("slot_rel", 1e-3)
     rel_s = f"{rel:.0e}".replace("e-0", "e-")                    # 1e-3, 2e-3
     rules = DTYPE_RULES.get(dtype, DTYPE_RULES["fp32"]).format(slot_rel=rel_s)
-    return SYSTEM_PROMPT_TEMPLATE.format(dtype_rules=rules)
+    hw = hw_profile.hardware_text(arch, dtype) if arch else ""
+    return SYSTEM_PROMPT_TEMPLATE.format(dtype_rules=rules) + (f"\n\n## Target hardware\n{hw}" if hw else "")
 
 
 SYSTEM_PROMPT = system_prompt("fp32")
@@ -416,9 +423,9 @@ class TargetProfile:
     slot_ext: str
     profiler: Any                     # module with render() / delta(): knowledge.ncu or knowledge.opencl_profile
 
-    def prompt_for(self, problem) -> str:
-        if self.name == "cuda":                       # dtype rules + the manifest's isolated bound
-            return system_prompt(problem.dtype, problem.tolerance)
+    def prompt_for(self, problem, arch: Optional[str] = None) -> str:
+        if self.name == "cuda":                       # dtype rules + the manifest's isolated bound + the target GPU
+            return system_prompt(problem.dtype, problem.tolerance, arch)
         return self.system_prompt
 
     def arch_label(self, arch: str) -> str:
@@ -445,7 +452,7 @@ def _fmt_instances(slot) -> str:
     return "\n".join(f"  {r}" for r in rows) + more
 
 
-def build_codegen_messages(*, problem: SlotProblem, sid: str, source: str, technique: str,
+def build_codegen_messages(*, problem: SlotProblem, sid: str, source: str, technique: str, arch: Optional[str] = None,
                            technique_desc: str, state: str, state_numbers: dict, slot_us: float,
                            partition_us: float, neighbours: list[tuple[str, str]],
                            examples: list[tuple[str, str]], adapt: Optional[tuple[str, str]],
@@ -480,16 +487,16 @@ def build_codegen_messages(*, problem: SlotProblem, sid: str, source: str, techn
         parts.append("Already tried on this slot (avoid repeating dead ends):\n" + already_tried)
     parts.append(f"## Technique to apply: {technique}\n{technique_desc}")
     parts.append(f"Current slot source:\n```{tp.fence}\n{source}\n```")
-    return [{"role": "system", "content": tp.prompt_for(problem)},
+    return [{"role": "system", "content": tp.prompt_for(problem, arch)},
             {"role": "user", "content": "\n\n".join(p for p in parts if p)}]
 
 
 def build_fix_messages(*, problem: SlotProblem, sid: str, source: str, error: str,
-                       pitfalls: str = "") -> list[dict]:
+                       pitfalls: str = "", arch: Optional[str] = None) -> list[dict]:
     slot = problem.slots[sid]
     tp = target_profile(problem.target)
     known = f"Known pitfalls from earlier runs:\n{pitfalls}\n\n" if pitfalls else ""
-    return [{"role": "system", "content": tp.prompt_for(problem)},
+    return [{"role": "system", "content": tp.prompt_for(problem, arch)},
             {"role": "user", "content":
              f"The slot `{sid}` (op `{slot.op}`, signature `{slot.signature}`) failed:\n```\n{error}\n```\n\n"
              f"Instances:\n{_fmt_instances(slot)}\n\n{known}Fix it (keep the optimisation if you can). "
@@ -925,8 +932,9 @@ class MultiSlotAgent:
             launches = max(int(round(res.attr_slot_launches[sid])), 1)
             ovh = overhead_per_launch(res) * res.attr_slot_launches[sid]
             lfrac = ovh / max(slot_us + ovh, 1e-9)
+        pk = hw_profile.peaks(self.arch, self.p.dtype, self.p.slots[sid].op_class) if self.tp.name == "cuda" else None
         return RooflineInput(bytes=byt, flops=fl, time_us=slot_us, work_items=work or None, launches=launches,
-                             launch_frac=lfrac)
+                             launch_frac=lfrac, peak_gflops=pk[0] if pk else None)
 
     def _record_outcome(self, **kw) -> Optional[OutcomeRecord]:
         if self.olog is None:
@@ -1025,6 +1033,9 @@ class MultiSlotAgent:
         """A full run of the composite best: its deployed time and attribution."""
         self.e2e_us = res.deployed_us
         self.last_full = res
+        note = getattr(self.ev, "note_incumbent_wall", None)       # adaptive run timeout (slots.py)
+        if note is not None and res.eval_wall_s:
+            note(self.p, res.eval_wall_s)
         self.runtime_info = partition_runtime(res)
         self.composite_version = getattr(self, "composite_version", 0) + 1
 
@@ -1083,7 +1094,9 @@ class MultiSlotAgent:
                 sid = self._pick_slot()
                 self.slot_tries[sid] += 1
             slot = self.p.slots[sid]
-            state, nums = slot_state(self.p, sid, cur_us[sid], self.arch, self.tp.peaks_for(self.arch))
+            state, nums = slot_state(self.p, sid, cur_us[sid], self.arch,
+                                     (hw_profile.peaks(self.arch, self.p.dtype, slot.op_class)
+                                      if self.tp.name == "cuda" else None) or self.tp.peaks_for(self.arch))
             prof_before = self._ncu_of(sid, cur[sid])
             if prof_before:
                 state = prof_before.get("state") or state    # measured bound beats the roofline estimate
@@ -1098,7 +1111,8 @@ class MultiSlotAgent:
                 nums = {**nums, **cls.decided_by}
             else:
                 lb = e2e and (self.runtime_info.get("launch_bound") or slot_launch_bound(info, sid, self.p))
-                techs = techniques_for(slot.op_class, self.tp.techniques, launch_bound=bool(lb))
+                techs = techniques_for(slot.op_class, self.tp.techniques, launch_bound=bool(lb),
+                                       arch=self.arch if self.tp.name == "cuda" else None, dtype=self.p.dtype)
                 # fp16 arms are their own keys (half2 / tensor-core techniques pay off
                 # differently); fp32 keys keep their names, and the cross-key prior
                 # still seeds an untried fp16 arm from its fp32 record
@@ -1136,7 +1150,7 @@ class MultiSlotAgent:
         neigh = [(n, self.p.slots[n].signature) for n in self.p.neighbours(sid)]
         best_note = (f"Best verified so far for this slot: {self.best[sid].slot_us:.1f} us."
                      if self.best[sid].slot_us < cur_us[sid] else "")
-        msgs = build_codegen_messages(problem=self.p, sid=sid, source=cur[sid], technique=tech,
+        msgs = build_codegen_messages(problem=self.p, sid=sid, source=cur[sid], technique=tech, arch=self.arch,
                                       technique_desc=desc, state=state, state_numbers=nums,
                                       slot_us=cur_us[sid], partition_us=part_us, neighbours=neigh,
                                       examples=examples, adapt=adapt, knowledge_text=ktext,
@@ -1185,7 +1199,7 @@ class MultiSlotAgent:
             err = capture or res.error_text()
             from .journal import sha as _jsha
             text = await self._llm(build_fix_messages(problem=self.p, sid=sid, source=code, error=err,
-                                                      pitfalls=self._pitfalls(sid, tech)), fmodel, frole,
+                                                      pitfalls=self._pitfalls(sid, tech), arch=self.arch), fmodel, frole,
                                    key=f"{jkey}c{fixes}", digest=_jsha(code, err))
             new = extract_code(text)
             if not new or new == code:

@@ -29,3 +29,5 @@ Thumbs.db
 out/
 set_key.sh
 data/kernelblaster/database_llm_log.txt
+.pytest_cache/
+tests/fixtures/*/.driver.local.cpp

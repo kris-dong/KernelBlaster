@@ -182,6 +182,40 @@ process per run).
 Measurements and design: ModelBlaster `docs/gpu_harness_perf.md`; bench script
 `scripts/bench_runtime.py`.
 
+### Evaluation timeouts (`run_multislot.py`; `LocalEvaluator` / `SSHEvaluator`)
+
+One candidate that deadlocks (a tcgen05 kernel waiting on a barrier nobody arrives at) must not
+stall the run. Three separate limits, each with its own flag:
+
+| flag | default | meaning |
+|---|---|---|
+| `--eval-timeout-s` | 900 | timeout of one candidate run (the cap in adaptive mode) |
+| `--eval-timeout-mode fixed\|adaptive` | fixed | fixed: every run gets `--eval-timeout-s` (as before) |
+| `--eval-timeout-min-s` | 60 | adaptive: lower bound |
+| `--eval-timeout-factor` | 20 | adaptive: K, the multiple of the incumbent's run time |
+| `--build-timeout-s` | 900 | each nvcc process, a host start, a binary copy (not the run) |
+| `--gpu-lock-wait-s` | 900 | the longest a run waits for its GPU's lock |
+
+Adaptive: the run timeout of a problem is `clamp(max(min, K x incumbent_wall), min, --eval-timeout-s)`,
+where `incumbent_wall` is the measured run wall time (`EvalResult.eval_wall_s`) of the last
+successful full evaluation of the baseline or the current composite of that problem (recorded by
+the evaluator for the baseline, and by the agent whenever the composite is re-measured). Until one
+exists the limit is 5 x min. Profiler (ncu) runs always get the cap.
+
+The lock wait is not charged to the run: the local path takes the GPU's flock in the client
+(`acquire_gpu_lock`), then starts the clock; a lock that stays taken past `--gpu-lock-wait-s`
+fails the evaluation with `MB_ERROR [lock]`, not as a timeout. On a timeout the host process (or
+the run's whole process group) is killed, which drops the flock at once, so the next rollout
+on that GPU is not held back by the restart. Over ssh the run is bounded on the remote machine by
+`timeout -k 5` inside the flock, and a killed persistent host's remote pid is killed over ssh. A
+host that prints `MB_HOST_LOCKED` after taking the lock itself has its clock started then.
+
+A timed-out candidate is an `EvalResult(stage="run")` whose error is `timeout after Ns (kernel
+presumed hung; adaptive limit)` (fixed mode keeps its old text), is recorded as `runtime_error`
+in the outcomes, and counted in telemetry (`eval.timeout`, `eval.timeout.adaptive`, `host.timeout`).
+ModelBlaster's `kb_graph_opt` passes `--eval-timeout-s` / `--eval-timeout-mode` (`Config`) when
+they are not the defaults; the others go through `--kb-arg`. Tests: `tests/test_eval_timeout.py`.
+
 ## Proposals
 
 - `fuse`: a producer -> consumer pair where the consumer is elementwise and the only reader of

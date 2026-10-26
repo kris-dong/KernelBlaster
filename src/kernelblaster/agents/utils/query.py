@@ -52,7 +52,7 @@ MAX_CHARACTERS_TOTAL = 340_000
 oai_client = None
 if os.getenv("OPENAI_API_KEY"):
     oai_client = openai.AsyncOpenAI(
-        base_url="https://api.openai.com/v1",
+        base_url=os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1",
         api_key=os.getenv("OPENAI_API_KEY"),
         timeout=TIMEOUT,
     )
@@ -355,6 +355,10 @@ async def generate_code_openai(client, messages, n_tasks, model: str) -> LLMResp
     elif re.search(r".*-nemotron-.*-thinking", model.lower()):
         args["model"] = model.replace("-thinking", "")
         args["max_tokens"] = 12288
+
+    # OpenAI-compatible proxies in front of Anthropic models default to 4096 output tokens.
+    if "max_tokens" not in args and os.getenv("OPENAI_MAX_TOKENS"):
+        args["max_tokens"] = int(os.getenv("OPENAI_MAX_TOKENS"))
 
     start = time.time()
 

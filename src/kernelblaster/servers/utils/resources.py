@@ -836,7 +836,8 @@ def gpu_lock_file(ident: Optional[str]) -> Optional[str]:
     return f"{d}/kernelblaster_gpu_{safe}.lock"
 
 
-def gpu_lock_wrap(argv: str, ident: Optional[str], *, wait_s: float = 3600) -> str:
+def gpu_lock_wrap(argv: str, ident: Optional[str], *, wait_s: float = 3600,
+                  run_timeout_s: Optional[float] = None) -> str:
     """Shell text that runs ``argv`` (a shell word list) holding an flock on the
     GPU ``ident``: one timed run per GPU across every KernelBlaster process on
     the host (other runs, other agents), not only within this pool.
@@ -844,13 +845,81 @@ def gpu_lock_wrap(argv: str, ident: Optional[str], *, wait_s: float = 3600) -> s
     The lock is ``$KERNELBLASTER_GPU_LOCK_DIR`` (default ``/dev/shm``)
     ``/kernelblaster_gpu_<uuid>.lock``. Without flock, or when the lock file
     cannot be opened (another user's file), the command runs unlocked.
-    ``KERNELBLASTER_GPU_FLOCK=0`` (read here, on the client) turns it off."""
+    ``KERNELBLASTER_GPU_FLOCK=0`` (read here, on the client) turns it off.
+
+    ``run_timeout_s``: the run itself (not the wait for the lock) is bounded on
+    the machine it runs on by coreutils ``timeout -k 5`` (exit status 124), so
+    a hung kernel is killed there and its flock released, whatever happens to
+    the ssh channel that started it."""
+    if run_timeout_s:
+        argv = (f"$(command -v timeout >/dev/null 2>&1 && echo 'timeout -k 5 {max(1, int(run_timeout_s))}') "
+                f"{argv}")
     path = gpu_lock_file(ident)
     if path is None:
         return argv
     lock = shlex.quote(path)
     return (f"if command -v flock >/dev/null 2>&1 && {{ : >> {lock}; }} 2>/dev/null; "
             f"then flock -w {int(wait_s)} {lock} {argv}; else {argv}; fi")
+
+
+class GpuLockTimeout(Exception):
+    """The GPU's flock was not free within the wait."""
+
+
+class GpuLockHandle:
+    """An flock on the GPU's lock file held by this process (``release()`` is
+    idempotent; the kernel drops it anyway when the process dies)."""
+
+    def __init__(self, fd: Optional[int]):
+        self.fd = fd
+
+    def release(self) -> None:
+        fd, self.fd = self.fd, None
+        if fd is not None:
+            try:
+                os.close(fd)                       # closing the descriptor drops the flock
+            except OSError:
+                pass
+
+
+async def acquire_gpu_lock(ident: Optional[str], wait_s: float, poll_s: float = 0.2) -> GpuLockHandle:
+    """``acquire_lock_file`` on the GPU ``ident``'s lock file (``gpu_lock_file``)."""
+    return await acquire_lock_file(gpu_lock_file(ident), wait_s, poll_s)
+
+
+async def acquire_lock_file(path: Optional[str], wait_s: float, poll_s: float = 0.2) -> GpuLockHandle:
+    """Take the flock on ``path`` (the one ``gpu_lock_wrap`` and the persistent
+    host take), waiting up to ``wait_s``; :class:`GpuLockTimeout` if it stays
+    taken. The wait is the caller's, so a run's own timeout never includes it.
+    A handle that holds nothing (no path, no flock, lock file not openable) when
+    the GPU cannot be locked, as ``gpu_lock_wrap`` runs unlocked."""
+    try:
+        import fcntl
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o666) if path else None
+    except (ImportError, OSError):
+        return GpuLockHandle(None)
+    if fd is None:
+        return GpuLockHandle(None)
+    deadline = time.monotonic() + max(0.0, wait_s)
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return GpuLockHandle(fd)
+            except BlockingIOError:
+                pass
+            except OSError:                       # flock unsupported here: run unlocked
+                os.close(fd)
+                return GpuLockHandle(None)
+            if time.monotonic() >= deadline:
+                raise GpuLockTimeout(f"GPU lock {path} not free after {int(wait_s)}s")
+            await asyncio.sleep(poll_s)
+    except BaseException:
+        try:
+            os.close(fd)                          # timed out or cancelled while waiting
+        except OSError:
+            pass
+        raise
 
 
 def shell_env(env: dict) -> str:

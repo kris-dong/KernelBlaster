@@ -60,6 +60,7 @@ import fcntl
 import json
 import os
 import runpy
+import shutil
 import signal
 import sys
 import time
@@ -244,6 +245,13 @@ async def _run_inner(args, run_span) -> int:
                                config=args.models_config)
     args.reflect_model, args.upkeep_model = router.models["reflect"], router.models["upkeep"]
     logger.info(f"models: {router.describe()}")
+    if getattr(args, "knowledge_seed", None) and args.knowledge == "v2" and not (kdir / "knowledge.db").exists():
+        sd = Path(args.knowledge_seed)                 # global knowledge seed (knowledge/v2/merge.py), once
+        kdir.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(sd / "knowledge.db", kdir / "knowledge.db")
+        if (sd / "impl" / "index.jsonl").exists() and not (kdir / "impl" / "index.jsonl").exists():
+            shutil.copytree(sd / "impl", kdir / "impl", dirs_exist_ok=True)
+        logger.info(f"knowledge: seeded {kdir} from {sd}")
     store = ImplStore(kdir / "impl")
     kv = None
     if args.knowledge == "v2":
@@ -293,10 +301,12 @@ async def _run_inner(args, run_span) -> int:
             ev = SSHEvaluator(hosts, arch=arch_for("cuda"), remote_dir=args.remote_dir, ssh_key=args.ssh_key,
                               cuda_visible_devices=cvd, remote_path=args.remote_cuda_bin,
                               work_root=out / "work", max_parallel=args.compile_jobs, runtime=args.runtime,
-                              gpu_model=args.gpu_model, remote_manifest=out / "remote.jsonl")
+                              gpu_model=args.gpu_model, remote_manifest=out / "remote.jsonl",
+                              **eval_timeout_kwargs(args))
         elif args.evaluator == "local":
             ev = LocalEvaluator(arch_for("cuda"), work_root=out / "work", max_parallel=args.compile_jobs,
-                                gpus=args.gpus, runtime=args.runtime, gpu_model=args.gpu_model)
+                                gpus=args.gpus, runtime=args.runtime, gpu_model=args.gpu_model,
+                                **eval_timeout_kwargs(args))
         else:
             raise SystemExit(f"--evaluator {args.evaluator} runs OpenCL problems only")
         evaluators[target] = ev
@@ -539,7 +549,14 @@ async def _default_parallel(evs) -> int:
     return n
 
 
-def main():
+def eval_timeout_kwargs(args) -> dict:
+    """The evaluator keyword arguments of the --eval-timeout-* / --build-timeout-s / --gpu-lock-wait-s flags."""
+    return dict(timeout_s=args.eval_timeout_s, eval_timeout_mode=args.eval_timeout_mode,
+                eval_timeout_min_s=args.eval_timeout_min_s, eval_timeout_factor=args.eval_timeout_factor,
+                build_timeout_s=args.build_timeout_s, gpu_lock_wait_s=args.gpu_lock_wait_s)
+
+
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("problems", nargs="+")
     ap.add_argument("--out", required=True)
@@ -593,6 +610,19 @@ def main():
     ap.add_argument("--stop-grace", type=float, default=float(os.getenv("KB_STOP_GRACE_S", "120")),
                     help="seconds in-flight steps get to finish after SIGTERM / SIGINT (then they are abandoned; "
                          "a resumed run redoes them from their journaled LLM responses)")
+    ap.add_argument("--eval-timeout-s", type=int, default=900,
+                    help="timeout (s) of one candidate run (the cap with --eval-timeout-mode adaptive)")
+    ap.add_argument("--eval-timeout-mode", choices=["fixed", "adaptive"], default="fixed",
+                    help="fixed: every run gets --eval-timeout-s. adaptive: clamp(max(--eval-timeout-min-s, "
+                         "--eval-timeout-factor x the problem's last good baseline/composite run time), min, "
+                         "--eval-timeout-s); 5 x min until one is measured")
+    ap.add_argument("--eval-timeout-min-s", type=float, default=60.0, help="adaptive: lower bound of the run timeout")
+    ap.add_argument("--eval-timeout-factor", type=float, default=20.0,
+                    help="adaptive: multiple of the incumbent's run time")
+    ap.add_argument("--build-timeout-s", type=int, default=900, help="timeout (s) of each nvcc process (and of a "
+                    "host start / file copy), separate from the run timeout")
+    ap.add_argument("--gpu-lock-wait-s", type=int, default=900,
+                    help="most a run waits for its GPU's lock (not charged to the run timeout)")
     ap.add_argument("--evaluator", choices=["local", "server", "ssh", "board", "plugin"], default="local",
                     help="local nvcc|g++ + run | KB compile/exec servers | build here, run on --ssh-host (CUDA) | "
                          "build + run on the Adreno board over ssh (OpenCL)")
@@ -616,6 +646,10 @@ def main():
                     help="v2: model for hypothesis generation + state discovery (unset: deterministic upkeep only)")
     ap.add_argument("--upkeep-every", type=int, default=8, help="v2: new outcomes between upkeep passes")
     ap.add_argument("--explore-frac", type=float, default=0.15, help="v2: share of steps for hypotheses")
+    ap.add_argument("--knowledge-seed", default=None,
+                    help="v2: a global-knowledge seed dir (knowledge.db + impl/, from `python -m "
+                         "kernelblaster.knowledge.v2.merge seed`) copied into --knowledge-dir when it has no "
+                         "knowledge.db yet (default: none, the repo seed)")
     ap.add_argument("--graph-hints", action="append", default=[],
                     help="v2: ModelBlaster graph_hints.json whose accepted/rejected decisions are synced into the "
                          "graph hypotheses at the start of the run (repeatable; env KB_GRAPH_HINTS, ':'-separated)")
@@ -625,7 +659,11 @@ def main():
                          "/ NCU output (deduplicated, gzip); meta = hashes and sizes only; off (env KB_TRACE)")
     ap.add_argument("--plugin", action="append", default=[],
                     help="python file run before the problems (e.g. it registers stub: models); repeatable")
-    sys.exit(asyncio.run(_run(ap.parse_args())))
+    return ap
+
+
+def main():
+    sys.exit(asyncio.run(_run(build_parser().parse_args())))
 
 
 if __name__ == "__main__":
