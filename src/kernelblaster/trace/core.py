@@ -474,14 +474,21 @@ _TEL_MODULES = ("kernelblaster.telemetry.core", "_mb_kb_telemetry.core")
 
 
 def _tel_span():
+    """The current span of whichever telemetry copy has one: both copies can be loaded in one process (the package
+    imported by name and ModelBlaster's file-path copy); only the one ModelBlaster's spans live in is non-empty."""
+    first = None
     for n in _TEL_MODULES:
         mod = sys.modules.get(n)
-        if mod is not None:
-            try:
-                return mod.current()
-            except Exception:  # noqa: BLE001
-                return None
-    return None
+        if mod is None:
+            continue
+        try:
+            sp = mod.current()
+        except Exception:  # noqa: BLE001
+            continue
+        if sp is not None and getattr(sp, "real", False):
+            return sp
+        first = first if first is not None else sp
+    return first
 
 
 def telemetry_span_id() -> Optional[int]:
