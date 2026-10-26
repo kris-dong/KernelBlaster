@@ -825,6 +825,7 @@ class MultiSlotAgent:
         self.min_share, self.confirm_pct = min_share, confirm_pct
         self.bandit = bandit or TechniqueBandit()
         self.rng = random.Random(seed)
+        self.seed = seed
         self.log = logger or _default_logger
         # resume (agents/journal.py): the snapshot + LLM responses of this problem, the
         # run's stop request (SIGTERM / SIGINT) and a hook called after every checkpoint
@@ -1043,10 +1044,17 @@ class MultiSlotAgent:
         if rec_on:
             try:
                 sl = self.p.slots[sid]
+                base_key = f"{jkey}c0"                           # turn 0 uses it, turn k {key}t{k}, the forced last {key}tf
+                ukey = getattr(self, "_usage_key", {})
+                usage = {t: ukey[k] for t, k in [(t, base_key if t == 0 else f"{base_key}t{t}") for t in range(log.turns)]
+                         if k in ukey}
+                if f"{base_key}tf" in ukey:
+                    usage["final"] = ukey[f"{base_key}tf"]
                 self._exp_recorder().record_step(
                     jkey, log, slot=sid, technique=tech, op=sl.op, op_class=sl.op_class,
                     shape_bucket=shape_bucket(sl.op_class, sl.shapes()[0] if sl.instances else {}),
-                    model=model, role=role, rationale=log.rationale, extra_prompt=xtext, fact_ids=fact_ids)
+                    model=model, role=role, rationale=log.rationale, extra_prompt=xtext, fact_ids=fact_ids,
+                    usage=usage)
             except Exception as e:                              # noqa: BLE001 -- recording must never break a step
                 self.log.warning(f"experiment record failed: {e!r}")
         return text
@@ -1057,8 +1065,18 @@ class MultiSlotAgent:
         if rec is None:
             rec = self._exp = experiments.ExperimentRecorder(self.out, run_id=self.run_id, problem=self.p.name,
                                                              arch=self.arch_label, target=self.p.target,
-                                                             dtype=self.p.dtype)
+                                                             dtype=self.p.dtype,
+                                                             lineage=experiments.lineage_from_env(
+                                                                 getattr(self, "seed", None)),
+                                                             flags=self._exp_flags)
         return rec
+
+    def _exp_flags(self) -> dict:
+        """Run-state flags the experiment records' validity depends on (v1.1): ncu disabled (a timeout can leave the
+        clocks locked), steps already timed on a clock-suspect GPU."""
+        cs = self.ev.clock_stats() if hasattr(self.ev, "clock_stats") else None    # None: the clock guard is off
+        return {"ncu_disabled": self.ncu_disabled, "clock_suspect": bool(getattr(self, "clock_suspect_steps", 0)),
+                "clock_clean_after_ncu": bool(cs) and not cs.get("suspect")}
 
     def _experiment_prompt(self, sid: str, tech: str) -> tuple:
         n = experiments.prompt_n()
@@ -1071,7 +1089,7 @@ class MultiSlotAgent:
             return "", []
 
     def _experiment_outcome(self, ridx, step, sid, seed_src, code, status, speedup, reward, d, before, after,
-                            impl_id, oid) -> None:
+                            impl_id, oid, res=None) -> None:
         rec = getattr(self, "_exp", None)
         if rec is None:
             return
@@ -1084,9 +1102,25 @@ class MultiSlotAgent:
                 progs = [p for p in progs if p]
                 if progs:
                     ov = experiments.reference_overlap(seed_src, code, "\n".join(progs))
-            rec.record_outcome(key, status=status, speedup=speedup, reward=reward,
+            # v1.1: an unchanged source is its own class (its measured delta is noise, not a regression); a step timed
+            # on a clock-suspect GPU is flagged; absolute candidate time next to the paired-chain one
+            unchanged = bool(code and experiments.same_source(seed_src, code))
+            susp = bool(res is not None and getattr(res, "_clock_suspect", False))
+            noise = None
+            if unchanged and before and after:
+                noise = round(100.0 * (after - before) / before, 3)
+            tm = None
+            if res is not None and getattr(res, "ok", False):
+                c = d["ctx"] if d is not None else {}
+                tm = {"basis": getattr(res, "e2e_basis", None), "abs_candidate_us": res.deployed_us,
+                      "abs_incumbent_us": res.ref_e2e_us, "paired_before_us": c.get("before_us"),
+                      "paired_after_us": (d or {}).get("e2e_after"), "pairing": c.get("pairing"),
+                      "ratio": (res.e2e_ratio or {}).get("med") if getattr(res, "e2e_ratio", None) else None}
+            rec.record_outcome(key, status=("clock_suspect" if susp else "unchanged" if unchanged else status),
+                               speedup=None if (unchanged or susp) else speedup, reward=reward,
                                e2e_gain=(d["ctx"].get("gain") if d is not None else None),
-                               slot_us_before=before, slot_us_after=after, impl_id=impl_id, outcome_id=oid, overlap=ov)
+                               slot_us_before=before, slot_us_after=after, impl_id=impl_id, outcome_id=oid, overlap=ov,
+                               unchanged=unchanged, noise_pct=noise, time=tm, step_clock_suspect=susp)
             if experiments.ingest_enabled() and self.kv is not None:
                 gpu = None
                 try:
@@ -1107,6 +1141,10 @@ class MultiSlotAgent:
         cost = float(u.get("cost_usd") or 0.0)                          # providers that report it
         pin, pout = lookup_pricing(model)                               # else the price table (0 if unknown)
         est = cost or (pt * pin + ct * pout) / 1e6
+        if key is not None:                                   # X-145 v1.1: tokens / $ per LLM turn (the experiment record)
+            if not hasattr(self, "_usage_key"):
+                self._usage_key = {}
+            self._usage_key[key] = {"prompt_tokens": pt, "completion_tokens": ct, "usd": round(est, 6), "key": key}
         self.llm_usage["prompt_tokens"] += pt
         self.llm_usage["completion_tokens"] += ct
         self.llm_usage["cost_usd"] += cost
@@ -1578,7 +1616,7 @@ class MultiSlotAgent:
         oid = self._rid("outcome", ridx, step)
         if getattr(self, "_exp", None) is not None:             # X-145: the outcome of the step the experiments fed
             self._experiment_outcome(ridx, step, sid, cur_prev, code, status, speedup, reward, d, before, after,
-                                     impl_id, oid)
+                                     impl_id, oid, res=res)
         okw = dict(sid=sid, technique=tech, status=status, state_before=state, id=oid,
                    state_after=prof_after.get("state") if prof_after else None,
                    metric_before=before, metric_after=after, speedup=speedup,

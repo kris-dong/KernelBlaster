@@ -285,6 +285,118 @@ def split_purposes(text: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------------------------------------------
+# v1.1 (X-149 / X-145 follow-up): validity + lineage, decision, unchanged source, noise, cost, clocks, nvcc.
+# All optional fields of kb-experiment/1: readers that do not know them ignore them; records / lines without them
+# (older runs, legacy imports) are learnable exactly as before.
+# ---------------------------------------------------------------------------------------------------------------
+
+SCHEMA_V = "1.1"
+ENV_ARM = "KERNELBLASTER_RUN_ARM"             # lineage labels of the run (set by whoever runs an A/B arm)
+ENV_SEED = "KERNELBLASTER_RUN_SEED"
+ENV_FORCE = "MB_FORCE_TECH_ORDER"             # a forced technique order (X-144) is part of the lineage
+ENV_VALID = "KERNELBLASTER_RUN_VALID"         # 0 / false: the operator marks the whole run invalid (not learned from)
+ENV_NOTE = "KERNELBLASTER_RUN_NOTE"
+
+_ADOPT = re.compile(r"\b(?:adopt(?:ed|ing)?|go(?:ing)? with|will use|i(?:'ll| will) (?:use|implement|apply|go)|"
+                    r"use (?:this|that|the)|switch(?:ing)? to|confirm(?:s|ed)? (?:that|the|my)|keep(?:ing)? (?:this|that|it)|"
+                    r"incorporat\w+|apply(?:ing)? (?:this|that|the))\b", re.I)
+_REJECT = re.compile(r"\b(?:reject(?:ed|ing)?|abandon(?:ed|ing)?|not worth|does(?:n't| not) help|did(?:n't| not) help|"
+                     r"no (?:benefit|gain|speed-?up|improvement)|slower|worse|drop(?:ping)? (?:this|that|the|it)|"
+                     r"won't|will not|not (?:beneficial|useful|profitable)|rule(?:s|d)? out|disprove[sd]?|"
+                     r"(?:is|are|was|were) not faster)\b", re.I)
+_UNSURE = re.compile(r"\b(?:inconclusive|unclear|not conclusive|cannot tell|can't tell|noisy|within noise|"
+                     r"no clear (?:winner|difference)|ambiguous|need(?:s)? more)\b", re.I)
+
+
+def parse_decision(text: Optional[str]) -> Optional[str]:
+    """Best effort: what the model concluded about the probe, from its conclusion text (the prose opening the reply that
+    follows the results): ``adopted`` | ``rejected`` | ``inconclusive``, or None (no statement / mixed signals). Keyword
+    based, no LLM; an explicit ``inconclusive`` wins, a text with both adopt and reject cues is None."""
+    t = text or ""
+    if not t.strip():
+        return None
+    if _UNSURE.search(t):
+        return "inconclusive"
+    a, r = bool(_ADOPT.search(t)), bool(_REJECT.search(t))
+    if a == r:
+        return None
+    return "adopted" if a else "rejected"
+
+
+def _norm_src(src: Optional[str]) -> str:
+    """Source for equality: comments and whitespace do not count."""
+    t = re.sub(r"//[^\n]*|/\*.*?\*/", "", src or "", flags=re.S)
+    return "".join(t.split())
+
+
+def same_source(a: Optional[str], b: Optional[str]) -> bool:
+    return bool(a) and bool(b) and _norm_src(a) == _norm_src(b)
+
+
+def lineage_from_env(seed=None, env=None) -> dict:
+    """Arm, seed, forced technique order and operator notes of this run (what an A/B analysis needs to group records)."""
+    e = os.environ if env is None else env
+    out = {}
+    if e.get(ENV_ARM):
+        out["arm"] = e[ENV_ARM]
+    sd = e.get(ENV_SEED) or (None if seed is None else str(seed))
+    if sd not in (None, ""):
+        out["seed"] = sd
+    if (e.get(ENV_FORCE) or "").strip():
+        out["forced_order"] = [x.strip() for x in e[ENV_FORCE].split(",") if x.strip()]
+    if e.get(ENV_NOTE):
+        out["note"] = e[ENV_NOTE][:200]
+    return out
+
+
+def validity_of(flags: Optional[dict], env=None) -> dict:
+    """``{valid, reasons}`` from the run-state flags: ``ncu_disabled`` (the string ncu failed with),
+    ``clock_suspect`` (the GPU the probe / step ran on read locked / throttled), ``operator`` (ENV_VALID=0). An ncu
+    TIMEOUT counts as contamination (it can leave the clocks locked, X-144) unless a clock check after it came back
+    clean (``clock_clean_after_ncu``); other ncu failures (no counter permission) are not."""
+    f = dict(flags or {})
+    e = os.environ if env is None else env
+    reasons = []
+    if (e.get(ENV_VALID) or "").strip().lower() in ("0", "false", "no", "off"):
+        reasons.append("operator_marked_invalid")
+    if f.get("clock_suspect"):
+        reasons.append("clock_suspect")
+    nd = f.get("ncu_disabled")
+    if nd and "timed out" in str(nd) and not f.get("clock_clean_after_ncu"):
+        reasons.append("ncu_timed_out")
+    reasons += [x for x in f.get("extra_reasons") or [] if x not in reasons]
+    return {"valid": not reasons, "reasons": reasons, "ncu_disabled": nd or None,
+            **({"clock_suspect": True} if f.get("clock_suspect") else {})}
+
+
+def learnable(rec: dict) -> bool:
+    """False for a record from a contaminated run / step (``valid`` false): not counted as evidence for facts or
+    probe statistics (it stays in records.jsonl, flagged). Unmarked records are learnable."""
+    return rec.get("valid") is not False
+
+
+def counts_as_outcome(rec: dict) -> bool:
+    """Whether the step outcome of a record is evidence about the probe's usefulness: not for an unchanged source (the
+    step's measured delta is noise) nor a step flagged clock-suspect."""
+    st = ((rec.get("outcome") or {}).get("status"))
+    return st not in ("unchanged", "clock_suspect")
+
+
+def noise_stats(records: Iterable[dict]) -> dict:
+    """The measurement noise visible in steps whose submitted source equals the incumbent: their measured change is
+    pure noise. ``{n, median_abs_pct, max_abs_pct, values}``."""
+    seen, vals = set(), []
+    for r in records:
+        o = r.get("outcome") or {}
+        k = (r.get("run_id"), r.get("step_key"))
+        if o.get("status") == "unchanged" and o.get("noise_pct") is not None and k not in seen:
+            seen.add(k)
+            vals.append(abs(float(o["noise_pct"])))
+    return {"n": len(vals), "median_abs_pct": round(statistics.median(vals), 3) if vals else None,
+            "max_abs_pct": round(max(vals), 3) if vals else None, "values": [round(v, 3) for v in vals[:40]]}
+
+
+# ---------------------------------------------------------------------------------------------------------------
 # recorder (in-run, append-only)
 # ---------------------------------------------------------------------------------------------------------------
 
@@ -321,7 +433,9 @@ class ExperimentRecorder:
     """``<out>/experiments.jsonl`` + ``<out>/experiments/blobs/<sha256>.cu`` for one run."""
 
     def __init__(self, out: Path, *, run_id: str = "", problem: str = "", arch: str = "", target: str = "cuda",
-                 dtype: Optional[str] = None):
+                 dtype: Optional[str] = None, lineage: Optional[dict] = None, flags=None):
+        self.lineage = dict(lineage or {})            # v1.1: arm / seed / forced order of the run
+        self.flags = flags                            # v1.1: callable -> run-state flags for validity_of()
         self.out = Path(out)
         self.path = self.out / "experiments.jsonl"
         self.blobs = self.out / "experiments" / "blobs"
@@ -344,7 +458,7 @@ class ExperimentRecorder:
 
     def record_step(self, key: str, log, *, slot: str, technique: str, op: str = "", op_class: str = "",
                     shape_bucket: str = "", model: str = "", role: str = "", rationale: str = "",
-                    extra_prompt: str = "", fact_ids: Iterable = ()) -> list[str]:
+                    extra_prompt: str = "", fact_ids: Iterable = (), usage: Optional[dict] = None) -> list[str]:
         """One line per experiment of the step (``log.records`` from ``experiment_tool.converse``) + one ``step``
         line. Returns the experiment ids. Ids are deterministic, so a resumed step that reruns its probes does not
         add a second record (readers keep the last line per id)."""
@@ -352,6 +466,14 @@ class ExperimentRecorder:
         m = re.match(r"r(\d+)s(\d+)", key or "")
         ridx, step = (int(m.group(1)), int(m.group(2))) if m else (None, None)
         ids = []
+        usage = usage or {}                              # v1.1: turn -> {prompt_tokens, completion_tokens, usd, key}
+        run_flags = {}
+        if self.flags is not None:
+            try:
+                run_flags = dict(self.flags() or {})
+            except Exception:                            # noqa: BLE001 -- flags never break a record
+                run_flags = {}
+        n_in_turn = Counter(r.get("turn") for r in getattr(log, "records", []))
         for r in getattr(log, "records", []):
             prog = r.get("program") or ""
             psha = self._blob(prog) if prog else None
@@ -366,6 +488,23 @@ class ExperimentRecorder:
                    "status": _status(r), "exit": r.get("exit"), "wall_s": r.get("wall_s"),
                    "out_tail": (r.get("out") or "")[-OUT_TAIL:], "measurements": ms,
                    "probe_kind": classify_probe(prog, r.get("out") or "", ms), "ts": round(time.time(), 1)}
+            # ---- v1.1 (optional fields)
+            clk = r.get("clock") or {}
+            probe_susp = any((clk.get(k) or {}).get("suspect") for k in ("pre", "post"))
+            if r.get("gpu_uuid"):
+                rec["gpu"]["uuid"] = r["gpu_uuid"]
+            if clk:
+                rec["gpu"]["clock"] = clk                # {pre, post}: ClockVerdict dicts (sm / max / mem / state ...)
+            if r.get("nvcc"):
+                rec["nvcc"] = r["nvcc"]                  # {version, flags}
+            tu = usage.get(r.get("turn"))
+            if tu:
+                rec["cost"] = {**{k: tu.get(k) for k in ("prompt_tokens", "completion_tokens", "usd", "key")},
+                               "turn": r.get("turn"), "experiments_in_turn": n_in_turn[r.get("turn")]}
+            dec = parse_decision(rec["conclusion"])
+            rec.update(schema_v=SCHEMA_V, decision=dec, decision_src="conclusion_keywords" if dec else None,
+                       lineage=self.lineage or None,
+                       validity=validity_of({**run_flags, **({"clock_suspect": True} if probe_susp else {})}))
             _jl(self.path, rec)
             ids.append(eid)
             if eid not in self._ids:
@@ -373,22 +512,42 @@ class ExperimentRecorder:
                 self.n_records += 1
         self.extra_chars += len(extra_prompt)
         self.n_steps += 1
-        _jl(self.path, {"type": "step", "schema": SCHEMA, "run_id": self.ctx["run_id"], "step_key": key,
-                        "slot": slot, "technique": technique, "turns": getattr(log, "turns", None),
-                        "runs": getattr(log, "runs", None), "n_experiments": len(ids),
-                        "rationale": (rationale or "")[:MAX_TEXT] or None,
-                        "prompt_extra_chars": len(extra_prompt), "prompt_extra_ids": list(fact_ids)})
+        sl = {"type": "step", "schema": SCHEMA, "run_id": self.ctx["run_id"], "step_key": key,
+              "slot": slot, "technique": technique, "turns": getattr(log, "turns", None),
+              "runs": getattr(log, "runs", None), "n_experiments": len(ids),
+              "rationale": (rationale or "")[:MAX_TEXT] or None,
+              "prompt_extra_chars": len(extra_prompt), "prompt_extra_ids": list(fact_ids)}
+        if usage:                                        # v1.1: tokens and $ of every LLM turn of the step
+            sl["turns_usage"] = [{"turn": t, **{k: u.get(k) for k in ("prompt_tokens", "completion_tokens", "usd", "key")}}
+                                 for t, u in sorted(usage.items(), key=lambda kv: str(kv[0]))]
+            sl["cost"] = {"prompt_tokens": sum(u.get("prompt_tokens") or 0 for u in usage.values()),
+                          "completion_tokens": sum(u.get("completion_tokens") or 0 for u in usage.values()),
+                          "usd": round(sum(u.get("usd") or 0.0 for u in usage.values()), 6)}
+        _jl(self.path, sl)
         return ids
 
     def record_outcome(self, key: str, *, status: str, speedup=None, reward=None, e2e_gain=None, slot_us_before=None,
-                       slot_us_after=None, impl_id=None, outcome_id=None, overlap=None) -> None:
+                       slot_us_after=None, impl_id=None, outcome_id=None, overlap=None, unchanged: bool = False,
+                       noise_pct=None, time: Optional[dict] = None, step_clock_suspect: bool = False) -> None:
         """What the step the experiments fed did (a line per step, also for steps that ran no experiment: cheap and
-        lets a report compare)."""
+        lets a report compare). v1.1: ``unchanged`` (the submitted source equals the incumbent: status ``unchanged``,
+        ``noise_pct`` = the measured change, which is noise; not evidence either way), ``time`` (paired-chain and
+        absolute times), ``step_clock_suspect`` (the step was timed on a clock-suspect GPU: status ``clock_suspect``)."""
         self.n_outcomes += 1
-        _jl(self.path, {"type": "outcome", "schema": SCHEMA, "run_id": self.ctx["run_id"], "step_key": key,
-                        "status": status, "speedup": speedup, "reward": reward, "e2e_gain": e2e_gain,
-                        "slot_us_before": slot_us_before, "slot_us_after": slot_us_after, "impl_id": impl_id,
-                        "outcome_id": outcome_id, "final_overlap": overlap})
+        line = {"type": "outcome", "schema": SCHEMA, "run_id": self.ctx["run_id"], "step_key": key,
+                "status": status, "speedup": speedup, "reward": reward, "e2e_gain": e2e_gain,
+                "slot_us_before": slot_us_before, "slot_us_after": slot_us_after, "impl_id": impl_id,
+                "outcome_id": outcome_id, "final_overlap": overlap}
+        if unchanged or step_clock_suspect or time or noise_pct is not None:
+            flags = {}
+            if self.flags is not None:
+                try:
+                    flags = dict(self.flags() or {})
+                except Exception:                        # noqa: BLE001
+                    flags = {}
+            line.update(schema_v=SCHEMA_V, unchanged=bool(unchanged), noise_pct=noise_pct, time=time or None,
+                        validity=validity_of({**flags, **({"clock_suspect": True} if step_clock_suspect else {})}))
+        _jl(self.path, line)
 
     def pointer(self) -> dict:
         """The result.json block (only written when recording is enabled)."""
@@ -420,6 +579,15 @@ def finalize(lines: list[dict], *, gpu: Optional[dict] = None, blob_dir: Optiona
         r["outcome"] = ({k: o.get(k) for k in ("status", "speedup", "reward", "e2e_gain", "slot_us_before",
                                                "slot_us_after", "impl_id", "outcome_id", "final_overlap")}
                         if o else None)
+        if o and o.get("schema_v"):                       # v1.1 fields of the outcome line (absent: not copied)
+            r["outcome"].update({k: o.get(k) for k in ("unchanged", "noise_pct", "time")})
+            ov = o.get("validity") or {}
+            ev_ = r.get("validity") or {}
+            if ov or ev_:                                  # the record is learnable only if probe AND step are valid
+                reasons = list(dict.fromkeys((ev_.get("reasons") or []) + (ov.get("reasons") or [])))
+                r["validity"] = {**ev_, "valid": not reasons, "reasons": reasons}
+        if (r.get("validity") or {}).get("valid") is not None:
+            r["valid"] = bool(r["validity"]["valid"])
         g = dict(r.get("gpu") or {})
         if gpu:
             g.update({k: v for k, v in gpu.items() if k in ("name", "arch", "label", "index", "sm_mhz", "mem_mhz",
@@ -516,6 +684,8 @@ def facts_from_records(records: list[dict]) -> dict:
     for r in records:
         if r.get("status") != "ok" or not r.get("arch") and not (r.get("gpu") or {}).get("arch"):
             continue
+        if not learnable(r):                              # v1.1: contaminated run / step: not evidence
+            continue
         arch = r.get("arch") or (r.get("gpu") or {}).get("arch")
         for ob in _observations(r):
             k = fact_key(arch, r.get("op_class") or "", ob["fact_type"], ob["subject"], ob["technique"])
@@ -593,6 +763,7 @@ def ingest_facts(claims, records: list[dict]) -> dict:
     de-duplicate). Returns counts."""
     from ..claims import Claim
     facts = facts_from_records(records)
+    skipped = sum(1 for r in records if not learnable(r))
     added = updated = 0
     # agreement across ingests: an experiment that found another dominant component than an existing fact of the
     # same (arch, op class, type, technique) contradicts it, and that fact's experiments contradict the new one
@@ -626,7 +797,7 @@ def ingest_facts(claims, records: list[dict]) -> dict:
                 claims._touch(cur)
                 updated += 1
     claims.save()
-    return {"facts": len(facts), "added": added, "updated": updated}
+    return {"facts": len(facts), "added": added, "updated": updated, **({"skipped_invalid": skipped} if skipped else {})}
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -639,6 +810,8 @@ def probes_from_records(records: list[dict], blob_dirs: Iterable[Path] = ()) -> 
     blob_dirs = [Path(d) for d in blob_dirs]
     book: dict = {}
     for r in records:
+        if not learnable(r):                              # v1.1: contaminated run / step: no template, no statistics
+            continue
         prog = load_program(r, *blob_dirs)
         tsha, params, tmpl_sha = None, {}, None
         if prog:
@@ -651,7 +824,7 @@ def probes_from_records(records: list[dict], blob_dirs: Iterable[Path] = ()) -> 
                                   "question": q, "template_sha": tsha, "template_blob": tsha,
                                   "params": params, "title": None, "arch": r.get("arch"), "uses": 0, "runs_ok": 0,
                                   "runs_failed": 0, "next_improved": 0, "next_neutral": 0, "next_regressed": 0,
-                                  "next_error": 0, "problems": set(), "exp_ids": [], "programs": set(),
+                                  "next_error": 0, "next_unchanged": 0, "problems": set(), "exp_ids": [], "programs": set(),
                                   "legacy_only": prog is None,
                                   "ontology": {"id": f"diag:{r.get('op_class') or '*'}:{q}", "kind": "diagnostic_probe",
                                                "optional": True, "in_technique_menu": False}})
@@ -669,6 +842,9 @@ def probes_from_records(records: list[dict], blob_dirs: Iterable[Path] = ()) -> 
             p.setdefault("_src", {})[tsha] = prog
         o = r.get("outcome") or {}
         st = o.get("status")
+        if not counts_as_outcome(r):                      # v1.1: an unchanged source / clock-suspect step is no outcome
+            p["next_unchanged"] += 1
+            continue
         key2 = {"improved": "next_improved", "neutral": "next_neutral", "regressed": "next_regressed"}.get(st)
         if st in ("compile_error", "runtime_error", "wrong_output"):
             key2 = "next_error"
@@ -854,6 +1030,13 @@ CREATE TABLE IF NOT EXISTS gk_probes (part TEXT, id TEXT, data TEXT, prov TEXT, 
 def _slim(r: dict) -> dict:
     s = dict(r)
     s["out_tail"] = (s.get("out_tail") or "")[-GLOBAL_OUT_TAIL:]
+    if (s.get("gpu") or {}).get("uuid") or any((c or {}).get("uuid") for c in ((s.get("gpu") or {}).get("clock") or {}).values()):
+        g = dict(s["gpu"])                                 # v1.1: GPU UUIDs stay in the run's own records
+        g.pop("uuid", None)
+        if isinstance(g.get("clock"), dict):
+            g["clock"] = {k: ({kk: vv for kk, vv in v.items() if kk != "uuid"} if isinstance(v, dict) else v)
+                          for k, v in g["clock"].items()}
+        s["gpu"] = g
     return s
 
 
@@ -937,10 +1120,18 @@ def guess_op_class(slot: str) -> str:
     return re.sub(r"_(f16|f32|fp16|fp32|bf16)$", "", s) or "unknown"
 
 
-def import_legacy(run_dir: Path) -> list[dict]:
+def import_legacy(run_dir: Path, *, lineage: Optional[dict] = None, invalid: Iterable[str] = (),
+                  unchanged: Iterable[str] = ()) -> list[dict]:
     """Records from an older run dir: ``multiturn.jsonl`` items (``out_head`` = first 300 characters of the output)
     joined with ``result.json`` (arch, GPU, model, step outcomes). Missing: program, purpose, conclusion. The ids
-    are deterministic, so importing twice gives the same records."""
+    are deterministic, so importing twice gives the same records.
+
+    v1.1, as far as the old logs allow: the GPU name / UUID / clocks of ``result.json``'s ``gpu``; validity from its
+    ``ncu.disabled`` (an ncu timeout) and ``clock_suspect``; the run's total tokens / $ (``llm_usage``, per step is
+    not in the old logs); the lineage / extra invalid reasons / unchanged-source step keys the caller knows
+    (``lineage={"arm": ...}``, ``invalid=["clock_locked_after_ncu_timeout"]``, ``unchanged=["r0s2"]``: an old log
+    does not keep the submitted source, so unchanged steps cannot be detected from it; the decision field needs the
+    conclusion text, which the old log did not keep either)."""
     rd = Path(run_dir)
     mt = read_jsonl(rd / "multiturn.jsonl")
     res = {}
@@ -952,6 +1143,17 @@ def import_legacy(run_dir: Path) -> list[dict]:
     steps = {(s.get("rollout"), s.get("step")): s for s in res.get("steps") or []}
     arch = res.get("arch") or ""
     gpu = {k: v for k, v in (res.get("gpu") or {}).items() if k in ("name", "arch", "label", "index")}
+    rg = res.get("gpu") or {}
+    if rg.get("uuid"):
+        gpu["uuid"] = rg["uuid"]
+    if isinstance(rg.get("clock"), dict):
+        gpu["clock"] = {"final_run": rg["clock"]}
+    ncu_dis = (res.get("ncu") or {}).get("disabled")
+    run_susp = bool((rg.get("clock") or {}).get("suspect")) or bool(res.get("clock_suspect"))
+    lu = res.get("llm_usage") or {}
+    run_cost = ({"run_total": {"prompt_tokens": lu.get("prompt_tokens"), "completion_tokens": lu.get("completion_tokens"),
+                               "usd": lu.get("cost_usd")}} if lu else None)
+    unchanged = set(unchanged)
     run_id = res.get("run_id") or rd.name
     problem = res.get("problem") or rd.name
     recs = []
@@ -982,6 +1184,18 @@ def import_legacy(run_dir: Path) -> list[dict]:
                 "probe_kind": classify_probe(None, txt, ms), "ts": None, "outcome": out,
                 "missing": ["program", "purpose", "conclusion", "shape_bucket", "op_kind", "full_output"],
                 "legacy": True})
+            r = recs[-1]
+            r["schema_v"] = SCHEMA_V
+            r["lineage"] = dict(lineage or {}) or None
+            if run_cost:
+                r["cost"] = dict(run_cost)
+            r["validity"] = validity_of({"ncu_disabled": ncu_dis, "clock_suspect": run_susp,
+                                         "extra_reasons": list(invalid)})
+            r["valid"] = r["validity"]["valid"]
+            if key in unchanged and r.get("outcome"):
+                a, b = r["outcome"].get("slot_us_before"), r["outcome"].get("slot_us_after")
+                r["outcome"].update(status="unchanged", unchanged=True,
+                                    noise_pct=(round(100.0 * (b - a) / a, 3) if a and b else None))
     return recs
 
 
@@ -1029,15 +1243,32 @@ def report(records: list[dict], claims=None) -> dict:
     oc = Counter((r.get("outcome") or {}).get("status") or "no_outcome" for r in records)
     missing = Counter(m for r in records for m in r.get("missing") or [])
     nm = sum(1 for r in records if r.get("measurements"))
-    return {"experiments": len(records), "steps": len({(r.get("run_id"), r.get("step_key")) for r in records}),
+    inv = Counter(x for r in records if r.get("valid") is False for x in ((r.get("validity") or {}).get("reasons") or ["?"]))
+    dec = Counter(r.get("decision") or "none" for r in records)
+    cost: dict = {}
+    for r in records:
+        c = r.get("cost") or {}
+        if c.get("usd") is not None and "experiments_in_turn" in c:
+            cost.setdefault("_turns", {})[(r.get("run_id"), r.get("step_key"), c.get("turn"))] = c
+    turns = list((cost.get("_turns") or {}).values())
+    nvcc = Counter((r.get("nvcc") or {}).get("version") or "unknown" for r in records if r.get("nvcc"))
+    clk = Counter(((r.get("gpu") or {}).get("clock") or {}).get("pre", {}).get("state") or "unrecorded" for r in records)
+    lin = Counter(json.dumps(r.get("lineage"), sort_keys=True) for r in records if r.get("lineage"))
+    return {"experiments": len(records),
+            "learnable": sum(1 for r in records if learnable(r)), "invalid": dict(inv), "decisions": dict(dec),
+            "noise": noise_stats(records), "probe_clock_state": dict(clk), "nvcc": dict(nvcc), "lineage": dict(lin),
+            "cost": ({"experiment_turns": len(turns), "prompt_tokens": sum(c.get("prompt_tokens") or 0 for c in turns),
+                      "completion_tokens": sum(c.get("completion_tokens") or 0 for c in turns),
+                      "usd": round(sum(c.get("usd") or 0.0 for c in turns), 4)} if turns else None), "steps": len({(r.get("run_id"), r.get("step_key")) for r in records}),
             "status": dict(stat), "probe_kinds": dict(pk), "step_outcomes": dict(oc),
             "with_measurements": nm, "missing_fields": dict(missing),
             "facts": [{"key": k, "type": f["fact_type"], "subject": f["subject"], "arch": f["arch"],
                        "op_class": f["op_class"], "technique": f["technique"], "text": f["text"],
                        "summary": _summary(f), "independent": len(f["support"]), "contradicting": len(f["contradict"])}
                       for k, f in sorted(facts.items())],
-            "probes": [{k: p[k] for k in ("id", "op_class", "question", "uses", "next_improved", "next_neutral",
-                                          "next_regressed", "next_error", "legacy_only")} for p in probes]}
+            "probes": [{k: p.get(k, 0) for k in ("id", "op_class", "question", "uses", "next_improved", "next_neutral",
+                                                 "next_regressed", "next_error", "next_unchanged", "legacy_only")}
+                       for p in probes]}
 
 
 def _fmt(rep: dict) -> str:
@@ -1046,6 +1277,20 @@ def _fmt(rep: dict) -> str:
          f"with parsed measurements: {rep['with_measurements']}"]
     if rep["missing_fields"]:
         L.append(f"missing fields (legacy): {rep['missing_fields']}")
+    if rep.get("invalid") or rep.get("learnable") != rep["experiments"]:
+        L.append(f"validity: {rep['learnable']}/{rep['experiments']} learnable; invalid reasons {rep['invalid']}")
+    if rep.get("decisions") and set(rep["decisions"]) != {"none"}:
+        L.append(f"model-stated decisions: {rep['decisions']}")
+    if rep.get("noise", {}).get("n"):
+        n = rep["noise"]
+        L.append(f"unchanged-source steps: {n['n']}, measured change = noise: median |{n['median_abs_pct']}|%, max "
+                 f"{n['max_abs_pct']}% (not counted as regressions / evidence)")
+    if rep.get("cost"):
+        L.append(f"experiment turns: {rep['cost']}")
+    if rep.get("nvcc"):
+        L.append(f"nvcc: {rep['nvcc']}; probe-time clock state: {rep['probe_clock_state']}")
+    if rep.get("lineage"):
+        L.append(f"lineage: {rep['lineage']}")
     L.append(f"facts ({len(rep['facts'])}):")
     for f in rep["facts"]:
         L.append(f"  [{f['type']}] {f['arch']} {f['op_class']}"
@@ -1055,7 +1300,8 @@ def _fmt(rep: dict) -> str:
     for p in rep["probes"]:
         L.append(f"  {p['id']} {p['op_class']} / {p['question']}: used {p['uses']}x, next step improved "
                  f"{p['next_improved']} neutral {p['next_neutral']} regressed {p['next_regressed']} error "
-                 f"{p['next_error']}" + (" (no source: legacy)" if p["legacy_only"] else ""))
+                 f"{p['next_error']}" + (f" (unchanged/suspect, not counted: {p['next_unchanged']})" if p.get("next_unchanged") else "")
+                 + (" (no source: legacy)" if p["legacy_only"] else ""))
     return "\n".join(L)
 
 
@@ -1077,6 +1323,13 @@ def main(argv: Optional[list] = None) -> int:
     lg = sub.add_parser("import-legacy", help="legacy multiturn.jsonl -> records.jsonl (+ report); same as ingest --legacy")
     lg.add_argument("run_dir")
     lg.add_argument("--kdir", default=None, help="write <kdir>/experiments/ and claims (default: report only)")
+    for sp in (lg, i):
+        sp.add_argument("--arm", default=None, help="lineage: arm label of the (legacy) run")
+        sp.add_argument("--seed", default=None, help="lineage: seed of the (legacy) run")
+        sp.add_argument("--invalid", action="append", default=[], metavar="REASON",
+                        help="mark the (legacy) run invalid with this reason (e.g. clock_locked_after_ncu_timeout)")
+        sp.add_argument("--unchanged", default="", help="legacy: comma list of step keys (r0s2,...) whose submitted source "
+                        "equalled the incumbent")
     a = ap.parse_args(argv)
     if a.cmd == "report":
         recs, info = load_records(Path(a.path), part=a.part)
@@ -1089,7 +1342,9 @@ def main(argv: Optional[list] = None) -> int:
         legacy = a.cmd == "import-legacy" or a.legacy or not (rd / "experiments.jsonl").exists()
         kdir = getattr(a, "kdir", None)
         if legacy:
-            recs = import_legacy(rd)
+            lin = {k: v for k, v in (("arm", a.arm), ("seed", a.seed)) if v}
+            recs = import_legacy(rd, lineage=lin or None, invalid=a.invalid,
+                                 unchanged=[x for x in a.unchanged.split(",") if x])
             rep = report(recs)
             if kdir:
                 ed = Path(kdir) / "experiments"
