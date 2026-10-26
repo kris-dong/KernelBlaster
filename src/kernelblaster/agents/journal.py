@@ -40,6 +40,7 @@ EXIT_INTERRUPTED = 75      # stopped on SIGTERM / SIGINT after flushing the jour
 EXIT_ABORTED = 76          # a second signal: exited at once (the journals are still consistent)
 EXIT_CONFIG_MISMATCH = 3   # an existing out dir was made with another configuration (--force-restart)
 EXIT_LOCKED = 4            # another process holds the out dir
+EXIT_PAUSED = 77           # halfway sync (--pause-spec): every pausing problem parked at its pause step, journals flushed
 
 
 def fsync_dir(d: Path) -> None:
@@ -263,3 +264,8 @@ def config_hash(config: dict) -> str:
 
 class RunInterrupted(Exception):
     """A problem stopped on request (SIGTERM / SIGINT) with its journal flushed: resumable."""
+
+
+class RunPaused(Exception):
+    """A problem parked at its pause step (``pause_at``: ModelBlaster's halfway sync) with its journal flushed:
+    every rollout has completed ``pause_at`` steps and keeps its own current kernel; rerun without the pause to go on."""
