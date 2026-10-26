@@ -60,6 +60,11 @@ IMPL_NOTE = "impl_note"
 MECHANISM = "mechanism"          # v2: a technique's predicted vs observed metric effects
 CLAIM_KINDS = (APPLICABILITY, PITFALL, INTERACTION, PARAMETER, REVISE_DESCRIPTION,
                STATE_SPLIT, IMPL_NOTE, MECHANISM)
+#: X-145: a fact measured by a recorded probe program (knowledge/v2/experiments.py). Deliberately NOT in CLAIM_KINDS
+#: (the reflection pass's edit schema / prompt is built from it and must not change); written only by the experiment
+#: ingest, hidden from ``ClaimStore.relevant`` unless asked for by kind.
+EXPERIMENT = "experiment"
+VALID_KINDS = CLAIM_KINDS + (EXPERIMENT,)
 
 ACTIVE = "active"
 RETIRED = "retired"
@@ -73,7 +78,7 @@ LOCAL_FIELDS = ("problem_id", "slot")
 MIN_SUPPORT = 2                 # default prompt threshold
 # one observed dead end on a slot is the fact; a pitfall must cite a real failure
 # (validated) and its fix is cheap to try, so one is enough for those two kinds
-MIN_SUPPORT_BY_KIND = {IMPL_NOTE: 1, PITFALL: 1}
+MIN_SUPPORT_BY_KIND = {IMPL_NOTE: 1, PITFALL: 1, EXPERIMENT: 1}
 AGE_OUT_EPOCHS = 12             # retire ineligible claims untouched this long
 HALF_LIFE_EPOCHS = 30           # ranking decay of eligible claims
 PURGE_RETIRED_EPOCHS = 100      # drop retired claims from the file after this
@@ -153,7 +158,7 @@ class Claim:
     updated_ts: str = field(default_factory=_now)
 
     def __post_init__(self):
-        if self.kind not in CLAIM_KINDS:
+        if self.kind not in VALID_KINDS:
             raise ValueError(f"bad claim kind {self.kind!r}")
         if not self.text or not self.text.strip():
             raise ValueError("empty claim text")
@@ -184,6 +189,8 @@ class Claim:
             pol = (d.get("note_type"),)
         elif self.kind == MECHANISM:
             pol = (d.get("metric"), d.get("verdict"))
+        elif self.kind == EXPERIMENT:
+            pol = (d.get("fact_type"), d.get("subject"))
         else:
             pol = ()
         return (self.kind, self.level, self.family) + self.scope() + pol
@@ -446,6 +453,8 @@ class ClaimStore:
             for c in self.claims.values():
                 if kinds and c.kind not in kinds:
                     continue
+                if c.kind == EXPERIMENT and not (kinds and EXPERIMENT in kinds):
+                    continue                          # X-145: experiment facts reach prompts only through their own opt-in
                 if c.status != ACTIVE or (not include_ineligible and not self.eligible(c)):
                     continue
                 spec = self._matches(c, q)

@@ -204,6 +204,9 @@ def consolidate(g, part: str, *, seq: int, threshold: float = 0.35, include_loca
             sup += ms_ids
             con += mc_ids
             have |= set(ms_ids) | set(mc_ids)
+            if d.get("kind") == "experiment":                    # X-145: union the member's observations
+                from .experiments import merge_fact_data
+                d["data"] = merge_fact_data(d.get("data"), md.get("data"))
             for f in ("problems", "runs"):
                 for x in mpv.get(f) or []:
                     if x not in (pv.get(f) or []):

@@ -256,3 +256,21 @@ def test_struct_rows_priors_and_store_roundtrip(store, tmp_path):
     sp2 = StructPriors.load(tmp_path / "s2")
     assert sp2.prior("fuse", ["batchnorm2d", "relu"]).accepted == 1
     assert StructPriors.load(store, part=P89).prior("fuse", ["conv2d", "relu"]).n == 2
+
+
+def test_plan_llm_judge_only_on_borderline_pairs_and_bounded():
+    from kernelblaster.knowledge.v2.consolidate import plan
+    base = {"kind": "applicability", "arch": "sm_89", "op_class": "gemm", "technique": "t", "data": {"effect": "helps"},
+            "target": "cuda", "status": "active"}
+    rows = [("c1", dict(base, text="tile retune helps skinny gemm with long K", support=5), {}, "active"),
+            ("c2", dict(base, text="retuning tiles speeds up gemm when K is long and M small", support=2), {}, "active"),
+            ("c3", dict(base, text="completely unrelated words about register pressure", support=1), {}, "active")]
+    calls = []
+
+    def judge(a, b):
+        calls.append((a, b))
+        return True, "merged text"
+    p = plan(rows, threshold=0.99, judge=judge, llm_low=0.05, llm_max_pairs=1)
+    assert len(calls) == 1 and p["pairs_judged"] == 1 and p["llm_merges"] == 1
+    assert p["clusters"] == {"c1": ["c2"]} and p["texts"] == {"c1": "merged text"}
+    assert plan(rows, threshold=0.99)["clusters"] == {}                    # no judge: nothing below threshold

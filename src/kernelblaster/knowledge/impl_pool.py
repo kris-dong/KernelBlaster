@@ -240,7 +240,7 @@ class Pool:
             shapes = record.get("shapes") or []
             us = record.get("slot_us")
             if len(shapes) == 1:
-                self.observe(kid, shapes[0], us=us, ok=True, src="record")
+                self.observe(kid, shapes[0], us=us, ok=True, src="record", seed_us=record.get("seed_us"))
             elif shapes:
                 for s in shapes:
                     self.observe(kid, s, us=None, ok=True, src="set")
@@ -263,7 +263,7 @@ class Pool:
         return kid
 
     def observe(self, kid: str, shape: dict, *, us: Optional[float] = None, ok: bool = True, src: str = "measured",
-                config=None, err: Optional[str] = None) -> None:
+                config=None, err: Optional[str] = None, seed_us: Optional[float] = None) -> None:
         """One measurement of kernel ``kid`` on ``shape``: ``us`` (None = validated only) / ``ok``. Repeated
         observations keep the minimum time and count failures (``n_fail``); a cell with any failure is not
         routed to (conservative guard)."""
@@ -274,6 +274,8 @@ class Pool:
         self.shapes.setdefault(sk, shape)
         c = self.obs.setdefault(kid, {}).setdefault(sk, {"us": None, "ok": True, "n": 0, "n_fail": 0, "src": src})
         c["n"] += 1
+        if seed_us:                                   # the problem's hand-seed time on this shape (retention baseline)
+            c["seed_us"] = max(float(seed_us), float(c.get("seed_us") or 0.0))
         if not ok:
             c["n_fail"] += 1
             c["ok"] = False
@@ -418,10 +420,13 @@ class Pool:
         oracle = sum(v for v in best.values() if v) or 1.0
         t = {k: {s: c["us"] for s, c in (self.obs.get(k) or {}).items() if c["ok"] and c["us"] is not None}
              for k in ks}
-        # an uncovered shape counts as served by a kernel twice as slow as the slowest one seen on it, so the greedy
-        # (like kb_family_tune's pool step) both covers shapes and saves time
-        worst = {s: max([t[k][s] for k in ks if s in t[k]], default=0.0) for s in shapes}
-        cur = {s: min([t[k][s] for k in kept if s in t[k]], default=2.0 * worst[s]) for s in shapes}
+        # usefulness = time saved against the shape's baseline: the hand seed's time on it where a record says (else
+        # the slowest kernel seen there), then against the best kernel kept so far (like kb_family_tune's greedy
+        # pool step). A slow kernel valid everywhere (the seed itself) saves nothing and is not kept for coverage.
+        base = {s: max([t[k][s] for k in ks if s in t[k]] +
+                       [float((self.obs.get(k) or {}).get(s, {}).get("seed_us") or 0.0) for k in ks], default=0.0)
+                for s in shapes}
+        cur = {s: min([t[k][s] for k in kept if s in t[k]], default=base[s]) for s in shapes}
         cap_useful = max(1, int(round(max_kernels * useful_frac)))
         reason = {k: "protected" for k in kept}
         while len(kept) < min(cap_useful, max_kernels):

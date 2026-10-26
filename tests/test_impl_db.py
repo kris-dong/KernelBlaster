@@ -247,3 +247,36 @@ def test_impl_links_claims_negatives_render_and_penalty():
     assert len(L.render(["I1"], max_chars=120)) <= 120
     assert L.penalty({"records": ["I1"]}) == pytest.approx(0.05)
     assert L.render(["nothing"]) == ""
+
+
+def test_multislot_prompt_hooks_are_env_gated(tmp_path, monkeypatch):
+    """opt_multislot: KERNELBLASTER_IMPL_LINKS adds the linked-knowledge section, KERNELBLASTER_IMPL_SIMILAR passes
+    similar_k; both off by default (no new keys, empty text)."""
+    from types import SimpleNamespace
+
+    from kernelblaster.agents.opt_multislot import MultiSlotAgent, SlotBest
+    from kernelblaster.knowledge.outcomes import OutcomeRecord
+    from kernelblaster.knowledge.v2 import KnowledgeV2
+    kv = KnowledgeV2(tmp_path / "k")
+    rec = OutcomeRecord(technique="tile_shape_retune", status="improved", arch="sm_89", problem_id="p", slot="s0",
+                        op_class="conv", speedup=1.4, impl_id="I1")
+    kv.outcomes.append(rec, {"item_id": "tile_shape_retune", "reward": 0.3, "chain": []})
+    fake = SimpleNamespace(kv=kv, best={"s0": SlotBest("src", 1.0, impl_id="I1")})
+    monkeypatch.delenv("KERNELBLASTER_IMPL_LINKS", raising=False)
+    assert MultiSlotAgent._impl_links_text(fake, "s0", {"adapt": None, "examples": []}) == ""
+    monkeypatch.setenv("KERNELBLASTER_IMPL_LINKS", "1")
+    txt = MultiSlotAgent._impl_links_text(fake, "s0", {"adapt": None, "examples": []})
+    assert "impl I1 (current best): made by tile_shape_retune (1.40x)" in txt
+    monkeypatch.setenv("KERNELBLASTER_IMPL_LINKS_CHARS", "40")
+    fake._impl_links = None
+    assert len(MultiSlotAgent._impl_links_text(fake, "s0", {"adapt": None, "examples": []})) <= 40
+    # _retrieve passes similar_k only when asked
+    s = ImplStore(tmp_path / "impl")
+    add(s, "other", [conv(64)], 9.0, problem="p2")
+    slot = SimpleNamespace(op="conv2d_f16", op_class="conv", signature=SIG, shapes=lambda: [conv(64)])
+    agent = SimpleNamespace(store=s, p=SimpleNamespace(slots={"s0": slot}, target="cuda", dtype="fp16"),
+                            arch_label="sm_89", problem_id="me")
+    monkeypatch.delenv("KERNELBLASTER_IMPL_SIMILAR", raising=False)
+    assert "similar" not in MultiSlotAgent._retrieve(agent, "s0")
+    monkeypatch.setenv("KERNELBLASTER_IMPL_SIMILAR", "2")
+    assert len(MultiSlotAgent._retrieve(agent, "s0")["similar"]) == 1
