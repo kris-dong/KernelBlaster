@@ -95,6 +95,8 @@ CREATE TABLE IF NOT EXISTS gk_scopes (id TEXT PRIMARY KEY, parent TEXT, data TEX
 CREATE TABLE IF NOT EXISTS gk_targets (key TEXT PRIMARY KEY, node TEXT, data TEXT);
 CREATE TABLE IF NOT EXISTS gk_log (seq INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, kind TEXT, ref TEXT, part TEXT,
     data TEXT);
+CREATE TABLE IF NOT EXISTS gk_contrib (seq INTEGER, run_uid TEXT, part TEXT, kind TEXT, key TEXT, data TEXT);
+CREATE INDEX IF NOT EXISTS gk_contrib_pks ON gk_contrib (part, kind, seq);
 """
 
 GK_TABLES = ("gk_claims", "gk_hypotheses", "gk_states", "gk_techniques", "gk_stats", "gk_outcomes",
@@ -138,6 +140,14 @@ class Policy:
     impl_per_key: int = 1                    # kept per (op, signature, arch, dtype, shape set)
     impl_max_per_op: int = 8                 # kept per (op, signature, arch, dtype) over all shape sets
     proposals_per_key: int = 5               # rejected proposals kept per trigger key in the store
+    refresh_max_claims: int = 300            # new claims in one mid-run refresh package (refresh.py)
+    # A5 (impl database / knowledge store), all off by default -- the defaults reproduce the behaviour above
+    impl_pool: bool = False                  # merge: keep per (op, signature, arch, dtype) a pool + cross-shape matrix
+    pool_max_kernels: int = 16               # pool retention cap (usefulness + diversity, impl_pool.Pool.retain)
+    pool_min_speedup: float = 1.0            # pool input: verified records at least this fast vs their seed
+    seed_pool: bool = False                  # materialize: ship the partition's pools into impl/pool/
+    struct_outcomes: bool = False            # merge: structural decisions (fusion / layout / attention) -> gk_struct
+    seed_struct: bool = False                # materialize: write struct_priors.json (priors.StructPriors)
 
     @classmethod
     def from_json(cls, s) -> "Policy":
@@ -477,7 +487,9 @@ class GlobalStore:
                 self.codedir.mkdir(parents=True, exist_ok=True)
                 c = _connect(tmp)
                 try:
+                    from .pool_store import code_refs
                     ref = {r[0] for r in c.execute("SELECT json_extract(data, '$.code_sha') FROM gk_impl")}
+                    ref |= code_refs(c)
                 finally:
                     c.close()
                 for sha in ref:
@@ -495,7 +507,9 @@ class GlobalStore:
         for v in self.versions():
             c = _connect(self.path(v), ro=True)
             try:
+                from .pool_store import code_refs
                 ref |= {r[0] for r in c.execute("SELECT json_extract(data, '$.code_sha') FROM gk_impl")}
+                ref |= code_refs(c)                      # pool kernels (A5) are referenced too
             finally:
                 c.close()
         n = 0
@@ -548,6 +562,13 @@ class GlobalStore:
                     st["parts"].setdefault(part, {})["outcomes"] = n
                 for part, n in c.execute("SELECT part, COUNT(*) FROM gk_impl GROUP BY 1"):
                     st["parts"].setdefault(part, {})["impl"] = n
+                from .pool_store import has_pool
+                if has_pool(c):
+                    for part, npk, nk in c.execute("SELECT part, COUNT(DISTINCT pkey), COUNT(*) FROM gk_pool GROUP BY 1"):
+                        st["parts"].setdefault(part, {})["pool"] = {"pools": npk, "kernels": nk}
+                if "gk_struct" in _tables(c):
+                    for part, n in c.execute("SELECT part, COUNT(*) FROM gk_struct GROUP BY 1"):
+                        st["parts"].setdefault(part, {})["struct_outcomes"] = n
                 st["ledger"] = c.execute("SELECT COUNT(DISTINCT run_uid), COUNT(*) FROM gk_ledger").fetchone()
                 st["merge_seq"] = _meta(c, "merge_seq", 0, "gk_meta")
             finally:
@@ -657,7 +678,8 @@ def materialize(store: GlobalStore, part: str, out_dir, *, problem: Optional[str
         man = {"format": FORMAT, "snapshot": vid, "part": part, "problem": problem,
                "run_uid": run_uid or uuid.uuid4().hex, "created": _now(), "store": str(store.root),
                "policy": asdict(pol), "counts": counts, "seed_outcomes": n_out,
-               "snapshot_sha256": store.manifest(vid).get("sha256") if vid else None}
+               "snapshot_sha256": store.manifest(vid).get("sha256") if vid else None,
+               "merge_seq": int(_meta(g, "merge_seq", 0, "gk_meta") or 0) if g is not None else 0}
         _set_meta(k, "gk_seed", man)
         k.execute("COMMIT")
         _check(k, "seed")
@@ -668,6 +690,17 @@ def materialize(store: GlobalStore, part: str, out_dir, *, problem: Optional[str
     os.replace(tmp, dst)
     if g is not None:
         man["impl"] = _seed_impl(store, vid, part, out / "impl")
+        if pol.seed_pool or pol.seed_struct:
+            g2 = _connect(store.path(vid), ro=True)
+            try:
+                if pol.seed_pool:
+                    from .pool_store import seed_pool
+                    man["pool"] = seed_pool(g2, store, part, out / "impl")
+                if pol.seed_struct:
+                    from .priors import seed_struct
+                    man["struct"] = seed_struct(g2, part, out / "struct_priors.json")
+            finally:
+                g2.close()
     (out / "seed.json").write_text(json.dumps(man, indent=1))
     return man
 
@@ -944,9 +977,10 @@ def _seed_info(c: sqlite3.Connection) -> dict:
 
 
 def merge_run(store: GlobalStore, run_db, base_db=None, *, info: RunInfo, impl_dir=None, base_impl_dir=None,
-              policy: Optional[Policy] = None, review_path=None, label: str = "") -> dict:
+              policy: Optional[Policy] = None, review_path=None, label: str = "", struct_path=None) -> dict:
     """Merge ``run_db`` - ``base_db`` (the db the run started from, or the copy merged last; default:
-    the repo seed) into a new snapshot. Returns a report; ``status`` is merged | duplicate | empty."""
+    the repo seed) into a new snapshot. Returns a report; ``status`` is merged | duplicate | empty.
+    ``struct_path`` (a ModelBlaster ``state.json``) is read only with ``Policy.struct_outcomes``."""
     pol = policy or Policy()
     run_db = Path(run_db)
     with store.lock():
@@ -980,6 +1014,11 @@ def merge_run(store: GlobalStore, run_db, base_db=None, *, info: RunInfo, impl_d
                 if led and led[-1][1] != bfp:
                     raise MergeError(f"run {info.run_uid} was merged before (fingerprint {led[-1][1]}); merge it "
                                      f"against the copy merged last, not {base_db} ({bfp})")
+                # rows the run imported mid-run (refresh.py) after this base was taken: into the base copy, so
+                # the delta below is the run's own learning only
+                from .refresh import adjust_base, imported_impl_ids
+                adj = adjust_base(bc, rc)
+                B = KDB(bc)
                 if not B.outcome_ids() <= R.outcome_ids():
                     raise MergeError("the run db is not a continuation of the base db (outcomes missing)")
                 store._backup(f"merge {info.problem} {info.run_uid}")
@@ -990,9 +1029,25 @@ def merge_run(store: GlobalStore, run_db, base_db=None, *, info: RunInfo, impl_d
                     seq = int(_meta(g, "merge_seq", 0, "gk_meta") or 0) + 1
                     _set_meta(g, "merge_seq", seq, "gk_meta")
                     rep = _apply_delta(g, R, B, info=info, part=part, seq=seq, pol=pol, review_path=review_path)
-                    rep["impl"] = _merge_impl(g, store, impl_dir, base_impl_dir, info=info, part=part, seq=seq, pol=pol)
+                    rep["impl"] = _merge_impl(g, store, impl_dir, base_impl_dir, info=info, part=part, seq=seq, pol=pol,
+                                              exclude=imported_impl_ids(rc))
+                    if pol.impl_pool and impl_dir:
+                        from .pool_store import merge_pool
+                        rep["pool"] = merge_pool(g, store, [impl_dir], base_impl_dir, part=part, pol=pol,
+                                                 prov=info.prov(), exclude=imported_impl_ids(rc), problem=info.problem)
+                    if pol.struct_outcomes and struct_path and Path(struct_path).exists():
+                        from .priors import merge_struct
+                        rep["struct"] = merge_struct(g, struct_path, part=part, run_uid=info.run_uid,
+                                                     problem=info.problem)
                     rep["upkeep"] = upkeep(g, part, seq, pol)
+                    if adj["rids"]:
+                        rep["refresh_base_adjust"] = adj
                     vid_next = store._next_id()
+                    lin = _meta(g, "lineage", None, "gk_meta")
+                    if lin is None:
+                        from .refresh import lineage
+                        lin = lineage(store, cur)
+                    _set_meta(g, "lineage", (list(lin) + [vid_next])[-2000:], "gk_meta")
                     g.execute("INSERT INTO gk_ledger VALUES (?,?,?,?,?,?,?,?,?,?)",
                               (info.run_uid, len(led) + 1, fp, part, info.problem, info.attempt,
                                "seed" if not led else "incremental", vid_next, _now(), _j(rep)))
@@ -1233,6 +1288,9 @@ def _apply_delta(g, R: KDB, B: KDB, *, info: RunInfo, part: str, seq: int, pol: 
             g.execute("INSERT INTO gk_stats VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT (part, item, level, scope, op, state) "
                       "DO UPDATE SET n=n+excluded.n, s=s+excluded.s, ss=ss+excluded.ss",
                       (part, mitem(item), level, scope, op, mstate(state), dn, ds, dss))
+            g.execute("INSERT INTO gk_contrib VALUES (?,?,?,?,?,?)",
+                      (seq, info.run_uid, part, "stats", _j([mitem(item), level, scope, op, mstate(state)]),
+                       _j([dn, ds, dss])))
             nadd += 1
         rep["stats"] = {"rows": nadd, "negative_deltas_skipped": neg}
 
@@ -1307,6 +1365,12 @@ def _apply_delta(g, R: KDB, B: KDB, *, info: RunInfo, part: str, seq: int, pol: 
                 gid = bid
                 put(gid, dict(b, id=gid), _prov_add(None, prov, seq), bck)
                 overlay_by_ck[bck] = gid
+            # a claim consolidated into another one (consolidate.py) passes its new evidence to the survivor
+            hops = 0
+            while hops < 8 and ((gclaims[gid][0].get("data") or {}).get("gk_consolidated_into") in gclaims) \
+                    and gclaims[gid][2] != ACTIVE:
+                gid = gclaims[gid][0]["data"]["gk_consolidated_into"]
+                hops += 1
             gd, pv, _, bck = gclaims[gid]
             gd = dict(gd)
             bsup = set(b.get("support_ids", []))
@@ -1316,12 +1380,14 @@ def _apply_delta(g, R: KDB, B: KDB, *, info: RunInfo, part: str, seq: int, pol: 
             gd = fold(gd, [i for i in d.get("support_ids", []) if i not in bsup],
                       [i for i in d.get("contradict_ids", []) if i not in bcon], dsup, dcon)
             for f in ("text", "level", "family", "target", "arch", "state", "op_class", "technique"):
+                if hops:                                           # evidence only: the survivor keeps its own text
+                    break
                 if d.get(f) != b.get(f):                           # lifted / demoted / revised in the run
                     gd[f] = d.get(f)
             pv = _prov_add(pv, prov, seq)
             if dsup > 0 or dcon > 0:
                 pv["last_evidence"] = seq
-            if d.get("status") == RETIRED and b.get("status") == ACTIVE:
+            if d.get("status") == RETIRED and b.get("status") == ACTIVE and not hops:
                 kinds = evs.get(cid, set())
                 why = None
                 if (d.get("data") or {}).get("merged_into"):
@@ -1471,13 +1537,13 @@ def _impl_records(d: Optional[Path]) -> list[dict]:
 
 
 def _merge_impl(g, store: GlobalStore, impl_dir, base_impl_dir, *, info: RunInfo, part: str, seq: int,
-                pol: Policy) -> dict:
+                pol: Policy, exclude=()) -> dict:
     """Keep per (op, signature, arch, dtype, shape set) the fastest verified record (and at most
     ``impl_max_per_op`` shape sets per op); sources go to the content-addressed ``impl_code/``."""
     recs = _impl_records(impl_dir)
     if not recs:
         return {"records": 0}
-    base_ids = {r.get("id") for r in _impl_records(base_impl_dir)}
+    base_ids = {r.get("id") for r in _impl_records(base_impl_dir)} | set(exclude)   # + imported mid-run
     tk, dt = parse_part(part)
     arch = tk.split(":", 1)[-1]
     store.codedir.mkdir(parents=True, exist_ok=True)
@@ -1509,6 +1575,7 @@ def _merge_impl(g, store: GlobalStore, impl_dir, base_impl_dir, *, info: RunInfo
         d = dict(r, problem_id=ns(info.problem, r.get("problem_id")))
         g.execute("INSERT OR REPLACE INTO gk_impl VALUES (?,?,?,?,?,?)",
                   (r["id"], part, kkey, float(r.get("slot_us") or 0.0), _j(d), _j(info.prov())))
+        g.execute("INSERT INTO gk_contrib VALUES (?,?,?,?,?,?)", (seq, info.run_uid, part, "impl", r["id"], "1"))
         kept += 1
         for rid, _ in g.execute("SELECT id, slot_us FROM gk_impl WHERE part=? AND kkey=? ORDER BY slot_us",
                                 (part, kkey)).fetchall()[pol.impl_per_key:]:
@@ -1625,8 +1692,10 @@ def merge_knowledge_dir(store: GlobalStore, kdir, seed_dir=None, *, info: RunInf
         sd = Path(seed_dir)
         base_db = sd if sd.suffix == ".db" else sd / "knowledge.db"
         base_impl = (sd.parent if sd.suffix == ".db" else sd) / "impl"
+    sp = kdir.parent / "state.json"
     return merge_run(store, kdir / "knowledge.db", base_db, info=info, impl_dir=kdir / "impl",
-                     base_impl_dir=base_impl, policy=policy, review_path=kdir / "review.jsonl", label=label)
+                     base_impl_dir=base_impl, policy=policy, review_path=kdir / "review.jsonl", label=label,
+                     struct_path=sp if sp.exists() else None)
 
 
 def seed_meta(db_path) -> dict:
@@ -1696,11 +1765,46 @@ def main(argv: Optional[list] = None) -> int:
     m.add_argument("--source", default="run")
     m.add_argument("--label", default="")
     m.add_argument("--policy")
+    rf = sub.add_parser("refresh", help="build a mid-run refresh package for a running run (refresh.py)")
+    rf.add_argument("--part", help="default: the run db's gk_seed partition")
+    rf.add_argument("--out", required=True)
+    rf.add_argument("--run-db", help="the run's latest pulled knowledge.db: its run uid, partition and sync point")
+    rf.add_argument("--run-uid")
+    rf.add_argument("--problem")
+    rf.add_argument("--since-snapshot")
+    rf.add_argument("--since-seq", type=int)
+    rf.add_argument("--policy")
+    im = sub.add_parser("import", help="apply a refresh package to a knowledge dir (node side, at a round boundary)")
+    im.add_argument("--kdir", required=True)
+    im.add_argument("--pkg", required=True)
     r = sub.add_parser("rollback")
     r.add_argument("version")
     r.add_argument("--reason", default="")
     p = sub.add_parser("prune")
     p.add_argument("--keep", type=int, default=20)
+    co = sub.add_parser("consolidate", help="A5: merge near-duplicate claims into a new snapshot (consolidate.py)")
+    co.add_argument("--part")
+    co.add_argument("--threshold", type=float, default=0.35)
+    co.add_argument("--include-local", action="store_true")
+    co.add_argument("--dry-run", action="store_true")
+    co.add_argument("--llm", help="cheap model for borderline pairs through the relay (OPENAI_BASE_URL)")
+    co.add_argument("--llm-low", type=float, default=0.2)
+    co.add_argument("--llm-max-pairs", type=int, default=100)
+    co.add_argument("--label", default="consolidate")
+    pb = sub.add_parser("pool-build", help="A5: build implementation pools (current + gk_impl + run impl dirs)")
+    pb.add_argument("--part", required=True)
+    pb.add_argument("--impl", nargs="*", default=[], help="run impl dirs (results/*/work/knowledge/impl)")
+    pb.add_argument("--no-gk-impl", action="store_true")
+    pb.add_argument("--policy")
+    pb.add_argument("--label", default="pool bootstrap")
+    si = sub.add_parser("struct-ingest", help="A5: structural decisions of ModelBlaster work dirs -> gk_struct")
+    si.add_argument("--part", required=True)
+    si.add_argument("--work", nargs="+", required=True)
+    si.add_argument("--label", default="struct bootstrap")
+    pr = sub.add_parser("prior", help="A5: structural-outcome prior (priors.StructPriors)")
+    pr.add_argument("kind")
+    pr.add_argument("context", nargs="?", default="")
+    pr.add_argument("--part")
     sh = sub.add_parser("show")
     sh.add_argument("kind", choices=["claims", "hypotheses", "states", "techniques"])
     sh.add_argument("--part")
@@ -1726,6 +1830,35 @@ def main(argv: Optional[list] = None) -> int:
             info = RunInfo(run_uid=uid, problem=a.problem or meta.get("problem"), attempt=a.attempt,
                            part=a.part or meta.get("part"), model=a.model, source=a.source)
             res = merge_knowledge_dir(st, kdir, a.base, info=info, policy=Policy.from_json(a.policy), label=a.label)
+        elif a.cmd == "refresh":
+            from .refresh import build_package, run_sync_point
+            sp = run_sync_point(a.run_db) if a.run_db else {}
+            seed = seed_meta(a.run_db) if a.run_db else {}
+            res = build_package(st, a.part or seed.get("part"), a.out, run_uid=a.run_uid or seed.get("run_uid"),
+                                problem=a.problem or seed.get("problem"),
+                                since_snapshot=a.since_snapshot or sp.get("snapshot"),
+                                since_seq=a.since_seq if a.since_seq is not None else sp.get("seq"),
+                                policy=Policy.from_json(a.policy))
+        elif a.cmd == "import":
+            from .refresh import import_package
+            res = import_package(a.kdir, a.pkg)
+        elif a.cmd == "consolidate":
+            from .consolidate import consolidate_store, relay_judge
+            judge = relay_judge(a.llm) if a.llm else None
+            res = consolidate_store(st, a.part, label=a.label, dry_run=a.dry_run, threshold=a.threshold,
+                                    include_local=a.include_local, judge=judge, llm_low=a.llm_low,
+                                    llm_max_pairs=a.llm_max_pairs)
+        elif a.cmd == "pool-build":
+            from .pool_store import build_from_runs
+            pol = Policy.from_json(a.policy)
+            pol.impl_pool = True
+            res = build_from_runs(st, a.part, a.impl, policy=pol, label=a.label, from_gk_impl=not a.no_gk_impl)
+        elif a.cmd == "struct-ingest":
+            from .priors import ingest_runs
+            res = ingest_runs(st, a.part, a.work, label=a.label)
+        elif a.cmd == "prior":
+            from .priors import StructPriors
+            res = StructPriors.load(st, part=a.part).prior(a.kind, a.context or None, a.part).to_dict()
         elif a.cmd == "rollback":
             res = st.rollback(a.version, reason=a.reason)
         elif a.cmd == "prune":

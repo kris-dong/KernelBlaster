@@ -96,8 +96,30 @@ TECHNIQUES: dict[str, list[tuple[str, str]]] = {
     "data_movement": [
         ("index_math_hoisting", "Precompute strides/divisions; use fewer integer divides per element."),
     ],
+    # sequence recurrences (gru_seq / lstm_seq) with ModelBlaster --recurrent-class on: latency per timestep, not
+    # tiling or DRAM, bounds them (techniques/45_recurrent.json has the v2 entries)
+    "recurrent": [
+        ("persistent_recurrence_state_on_chip", "One persistent launch for all timesteps; each block keeps its W_hh "
+                                                "slice resident (registers as mma fragments, or smem) and its h slice "
+                                                "on chip; only the h exchange goes through L2."),
+        ("recurrence_input_projection_hoisting", "Compute X W_ih^T + b for all timesteps as one tensor-core GEMM "
+                                                 "(before or overlapped with the recurrence); each serial step only "
+                                                 "does h W_hh^T + gates."),
+        ("step_sync_minimization", "Replace grid-wide barriers by point-to-point readiness: publish h_t slices as "
+                                   "tagged {value, step} words (release store), readers poll only what they need "
+                                   "(acquire load); replicate the exchange buffer for coalesced reads."),
+        ("layer_wavefront_pipeline", "Use few blocks per recurrence (size the grid with mb_sm_budget() when present) "
+                                     "so concurrent siblings (other direction / layer) fit beside it; overlap "
+                                     "independent recurrences."),
+        ("recurrent_gate_fast_math", "Gate math is on the serial critical path: __expf / tanh.approx.f32, one "
+                                     "(batch, unit) per thread, fp32 accumulation."),
+    ],
     "attention": [
         ("flash_style_tiling", "Tile Q/K/V through shared memory with an online softmax so the score matrix is never materialised."),
+        ("eliminate_composite_intermediates", "If the seed is a COMPOSITE (copies + bmm + softmax + bmm called back to "
+                                              "back with a workspace), replace it by one kernel: read q/k/v in place "
+                                              "through their strides, keep scores in registers, write O through its "
+                                              "strides; drop the workspace."),
     ],
 }
 
@@ -161,6 +183,9 @@ def _op_cost(problem: SlotProblem, op: dict) -> tuple[float, float]:
     elif slot.op_class == "attention":
         s, d = sh.get("S", 1), sh.get("D", 1)
         flops = 4.0 * sh.get("BH", 1) * s * s * d
+    elif slot.op_class == "recurrent":                  # G gates x (input + hidden) GEMV per step and batch row
+        g = 4 if "lstm" in slot.op else 3
+        flops = 2.0 * sh.get("T", 1) * sh.get("B", 1) * g * sh.get("H", 1) * (sh.get("I", 0) + sh.get("H", 1))
     return byt, flops
 
 
@@ -179,15 +204,22 @@ def slot_state(problem: SlotProblem, sid: str, slot_us: float, arch: str,
     pb, pf = gbs / peak_b, gfs / peak_f
     ai = fl / max(byt, 1.0)
     ridge = peak_f / peak_b
+    rec = problem.slots[sid].op_class == "recurrent"
     if slot_us < 8.0:
+        state = "latency_bound"
+    elif rec and max(pb, pf) < 0.5:                     # T dependent steps: per-step latency bounds it
         state = "latency_bound"
     elif max(pb, pf) < 0.15:
         state = "underutilized_compute" if ai > ridge else "underutilized_memory"
     else:
         state = "compute_bound" if pf >= pb else "memory_bound"
-    return state, {"bytes": byt, "flops": fl, "arith_intensity": round(ai, 2),
-                   "achieved_GBps": round(gbs, 1), "achieved_GFLOPs": round(gfs, 1),
-                   "pct_peak_bw": round(100 * pb, 1), "pct_peak_flops": round(100 * pf, 1)}
+    nums = {"bytes": byt, "flops": fl, "arith_intensity": round(ai, 2),
+            "achieved_GBps": round(gbs, 1), "achieved_GFLOPs": round(gfs, 1),
+            "pct_peak_bw": round(100 * pb, 1), "pct_peak_flops": round(100 * pf, 1)}
+    if rec:
+        steps = sum(int(primary_shape(i.get("shape", {})).get("T", 1)) for i in problem.slots[sid].instances)
+        nums.update(serial_steps=steps, us_per_step=round(slot_us / max(steps, 1), 3))
+    return state, nums
 
 
 # ---------------------------------------------------------------- KernelSpec proposals
@@ -472,6 +504,7 @@ def build_codegen_messages(*, problem: SlotProblem, sid: str, source: str, techn
         profile_text,
         best_note,
         f"C reference implementation (semantics oracle, not fast):\n```c\n{ref[:4000]}\n```" if ref else "",
+        hw_profile.recurrent_text(arch) if slot.op_class == "recurrent" and tp.name == "cuda" else "",
     ]
     if neighbours:
         parts.append("Neighbouring slots (read-only, for context):\n" + "\n".join(
@@ -643,6 +676,91 @@ class StepLog:
     e2e_after: Optional[float] = None                # ... with the candidate (paired: before x ratio)
 
 
+def _sf(s, k):
+    return s.get(k) if isinstance(s, dict) else getattr(s, k, None)
+
+
+def patience_trigger(steps: list, patience: int) -> Optional[dict]:
+    """E7 patience rule (l3_farm/analysis/efficiency_rules.md) over committed steps in commit order
+    (``steps_log`` order: across the parallel rollouts, as each step committed).
+
+    A step sets a *new best* iff its status is ``improved`` and its ``slot_us_after`` is below the running best
+    of its slot; the running best starts at the slot's time the rollouts started from (``slot_us_before`` of the
+    slot's first committed step-0 step, else of its first committed step) -- exactly the replay's definition
+    (e7_build.py / e7_analyze.py). Every other committed step is a *miss*: neutral, regressed, an improved step
+    that does not beat the best, and compile / run / wrong-output failures after their fix attempts (a step with
+    its fix attempts is one step). Steps that raised (not in the log) do not count. -> {"trigger_commit": n
+    (1-based commit number of the ``patience``-th consecutive miss), "misses": patience} or None."""
+    if not patience or patience <= 0:
+        return None
+    base: dict = {}
+    for s in steps:                                   # slot baselines: first step-0 commit, else first commit
+        sid = _sf(s, "slot")
+        if _sf(s, "step") in (0, "0") and sid not in base and _sf(s, "slot_us_before") is not None:
+            base[sid] = float(_sf(s, "slot_us_before"))
+    for s in steps:
+        sid = _sf(s, "slot")
+        if sid not in base and _sf(s, "slot_us_before") is not None:
+            base[sid] = float(_sf(s, "slot_us_before"))
+    best, miss = dict(base), 0
+    for i, s in enumerate(steps):
+        sid, after = _sf(s, "slot"), _sf(s, "slot_us_after")
+        after = float(after) if after not in (None, "") else None
+        if _sf(s, "status") == IMPROVED and after is not None and after < best.get(sid, float("inf")):
+            best[sid], miss = after, 0
+        else:
+            miss += 1
+            if miss >= patience:
+                return {"trigger_commit": i + 1, "misses": miss}
+    return None
+
+
+# ---- rollout acceptance and lineage (ModelBlaster search fixes, l3_farm/analysis/search_fixes.md item 4)
+# KERNELBLASTER_MULTISLOT_ROLLOUT_ACCEPT:
+#   composite (default): a step's decision uses g = min(gain over the rollout's own state, confirmed gain over the
+#             composite best): a rollout that lags the composite cannot keep an improvement that does not beat it.
+#   local:    status / reward / keep use the gain over the rollout's own state, so the rollout continues from its own
+#             improvement (its lineage); merging into the composite still needs the confirmed composite gain (promotion
+#             = the existing confirm + merge when the lineage overtakes the composite).
+#   lineage:  local, plus resync (default factor 1.5): see should_resync.
+# KERNELBLASTER_MULTISLOT_ROLLOUT_RESYNC=X (0 / unset = off, except lineage): before a step, a rollout whose own
+#   state is more than X times slower end to end than the composite best AND whose previous step did not improve its
+#   own state (stalled) restarts from the composite best. Patience (E7) is unchanged: it counts committed steps that
+#   set no new SLOT BEST, so a local lineage improvement that does not beat the best is a miss.
+ROLLOUT_MODES = ("composite", "local", "lineage")
+LINEAGE_RESYNC = 1.5
+
+
+def rollout_mode() -> str:
+    m = (os.getenv("KERNELBLASTER_MULTISLOT_ROLLOUT_ACCEPT") or "composite").strip().lower()
+    return m if m in ROLLOUT_MODES else "composite"
+
+
+def rollout_resync_factor(mode: Optional[str] = None) -> float:
+    v = os.getenv("KERNELBLASTER_MULTISLOT_ROLLOUT_RESYNC")
+    if v not in (None, ""):
+        try:
+            return max(0.0, float(v))
+        except ValueError:
+            return 0.0
+    return LINEAGE_RESYNC if (mode or rollout_mode()) == "lineage" else 0.0
+
+
+def rollout_decision(gain: Optional[float], g: float, acc: float, mode: str = "composite") -> tuple:
+    """(gr, status, keep) of a verified candidate: ``gain`` = gain over the rollout's own state (None: unpaired),
+    ``g`` = min(gain, confirmed composite gain) as measured (= gain when no confirm ran), ``acc`` = the accept
+    fraction. composite decides on g; local / lineage on the rollout's own gain."""
+    gr = gain if (mode in ("local", "lineage") and gain is not None) else g
+    status = IMPROVED if gr >= acc else REGRESSED if gr <= -acc else NEUTRAL
+    return gr, status, gr > -acc / 2
+
+
+def should_resync(state_e2e: Optional[float], comp_e2e: Optional[float], factor: float, stalled: bool) -> bool:
+    """Restart a rollout from the composite best: its state lags the composite by more than ``factor`` x end to end
+    and its last step did not improve its own state."""
+    return bool(factor and factor > 0 and stalled and state_e2e and comp_e2e and state_e2e > comp_e2e * factor)
+
+
 class MultiSlotAgent:
     def __init__(self, problem: SlotProblem, evaluator: Evaluator, *, model: str, out_dir: Path,
                  arch: str = "75", impl_store: Optional[ImplStore] = None,
@@ -653,8 +771,13 @@ class MultiSlotAgent:
                  problem_id: Optional[str] = None, propose: bool = True, ncu: str = "off",
                  knowledge_v2: Any = None, router: Optional[ModelRouter] = None, reward: Optional[str] = None,
                  e2e_accept_pct: Optional[float] = None, journal: Any = None,
-                 stop_event: Optional[asyncio.Event] = None, on_checkpoint: Any = None):
+                 stop_event: Optional[asyncio.Event] = None, on_checkpoint: Any = None,
+                 stop_patience: int = 0):
         self.p, self.ev, self.model = problem, evaluator, model
+        # E7 patience (patience_trigger): stop starting steps after this many consecutive committed steps
+        # without a new slot best; 0 = off (the class default; run_multislot.py defaults to 8, --efficiency-rules)
+        self.stop_patience = max(0, int(stop_patience or 0))
+        self.patience_stop: Optional[dict] = None
         # what a step is rewarded and accepted on: "e2e" (default; KERNELBLASTER_MULTISLOT_REWARD):
         # the deployed partition time (CUDA graph where capturable), paired with the incumbent
         # where the evaluator can; "slot": the changed slot's own time, as before
@@ -832,9 +955,35 @@ class MultiSlotAgent:
         if self.store is None:
             return {"seed": None, "adapt": None, "examples": []}
         s = self.p.slots[sid]
+        # A5 (opt-in): KERNELBLASTER_IMPL_SIMILAR=K adds pool-based similarity retrieval (ImplStore.retrieve similar_k)
+        k_sim = int(os.environ.get("KERNELBLASTER_IMPL_SIMILAR", "0") or 0)
         return self.store.retrieve(target=self.p.target, arch=self.arch_label, op=s.op, op_class=s.op_class,
                                    signature=s.signature, shapes=s.shapes(), exclude_problem=self.problem_id,
-                                   dtype=self.p.dtype)
+                                   dtype=self.p.dtype, **({"similar_k": k_sim} if k_sim > 0 else {}))
+
+    def _impl_links_text(self, sid: str, r: dict) -> str:
+        """A5 (opt-in, KERNELBLASTER_IMPL_LINKS=1): claims / hypotheses / negative results linked to the retrieved
+        and current implementations (knowledge/impl_links.py), capped at KERNELBLASTER_IMPL_LINKS_CHARS (600)."""
+        if os.environ.get("KERNELBLASTER_IMPL_LINKS", "0") in ("", "0", "off") or self.kv is None:
+            return ""
+        try:
+            from ..knowledge.impl_links import ImplLinks
+            lk = getattr(self, "_impl_links", None)
+            if lk is None or time.time() - lk.built > 60:
+                lk = self._impl_links = ImplLinks.from_db(self.kv.root / "knowledge.db")
+            ids, labels = [], {}
+            for tag, rec in (("current best", self.best[sid] if sid in self.best else None), ("adapt", r.get("adapt"))):
+                iid = getattr(rec, "impl_id", None) or getattr(rec, "id", None)
+                if iid:
+                    ids.append(iid)
+                    labels[iid] = tag
+            for e in r.get("examples") or []:
+                ids.append(e.id)
+                labels.setdefault(e.id, "example")
+            return lk.render(ids, labels=labels,
+                             max_chars=int(os.environ.get("KERNELBLASTER_IMPL_LINKS_CHARS", "600") or 600))
+        except Exception:                                   # noqa: BLE001 -- knowledge must never block a step
+            return ""
 
     async def _llm(self, messages, model, role: str = "codegen", key: Optional[str] = None,
                    digest: Optional[str] = None, extra: Optional[dict] = None) -> str:
@@ -973,6 +1122,14 @@ class MultiSlotAgent:
     async def initialize(self) -> EvalResult:
         seeds = self.p.seed_sources()
         base = await self.ev.evaluate(self.p, seeds, "baseline")
+        if not base.ok and "MB_CONC_DEADLOCK" in (base.log or "") + base.error_text():
+            # ModelBlaster --graph-concurrency: the seeds' concurrent CUDA-graph branches hung (driver watchdog);
+            # this problem's runs launch sequentially from here on (recorded in result.json)
+            from ..knowledge import slots as _slots
+            _slots.PROBLEM_DRIVER_ENV[str(self.p.root)] = {"MB_CONCURRENCY": "0"}
+            self.concurrency_fallback = "deadlock at baseline: sequential launches"
+            self.log.warning(f"[{self.p.name}] {self.concurrency_fallback}")
+            base = await self.ev.evaluate(self.p, seeds, "baseline_sequential")
         if not base.ok:
             raise RuntimeError(f"baseline failed ({base.stage}): {base.error_text()}")
         self.baseline = base
@@ -1022,12 +1179,58 @@ class MultiSlotAgent:
                     for sid in taken:
                         self.best[sid] = SlotBest(seeds[sid], self._slot_us(base, sid) or 0.0, techniques=[],
                                                   event_us=base.slot_us.get(sid))
+        await self._seed_candidates(seeds, base)
         await self._profile(self._sources(), "baseline")
         for sid, b in self.best.items():
             if b.impl_id is None:
                 b.impl_id = self._store(sid, b.source, b.slot_us, None, [], None,
                                         base.slot_checks.get(sid, {}).get("rel_err"), rid=self._rid("seed", sid))
         return base
+
+    async def _seed_candidates(self, seeds: dict, base: EvalResult) -> None:
+        """ModelBlaster ``--reuse-winners``: the problem's ``seed_candidates`` (verified kernels of the same op and
+        signature from sibling problems / the global store, for other shapes) are tried like store seeds: one run
+        per candidate rank, a slot takes one only if it passes its isolated check on this problem's shapes and is
+        faster; the seeded composite must not be slower end to end."""
+        cands = self.p.manifest.get("seed_candidates") or {}
+        cands = {sid: lst for sid, lst in cands.items() if sid in self.p.slots and lst}
+        if not cands:
+            return
+        taken = []
+        for r in range(max(len(v) for v in cands.values())):
+            trial, tried = self._sources(), {}
+            for sid, lst in cands.items():
+                if r < len(lst):
+                    try:
+                        trial[sid] = (self.p.root / lst[r]["file"]).read_text()
+                    except OSError:
+                        continue
+                    tried[sid] = lst[r]
+            if not tried:
+                continue
+            res = await self.ev.evaluate(self.p, trial, f"seed_candidates_{r}", **self._eval_kw(seeds))
+            for sid, c in tried.items():
+                ok = res.ok or res.slot_checks.get(sid, {}).get("ok", False)
+                us = self._slot_us(res, sid)
+                if ok and us is not None and us < self.best[sid].slot_us * 0.98:
+                    self.log.info(f"[{self.p.name}] {sid}: seed candidate {c.get('from')} {us:.1f} us "
+                                  f"(was {self.best[sid].slot_us:.1f})")
+                    self.best[sid] = SlotBest(trial[sid], us, None, ["reuse_seed"], event_us=res.slot_us.get(sid))
+                    taken.append(sid)
+        self.seed_candidates_taken = sorted(set(taken))
+        if taken and self.reward == "e2e":
+            comp = await self.ev.evaluate(self.p, self._sources(), "seed_candidates_composite", **self._eval_kw(seeds))
+            gain, _ = e2e_gain(comp, self.e2e_us or base.deployed_us)
+            if comp.ok and gain is not None and gain >= 0:
+                self._set_composite(comp)
+                if comp.partition_us:
+                    self.partition_us = min(self.partition_us, comp.partition_us)
+            else:
+                self.log.info(f"[{self.p.name}] seed candidates not faster end to end ({gain}); kept the seeds")
+                for sid in set(taken):
+                    self.best[sid] = SlotBest(seeds[sid], self._slot_us(base, sid) or 0.0, techniques=[],
+                                              event_us=base.slot_us.get(sid))
+                self.seed_candidates_taken = []
 
     def _set_composite(self, res: EvalResult) -> None:
         """A full run of the composite best: its deployed time and attribution."""
@@ -1144,6 +1347,9 @@ class MultiSlotAgent:
             tried = self.kv.already_tried(self.problem_id, sid)
         else:
             ktext, tried = self._knowledge(sid, state, tech)
+        ltext = self._impl_links_text(sid, r)
+        if ltext:
+            ktext = (ktext + "\n\n" + ltext) if ktext else ltext
         tel.lap("prompt.build")
         trace.step_input(slot=sid, technique=tech, source=cur[sid], state=state, choice_kind=getattr(choice, "kind", None))
         part_us = (meta.get("e2e") if e2e else None) or sum(cur_us.values())
@@ -1318,7 +1524,62 @@ class MultiSlotAgent:
         self.log.info(f"[{self.p.name}] r{ridx} s{step}: {sid} {tech} -> {status}"
                       + (f" {before:.1f}->{after:.1f} us" if after else "") + f" (fixes={fixes})")
         tel.count("step")                      # completed steps (a step replayed after a kill counts once)
+        self._check_patience()
         self._step_done(ridx, step, cur, cur_us, meta)
+
+    def _check_patience(self, announce: bool = True) -> None:
+        """E7 patience: once ``stop_patience`` consecutive committed steps set no new slot best, no rollout
+        starts another step (in-flight ones finish and commit). Sticky; recomputed from the steps log on resume."""
+        if not self.stop_patience or self.patience_stop is not None:
+            return
+        trig = patience_trigger(self.steps_log, self.stop_patience)
+        if trig is None:
+            return
+        planned = self.rollouts * self.steps
+        inflight = max(len(self._inflight) - 1, 0)       # the committing step is still in _inflight here
+        self.patience_stop = {**trig, "patience": self.stop_patience, "steps_planned": planned,
+                              "inflight_at_trigger": inflight}
+        if not announce:                                  # restored from the journal: logged when it happened
+            return
+        self.log.info(f"[{self.p.name}] efficiency: patience {self.stop_patience} reached at commit "
+                      f"{trig['trigger_commit']} of {planned} planned steps ({trig['misses']} committed steps "
+                      f"without a new slot best); no new steps, {inflight} in flight finish")
+        tel.emit({"t": "efficiency", "ts": time.time(), "problem": self.problem_id, "rule": "patience",
+                  **self.patience_stop})
+
+    def _external_stop(self) -> bool:
+        """``<out>/mb_stop.json`` (written by ModelBlaster's graph search when a mid-run graph decision removes this
+        problem's ops from the graph): no rollout starts another step; in-flight steps finish. Sticky; absent = no
+        effect."""
+        if getattr(self, "external_stop", None) is not None:
+            return True
+        f = self.out / "mb_stop.json"
+        if not f.exists():
+            return False
+        try:
+            why = json.loads(f.read_text())
+        except (OSError, ValueError):
+            why = {}
+        self.external_stop = {"commit": len(self.steps_log), **(why if isinstance(why, dict) else {})}
+        self.log.info(f"[{self.p.name}] external stop at commit {len(self.steps_log)}: {str(why)[:200]}; no new steps")
+        tel.emit({"t": "efficiency", "ts": time.time(), "problem": self.problem_id, "rule": "external",
+                  **self.external_stop})
+        return True
+
+    def efficiency_info(self) -> dict:
+        """result.json ``efficiency``: the rule and, if it stopped the problem, where (E7-style attribution)."""
+        planned = self.rollouts * self.steps
+        n = len(self.steps_log)
+        out = {"stop_patience": self.stop_patience, "stopped": None, "steps_planned": planned,
+               "steps_committed": n, "steps_not_run": max(planned - n, 0)}
+        if self.patience_stop is not None:
+            tc = int(self.patience_stop["trigger_commit"])
+            out.update(stopped="patience", trigger_commit=tc, steps_after_trigger=max(n - tc, 0),
+                       inflight_at_trigger=self.patience_stop.get("inflight_at_trigger"))
+        if getattr(self, "external_stop", None) is not None:
+            out["external_stop"] = self.external_stop
+            out["stopped"] = out["stopped"] or "external"
+        return out
 
     def _capture_defect(self, res: Optional[EvalResult]) -> Optional[str]:
         """The fix-loop error text when a verified candidate made the partition fall back
@@ -1368,13 +1629,20 @@ class MultiSlotAgent:
                     after = max(after or 0.0, self._slot_us(res2, sid) or 0.0) or after
             ctx.update(confirm_ok=res2.ok, confirm_gain=None if gain_c is None else round(gain_c, 5),
                        confirm_us=res2.deployed_us if res2.ok else None)
-        reward = max(-1.0, min(1.0, g))
-        status = IMPROVED if g >= acc else REGRESSED if g <= -acc else NEUTRAL
+        # KERNELBLASTER_MULTISLOT_ROLLOUT_ACCEPT=local|lineage (ModelBlaster --reuse-winners / --rollout-accept): a
+        # rollout keeps a verified gain over its own state even when it does not beat the composite best (that still
+        # decides the merge below); default "composite": g = min(own gain, confirmed gain vs the composite), so a
+        # lagging rollout cannot climb (rollout_decision)
+        mode = rollout_mode()
+        gr, status, keep = rollout_decision(gain, g, acc, mode)
+        if mode != "composite" and gain is not None:
+            ctx["rollout_accept"] = mode
+        reward = max(-1.0, min(1.0, gr))
         e2e_after = res.deployed_us
         if how == "paired" and meta.get("e2e"):
             e2e_after = meta["e2e"] * (1.0 - (gain or 0.0))     # on the scale of the state's own time
         out.update(after=after, speedup=(before / after) if after else None, status=status, reward=reward,
-                   keep=g > -acc / 2, e2e_after=e2e_after,
+                   keep=keep, e2e_after=e2e_after,
                    merged=bool(res2 is not None and res2.ok and gain_c is not None and gain_c >= acc and g >= acc),
                    res2=res2)
         # the per-slot rule on the same runs (what the previous reward would have done)
@@ -1421,6 +1689,12 @@ class MultiSlotAgent:
         for step in range(first, self.steps):
             if self.stopping:                       # SIGTERM / SIGINT: no new steps
                 break
+            if self.patience_stop is not None:      # E7 patience: no new steps (in-flight ones finish)
+                break
+            if self._external_stop():               # ModelBlaster graph search: the slot's ops were fused away
+                break
+            if step > 0:
+                self._maybe_resync(ridx, step, cur, cur_us, meta)
             try:
                 await self._step(ridx, step, cur, cur_us, meta)
             except asyncio.CancelledError:
@@ -1441,6 +1715,32 @@ class MultiSlotAgent:
                     await self.kv.maybe_upkeep()
                 except Exception as e:
                     self.log.warning(f"knowledge-v2 upkeep failed: {e!r}")
+
+    def _maybe_resync(self, ridx: int, step: int, cur: dict, cur_us: dict, meta: dict) -> None:
+        """Lineage resync (should_resync): a stalled rollout lagging the composite restarts from it (in place: the
+        step code holds these dicts). Deterministic from the steps log, so a resumed rollout decides alike."""
+        factor = rollout_resync_factor()
+        if not factor or self.reward != "e2e":
+            return
+        mine = [x for x in self.steps_log if x.rollout == ridx and x.step < step]
+        stalled = bool(mine) and mine[-1].status != IMPROVED
+        if not should_resync(meta.get("e2e"), self.e2e_us, factor, stalled):
+            return
+        was = meta.get("e2e")
+        cur.clear()
+        cur.update({s: b.source for s, b in self.best.items()})
+        cur_us.clear()
+        cur_us.update({s: b.slot_us for s, b in self.best.items()})
+        meta.clear()
+        meta.update({"e2e": self.e2e_us, "ev": {s: b.event_us for s, b in self.best.items()}})
+        ev = {"rollout": ridx, "before_step": step, "state_e2e": was, "composite_e2e": self.e2e_us,
+              "factor": factor}
+        if not hasattr(self, "resyncs"):
+            self.resyncs = []
+        self.resyncs.append(ev)
+        self.log.info(f"[{self.p.name}] r{ridx} s{step}: lineage resync ({was:.1f} us > {factor} x composite "
+                      f"{self.e2e_us:.1f} us after a non-improving step)")
+        tel.emit({"t": "rollout_resync", "ts": time.time(), "problem": self.problem_id, **ev})
 
     # ---- resume (agents/journal.py)
     @property
@@ -1506,6 +1806,7 @@ class MultiSlotAgent:
             "phase": self.phase, "problem": self.p.name, "problem_id": self.problem_id, "problem_hash": self._phash,
             "run_id": self.run_id, "segment": self.segment, "segments": self.segments,
             "steps": self.steps, "rollouts": self.rollouts,
+            "stop_patience": self.stop_patience, "patience_stop": self.patience_stop,
             "baseline": self._er(self.baseline), "partition_us": self.partition_us, "e2e_us": self.e2e_us,
             "last_full": self._er(self.last_full), "runtime_info": self.runtime_info,
             "composite_version": getattr(self, "composite_version", 0),
@@ -1558,6 +1859,14 @@ class MultiSlotAgent:
                                  "cur_us": x["cur_us"], "meta": x["meta"]}
                         for r, x in st.get("rollout_state", {}).items()}
         self._replay = dict(st.get("inflight", {}))
+        # the patience the problem was started with wins (a resume never changes it silently); a journal from
+        # before the rule (no key) keeps whatever the run resolved (run_multislot.py: off for a legacy out dir)
+        if "stop_patience" in st and int(st.get("stop_patience") or 0) != self.stop_patience:
+            self.log.warning(f"[{self.p.name}] resume: keeping the journal's stop_patience "
+                             f"{st.get('stop_patience')} (this run asked for {self.stop_patience})")
+            self.stop_patience = int(st.get("stop_patience") or 0)
+        self.patience_stop = None
+        self._check_patience(announce=False)
         kc = st.get("kv_counters")
         if kc and self.kv is not None:
             for k, v in kc.items():
@@ -1749,6 +2058,11 @@ class MultiSlotAgent:
                             "launches": final.attr_slot_launches.get(sid)}
                       for sid, b in self.best.items()},
             "steps": [asdict(s) for s in self.steps_log],
+            # E7 rules (efficiency_rules.md): patience and, if it fired, at which commit
+            "efficiency": self.efficiency_info(),
+            # rollout acceptance / lineage (search fixes item 4): mode, resync factor, resync events
+            "rollout_accept": {"mode": rollout_mode(), "resync": rollout_resync_factor(),
+                               "resyncs": getattr(self, "resyncs", [])},
             "bandit": self.bandit.to_json(),
             # segments of a resumed run (journal); llm_replayed: responses reused, not paid again
             "resume": {"segments": len(getattr(self, "segments", []) or [None]), "llm_replayed": self.llm_replayed,

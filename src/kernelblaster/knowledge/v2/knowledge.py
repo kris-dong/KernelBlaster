@@ -78,6 +78,7 @@ class KnowledgeV2:
         self.explore_frac, self.ucb_c = explore_frac, ucb_c
         self.upkeep_every, self.max_new_hyp = upkeep_every, max_new_hypotheses
         self._seed()
+        self._seed_recurrent()
         self._load_scopes()
         self.hierarchy = self._load_hierarchy()
         self.ontology = self._load_ontology()
@@ -115,6 +116,21 @@ class KnowledgeV2:
                 self.db.put("techniques", t.id, t.to_dict())
         self.db.set_meta("legacy_state_map", legacy)
         self.db.set_meta("seed_version", SEED_VERSION)
+
+    def _seed_recurrent(self) -> None:
+        """Add seed techniques gated ONLY to the opt-in ``recurrent`` op class (techniques/45_recurrent.json) to
+        stores seeded before they existed. Rows already present are never touched, and these techniques apply
+        only to slots of class ``recurrent`` (ModelBlaster ``--recurrent-class on``), so stores used without
+        that flag behave exactly as before."""
+        have = {d["id"] for d in self.db.techniques()}
+        try:
+            from .ontology import load_seed_techniques
+            seeds = load_seed_techniques()
+        except Exception:                                       # pragma: no cover - seed files missing
+            return
+        for d in seeds:
+            if d["id"] not in have and d.get("op_classes") and set(d["op_classes"]) <= {"recurrent"}:
+                self.db.put("techniques", d["id"], Technique.from_dict(d).to_dict())
 
     def _seed_mined(self) -> None:
         """Fold ``mined.json`` (scripts/mine_knowledge.py) in once: its outcomes become statistics

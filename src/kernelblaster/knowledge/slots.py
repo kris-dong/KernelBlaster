@@ -82,6 +82,9 @@ class SlotProblem:
                 reference_path=(self.root / s["reference_file"]) if s.get("reference_file") else None,
                 instances=s.get("instances", []), seed_source=s.get("seed_source", "hand"))
         self.order: list[str] = m["assembly"]["order"]
+        # concurrent instances of one slot (ModelBlaster --graph-concurrency): lane k > 0 is the slot's source again,
+        # in namespace <prefix><id>__lane<k>, so each instance has its own static state
+        self.lanes: dict[str, int] = {k: int(v) for k, v in (m["assembly"].get("lanes") or {}).items()}
         self.driver_path = self._local_driver(self.root / m["driver"], self.root / m["data"])
 
     @staticmethod
@@ -111,6 +114,8 @@ class SlotProblem:
         parts = [(self.root / asm["head"]).read_text()]
         for sid in self.order:
             parts.append(wrap_slot(sid, sources[sid], prefix))
+            for ln in range(1, self.lanes.get(sid, 1)):
+                parts.append(wrap_slot(f"{sid}__lane{ln}", sources[sid], prefix))
         parts.append((self.root / asm["tail"]).read_text())
         return "\n".join(parts)
 
@@ -130,7 +135,10 @@ class SlotProblem:
         head = (self.root / asm["head"]).read_text()
         out = [(f"slot_{sid}.cu", "\n".join([head, wrap_slot(sid, sources[sid], prefix)]))
                for sid in self.order]
-        decls = "".join(f"namespace {prefix}{sid} {{ {self.slots[sid].signature}; }}\n" for sid in self.order)
+        out += [(f"slot_{sid}__lane{ln}.cu", "\n".join([head, wrap_slot(f"{sid}__lane{ln}", sources[sid], prefix)]))
+                for sid in self.order for ln in range(1, self.lanes.get(sid, 1))]
+        decls = "".join(f"namespace {prefix}{x} {{ {self.slots[sid].signature}; }}\n" for sid in self.order
+                        for x in [sid] + [f"{sid}__lane{ln}" for ln in range(1, self.lanes.get(sid, 1))])
         out.append(("walker_tail.cu", "\n".join([head, decls, (self.root / asm["tail"]).read_text()])))
         return out
 
@@ -357,6 +365,8 @@ def _env_on(name: str, default: str) -> bool:
 # driver variables added to every run of this process (``time_problems.py --driver-env``,
 # e.g. MB_WALL=1 for ModelBlaster's comparison against PyTorch); empty in the agent loop
 EXTRA_DRIVER_ENV: dict = {}
+# per problem (its root dir): e.g. MB_CONCURRENCY=0 after its concurrent CUDA-graph branches hung at the baseline
+PROBLEM_DRIVER_ENV: dict = {}
 
 
 def driver_env(only_slots=None, screen: bool = False) -> dict:
@@ -610,8 +620,9 @@ class LocalEvaluator(Evaluator):
         """Extra flags for the driver TU: CUPTI's headers (per-op attribution)."""
         return cupti_flags(self.nvcc)
 
-    def _run_env(self, only_slots=None, screen: bool = False) -> dict:
-        return {**driver_env(only_slots, screen), **({"MB_GRAPH": "1"} if getattr(self, "graph", False) else {})}
+    def _run_env(self, only_slots=None, screen: bool = False, problem=None) -> dict:
+        return {**driver_env(only_slots, screen), **({"MB_GRAPH": "1"} if getattr(self, "graph", False) else {}),
+                **(PROBLEM_DRIVER_ENV.get(str(problem.root), {}) if problem is not None else {})}
 
     def _build_cache(self, problem):
         from ..servers.utils.build_cache import BuildCache
@@ -781,7 +792,7 @@ class LocalEvaluator(Evaluator):
             bad = await self._build(problem, sources, work)
             if bad is not None:
                 return bad
-            text = await self._timed_run(problem, work / "problem", self._run_env(only_slots, screen))
+            text = await self._timed_run(problem, work / "problem", self._run_env(only_slots, screen, problem))
             if text is None:
                 return EvalResult(ok=False, stage="run",
                                   errors=[self._timeout_error((_RUNINFO.get() or {}).get("limit"))])
@@ -916,8 +927,9 @@ class LocalEvaluator(Evaluator):
             _log().warning(f"{problem.name}: {self._host_off[str(problem.root)]}; one process per run")
             return None
 
-    def _host_vars(self, only_slots, screen) -> dict:
-        return {**driver_env(only_slots, screen), "MB_GRAPH": "1"}
+    def _host_vars(self, only_slots, screen, problem=None) -> dict:
+        return {**driver_env(only_slots, screen), "MB_GRAPH": "1",
+                **(PROBLEM_DRIVER_ENV.get(str(problem.root), {}) if problem is not None else {})}
 
     async def _evaluate_host(self, problem, sources, tag, only_slots, screen, incumbent) -> Optional[EvalResult]:
         """One request to the problem's host; None to fall back to one process per run."""
@@ -934,7 +946,7 @@ class LocalEvaluator(Evaluator):
                 ref, rbad = await self._build_so(problem, incumbent, work / "incumbent")
                 if rbad is not None:
                     _log().warning(f"{problem.name}: incumbent does not build as a shared object; unpaired run")
-            rep = await self._host_request(problem, exe, so, ref, self._host_vars(only_slots, screen))
+            rep = await self._host_request(problem, exe, so, ref, self._host_vars(only_slots, screen, problem))
             if rep is None:
                 return None
             return self._host_result(problem, rep)

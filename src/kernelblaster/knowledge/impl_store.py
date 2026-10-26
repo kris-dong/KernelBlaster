@@ -42,6 +42,7 @@ _BUCKET_KEYS = {
     "gemm": ("M", "N", "K", "batch"),
     "conv": ("N", "IC", "OC", "OH", "OW", "KH", "KW", "G"),
     "attention": ("BH", "S", "D"),
+    "recurrent": ("T", "B", "I", "H"),          # gru_seq / lstm_seq with ModelBlaster --recurrent-class on
 }
 
 
@@ -97,8 +98,25 @@ class ImplRecord:
     ts: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds"))
 
 
+_FIELDS = None
+
+
+def _record(d: dict) -> ImplRecord:
+    """An index line -> ImplRecord; keys this version does not know (newer writers) are dropped."""
+    global _FIELDS
+    if _FIELDS is None:
+        from dataclasses import fields
+        _FIELDS = {f.name for f in fields(ImplRecord)}
+    return ImplRecord(**{k: v for k, v in d.items() if k in _FIELDS})
+
+
 class ImplStore:
-    """``<root>/index.jsonl`` + ``<root>/code/<sha>.cu``. Append-only; thread-safe."""
+    """``<root>/index.jsonl`` + ``<root>/code/<sha>.cu``. Append-only; thread-safe.
+
+    Optional (A5, additive): ``<root>/pool/obs.jsonl`` (cross-shape observations) and ``pool/kernels.jsonl``
+    (kernel metadata: structural lineage, tunables, links) behind :meth:`pool`, :meth:`observe`,
+    :meth:`annotate`, :meth:`retrieve_similar`, :meth:`retrieve_structural`; ``retrieve(similar_k=0)`` is the
+    unchanged tier retrieval unless ``similar_k`` > 0. Stores without ``pool/`` load as before."""
 
     def __init__(self, root: Path):
         self.root = Path(root)
@@ -124,7 +142,7 @@ class ImplStore:
         out = []
         for line in self.index_path.read_text().splitlines():
             if line.strip():
-                out.append(ImplRecord(**json.loads(line)))
+                out.append(_record(json.loads(line)))
         return out
 
     def code(self, rec: ImplRecord) -> str:
@@ -135,12 +153,32 @@ class ImplStore:
 
     def retrieve(self, *, target: str, arch: str, op: str, op_class: str, signature: str,
                  shapes: list, n_examples: int = 2, exclude_problem: Optional[str] = None,
-                 far_same_op: bool = False, dtype: str = "fp32") -> dict:
+                 far_same_op: bool = False, dtype: str = "fp32", similar_k: int = 0) -> dict:
         """-> {"seed": rec|None, "adapt": rec|None, "examples": [rec, ...]}
 
         ``exclude_problem`` drops the asking problem's own records: during a
         run they are its current state, and its baseline seeds would
-        otherwise always win the exact tier and hide other problems' work."""
+        otherwise always win the exact tier and hide other problems' work.
+
+        ``similar_k`` > 0 (opt-in) also returns ``"similar"``: :meth:`retrieve_similar`'s top k (pool-based
+        nearest-shape / cross-shape ranking), and when neither the seed nor the adapt tier found anything,
+        its top record becomes ``adapt`` (``adapt_from: "similar"``). 0 = the unchanged tiers."""
+        out = self._retrieve_tiers(target=target, arch=arch, op=op, op_class=op_class, signature=signature,
+                                   shapes=shapes, n_examples=n_examples, exclude_problem=exclude_problem,
+                                   far_same_op=far_same_op, dtype=dtype)
+        if similar_k and similar_k > 0:
+            sim = self.retrieve_similar(target=target, arch=arch, op=op, signature=signature, shapes=shapes,
+                                        k=similar_k, exclude_problem=exclude_problem, dtype=dtype)
+            out["similar"] = sim
+            recs = [x["record"] for x in sim if isinstance(x["record"], ImplRecord)]
+            if out["seed"] is None and out["adapt"] is None and recs:
+                out["adapt"] = recs[0]                    # an index record (callers read .shapes / code(rec))
+                out["adapt_from"] = "similar"
+        return out
+
+    def _retrieve_tiers(self, *, target: str, arch: str, op: str, op_class: str, signature: str,
+                        shapes: list, n_examples: int = 2, exclude_problem: Optional[str] = None,
+                        far_same_op: bool = False, dtype: str = "fp32") -> dict:
         sig = signature_sha(signature)
         want = {shape_bucket(op_class, s) for s in shapes}
         recs = [r for r in self.records() if r.target == target and r.dtype == dtype
@@ -190,3 +228,221 @@ class ImplStore:
             rows.append({**asdict(r), "file": f"code/{r.code_sha}.cu"})
         (out / "winners.json").write_text(json.dumps({"format": "kb-winners/1", "winners": rows}, indent=1))
         return out / "winners.json"
+
+    # ------------------------------------------------------------------ pool / similarity (A5, opt-in)
+    @property
+    def pool_dir(self) -> Path:
+        return self.root / "pool"
+
+    def _jsonl(self, name: str) -> list:
+        p = self.pool_dir / name
+        if not p.exists():
+            return []
+        out = []
+        for line in p.read_text(errors="replace").splitlines():
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                continue
+        return out
+
+    def _append(self, name: str, row: dict) -> None:
+        self.pool_dir.mkdir(parents=True, exist_ok=True)
+        with self._lock, open(self.pool_dir / name, "a") as f:
+            f.write(json.dumps(row, sort_keys=True) + "\n")
+
+    def _put_code(self, code: str) -> str:
+        sha = hashlib.sha1(code.encode()).hexdigest()
+        p = self.root / "code" / f"{sha}.cu"
+        if not p.exists():
+            p.write_text(code)
+        return sha
+
+    def code_by_sha(self, code_sha: str) -> Optional[str]:
+        p = self.root / "code" / f"{code_sha}.cu"
+        return p.read_text() if p.exists() else None
+
+    def observe(self, op: str, signature_sha_: str, arch: str, dtype: str, code_sha: Optional[str], shape: dict,
+                us: Optional[float] = None, ok: bool = True, *, config=None, err: Optional[str] = None,
+                src: str = "measured", problem: Optional[str] = None, code: Optional[str] = None,
+                target: str = "cuda") -> dict:
+        """Record one cross-shape measurement of a kernel (e.g. kb_reuse's matrix runs, the family tuner):
+        appended to ``pool/obs.jsonl``; ``code`` (optional) is stored content-addressed."""
+        from .impl_pool import pool_key, shape_key
+        if code is not None:
+            code_sha = self._put_code(code)
+        if not code_sha:
+            raise ValueError("observe needs code_sha or code")
+        row = {"pkey": pool_key(op, signature_sha_, arch, dtype, target), "op": op, "signature_sha": signature_sha_,
+               "arch": arch, "dtype": dtype or "fp32", "target": target, "code_sha": code_sha, "shape": shape,
+               "skey": shape_key(shape), "us": us, "ok": bool(ok), "config": config, "err": (err or None) and str(err)[:300],
+               "src": src, "problem": problem,
+               "ts": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+        self._append("obs.jsonl", row)
+        return row
+
+    def annotate(self, op: str, signature_sha_: str, arch: str, dtype: str, code_sha: str, *,
+                 target: str = "cuda", **meta) -> dict:
+        """Kernel metadata (structural lineage ``lineage={...}``, ``tunables``, links, ``kind`` ...): appended to
+        ``pool/kernels.jsonl``; later lines update earlier ones."""
+        from .impl_pool import pool_key
+        row = {"pkey": pool_key(op, signature_sha_, arch, dtype, target), "op": op, "signature_sha": signature_sha_,
+               "arch": arch, "dtype": dtype or "fp32", "target": target, "code_sha": code_sha, "meta": meta}
+        self._append("kernels.jsonl", row)
+        return row
+
+    def pool(self, op: str, signature_sha_: str, arch: str, dtype: str = "fp32", *, target: str = "cuda",
+             exclude_problem: Optional[str] = None, with_code: bool = False, records: Optional[list] = None):
+        """The :class:`~kernelblaster.knowledge.impl_pool.Pool` of (op, signature, arch, dtype): this store's
+        verified records (each a measurement on its own shapes) + ``pool/kernels.jsonl`` kernels (e.g. seeded
+        from the global pool) + ``pool/obs.jsonl`` observations. ``signature_sha_`` may also be a full
+        signature. ``exclude_problem`` drops that problem's records and observations."""
+        from .impl_pool import Pool, kernel_id, pool_key
+        if "(" in signature_sha_ or len(signature_sha_) != 12:
+            signature_sha_ = signature_sha(signature_sha_)
+        pk = pool_key(op, signature_sha_, arch, dtype, target)
+        recs = records if records is not None else self.records()
+        p = Pool(op, signature_sha_, arch, dtype, target)
+        for r in recs:
+            if (r.op, r.signature_sha, r.arch, r.dtype or "fp32", r.target) != (op, signature_sha_, arch, dtype or "fp32", target):
+                continue
+            if exclude_problem is not None and r.problem_id == exclude_problem:
+                continue
+            p.add_kernel(r.code_sha, record=asdict(r), code=self.code_by_sha(r.code_sha) if with_code else None)
+        for row in self._jsonl("kernels.jsonl"):
+            if row.get("pkey") != pk:
+                continue
+            meta = dict(row.get("meta") or {})
+            if exclude_problem is not None and exclude_problem in (meta.get("problems") or []) and \
+                    len(meta.get("problems") or []) == 1:
+                continue
+            obs = meta.pop("obs", None)                 # a seeded global pool kernel carries its cells
+            kid = p.add_kernel(row["code_sha"], code=self.code_by_sha(row["code_sha"]) if with_code else None,
+                               **{k: v for k, v in meta.items() if k not in ("records", "validated", "set_us", "code_sha",
+                                                                              "problems")})
+            k = p.kernels[kid]
+            for f in ("records", "problems"):
+                for x in meta.get(f) or []:
+                    if x not in k[f]:
+                        k[f].append(x)
+            for sk, c in (obs or {}).items():
+                shape = json.loads(sk)
+                for _ in range(max(int(c.get("n_fail", 0)), 0)):
+                    p.observe(kid, shape, ok=False, src=c.get("src", "global"), err=c.get("err"))
+                if c.get("ok", True):
+                    p.observe(kid, shape, us=c.get("us"), ok=True, src=c.get("src", "global"), config=c.get("config"))
+        for row in self._jsonl("obs.jsonl"):
+            if row.get("pkey") != pk or (exclude_problem is not None and row.get("problem") == exclude_problem):
+                continue
+            kid = kernel_id(row["code_sha"])
+            if kid not in p.kernels:
+                p.add_kernel(row["code_sha"], code=self.code_by_sha(row["code_sha"]) if with_code else None)
+            p.observe(kid, row["shape"], us=row.get("us"), ok=row.get("ok", True), src=row.get("src", "measured"),
+                      config=row.get("config"), err=row.get("err"))
+        return p
+
+    def retrieve_similar(self, *, target: str = "cuda", arch: str, op: str, shapes: list,
+                         signature: Optional[str] = None, sig_sha: Optional[str] = None, op_class: Optional[str] = None,
+                         k: int = 4, exclude_problem: Optional[str] = None, dtype: str = "fp32",
+                         query_code: Optional[str] = None, w_src: float = 0.0, profile: Optional[dict] = None,
+                         w_prof: float = 0.0, profiles: Optional[dict] = None, links=None, **rank_kw) -> list:
+        """Pool-based ranking of this op+signature's kernels for ``shapes`` (all instances of the slot):
+        measured cells on the very shapes first, then predicted slowdown from nearby shapes (see
+        ``impl_pool.rank_kernels``; several shapes: mean log ratio). -> [{record, kernel, pred_ratio, score, why}]
+        (one record per kernel: its fastest per instance; ``record`` is an ImplRecord when the kernel has one
+        in this store's index, else a dict). ``links`` (an ``ImplLinks``) adds negative evidence: kernels with
+        failed / regressed outcomes on these shape buckets are pushed down."""
+        import math as _m
+        from .impl_pool import rank_kernels
+        sig = sig_sha or signature_sha(signature or "")
+        recs = self.records()
+        p = self.pool(op, sig, arch, dtype, target=target, exclude_problem=exclude_problem,
+                      with_code=bool(query_code and w_src), records=recs)
+        if not p.kernels or not shapes:
+            return []
+        agg: dict = {}
+        for s in shapes:
+            for x in rank_kernels(p, s, query_code=query_code, w_src=w_src, profile=profile, w_prof=w_prof,
+                                  profiles=profiles, **rank_kw):
+                a = agg.setdefault(x["kernel"], {"lr": 0.0, "score": 0.0, "why": x["why"]})
+                a["lr"] += _m.log(x["pred_ratio"]) / len(shapes)
+                a["score"] += x["score"] / len(shapes)
+        if links is not None:
+            for kid, a in agg.items():
+                pen = links.penalty(p.kernels[kid], shapes=shapes)
+                if pen:
+                    a["score"] += pen
+                    a["why"] += f"; negative evidence +{pen:.2f}"
+        by_kid: dict = {}
+        for r in recs:
+            if (r.op, r.signature_sha, r.arch, r.dtype or "fp32") != (op, sig, arch, dtype or "fp32"):
+                continue
+            if exclude_problem is not None and r.problem_id == exclude_problem:
+                continue
+            kid = r.code_sha[:16]
+            per = r.slot_us / max(len(r.shapes), 1)
+            if kid not in by_kid or per < by_kid[kid][0]:
+                by_kid[kid] = (per, r)
+        ranked = sorted(agg.items(), key=lambda kv: (kv[1]["score"], kv[0]))[:max(0, int(k))]
+        out = []
+        for kid, a in ranked:
+            km = p.kernels[kid]
+            rec = by_kid.get(kid, (None, None))[1]
+            if rec is None:
+                rec = {"code_sha": km["code_sha"], "op": op, "signature_sha": sig, "arch": arch, "dtype": dtype,
+                       "shapes": [p.shapes[s] for s in km["validated"][:4] if s in p.shapes], "id": f"pool:{kid}",
+                       "problem_id": (km.get("problems") or [None])[-1], "techniques": km.get("techniques") or []}
+            out.append({"record": rec, "kernel": kid, "pred_ratio": round(_m.exp(a["lr"]), 4),
+                        "score": round(a["score"], 4), "why": a["why"], "kind": km.get("kind"),
+                        "tunables": bool(km.get("tunables"))})
+        return out
+
+    def lineage(self, rec_id: str, records: Optional[list] = None, limit: int = 64) -> list:
+        """The record's ancestors in this store, oldest first, ending with the record (parent_id chain; a fused
+        kernel's chain starts at its composite seed)."""
+        by = {r.id: r for r in (records if records is not None else self.records())}
+        chain, cur, seen = [], by.get(rec_id), set()
+        while cur is not None and cur.id not in seen and len(chain) < limit:
+            chain.append(cur)
+            seen.add(cur.id)
+            cur = by.get(cur.parent_id) if cur.parent_id else None
+        return list(reversed(chain))
+
+    def retrieve_structural(self, *, target: str = "cuda", arch: str, op: str, shapes: list,
+                            signature: Optional[str] = None, dtype: str = "fp32", k: int = 3,
+                            exclude_problem: Optional[str] = None) -> dict:
+        """Structural (fused / sibling / attention / layout) kernels as first-class records:
+        ``same`` (this op, :meth:`retrieve_similar`), ``composition`` (other ops with the same stage composition,
+        e.g. another fusion argument tag, best per op), ``stages`` (per stage op: the best records -- the
+        ingredients of a composite seed), ``lineage`` (the top same-op record's chain back to its seed)."""
+        from .impl_pool import struct_info
+        info = struct_info(op)
+        recs = [r for r in self.records() if r.target == target and (r.dtype or "fp32") == (dtype or "fp32")
+                and (exclude_problem is None or r.problem_id != exclude_problem)]
+        out = {"info": info, "same": [], "composition": [], "stages": {}, "lineage": []}
+        if signature is not None:
+            out["same"] = self.retrieve_similar(target=target, arch=arch, op=op, signature=signature, shapes=shapes,
+                                                k=k, exclude_problem=exclude_problem, dtype=dtype)
+        best_op: dict = {}
+        for r in recs:
+            if r.op == op or r.arch != arch or struct_info(r.op)["composition"] != info["composition"]:
+                continue
+            if r.op not in best_op or (r.speedup_vs_seed or 0) > (best_op[r.op].speedup_vs_seed or 0):
+                best_op[r.op] = r
+        out["composition"] = sorted(best_op.values(), key=lambda r: -(r.speedup_vs_seed or 0))[:k]
+        if info["kind"] in ("fused", "sibling") and len(info["stages"]) > 1:
+            from .impl_pool import shape_distance
+            tags = "abcdefghij"
+            for i, st in enumerate(info["stages"]):
+                want = [s.get(tags[i]) for s in shapes if isinstance(s.get(tags[i]), dict)] if shapes else []
+                cands = [r for r in recs if r.op == st and r.arch == arch]
+                def d(r):
+                    if not want or not r.shapes:
+                        return 0.0
+                    return min(shape_distance(w, x) for w in want for x in r.shapes)
+                cands.sort(key=lambda r: (round(d(r), 3), r.slot_us / max(len(r.shapes), 1)))
+                out["stages"][st] = cands[:k]
+        top = out["same"][0]["record"] if out["same"] else None
+        if top is not None and hasattr(top, "id"):
+            out["lineage"] = self.lineage(top.id, records=recs)
+        return out

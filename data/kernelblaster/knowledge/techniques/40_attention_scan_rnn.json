@@ -9,7 +9,7 @@
     "flash_attention",
     "fused_attention_block"
    ],
-   "mechanism": "tile Q/K/V through fast memory with an online softmax so the score matrix never round-trips through DRAM",
+   "mechanism": "tile Q/K/V through fast memory with an online softmax so the score matrix never round-trips through DRAM; a composite seed (copies + bmm + softmax + bmm with a workspace) is replaced by one kernel that reads q/k/v in place through their strides and writes O in its consumer layout",
    "predicts": {
     "bw_util": "down",
     "l1_hit": "up"
@@ -23,7 +23,9 @@
     "attention"
    ],
    "op_kinds": [
-    "sdpa"
+    "sdpa",
+    "attention",
+    "attention_f16"
    ],
    "slot": true,
    "prior": {
@@ -38,8 +40,13 @@
     {
      "scope": "target:cuda:sm_80+",
      "how": "As above with cp.async double-buffered K/V tiles and mma.sync for both products."
+    },
+    {
+     "scope": "target:cuda:sm_89",
+     "how": "FA2 on Ada: per CTA 64-128 query rows (4 warps, 16 rows each); Q tile in registers as mma A-fragments (ldmatrix), K/V tiles of 64 keys through cp.async double-buffered, swizzled smem; S = Q K^T with mma.sync.m16n8k16 (fp32 accum), row max / sum via 2 quad shuffles on the accumulator fragments, rescale O by exp(m_old - m_new), P converted to fp16 A-fragments in registers (no smem round trip), O += P V with ldmatrix.trans on V; causal: stop the key loop at the diagonal tile and mask only it; relu variant (act=1): no running max/sum, P = max(S,0); normalise once and store O through o_* strides."
     }
-   ]
+   ],
+   "preconditions": null
   },
   {
    "id": "blocked_scan",

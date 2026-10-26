@@ -16,6 +16,7 @@ the technique's ``predicts``.
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -158,9 +159,23 @@ def mechanism_from_delta(predicts: dict, measured_delta: dict) -> dict:
 
 
 def _kind_match(op_kind: str, kinds: list) -> bool:
-    """A fused slot (``fused__conv2d__relu``) matches when any of its stages is listed."""
+    """A fused slot (``fused__conv2d__relu``) matches when any of its stages is listed.
+
+    ``$KERNELBLASTER_KIND_MATCH=base`` (opt-in, A2): a stage also matches by its base kind without the dtype
+    suffix (``conv2d_f16`` matches a technique gated on ``conv2d``). By default the match is exact, so kind-gated
+    seed techniques (implicit_gemm, rnn_input_projection_hoisting, ...) never apply to ``_f16`` slots."""
     stages = op_kind.split("__")[1:] if op_kind.startswith("fused__") else [op_kind]
+    stages = [s for s in stages if s and s != "par"] or stages
+    if os.environ.get("KERNELBLASTER_KIND_MATCH", "exact").strip().lower() == "base":
+        stages = stages + [_base_kind(s) for s in stages]
     return any(k in kinds for k in stages)
+
+
+def _base_kind(kind: str) -> str:
+    for suffix in ("_f16", "_s8_pc", "_s8", "_i8"):
+        if kind.endswith(suffix):
+            return kind[: -len(suffix)]
+    return kind
 
 
 def load_seed_techniques(data_dir: Optional[Path] = None) -> list[dict]:
