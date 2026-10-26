@@ -414,6 +414,9 @@ def _runinfo(**kw) -> None:
         d.update(kw)
 
 
+# X-149 clock guard: the verdict of the GPU the current evaluate() call's run was leased on ({"verdict": ClockVerdict})
+_CLOCKV: contextvars.ContextVar = contextvars.ContextVar("kb_clock_verdict", default=None)
+
 EVAL_TIMEOUT_MODES = ("fixed", "adaptive")
 
 
@@ -588,6 +591,93 @@ class LocalEvaluator(Evaluator):
                                 f"compile jobs {self._jobs.describe()}")
         return self._pool
 
+    # ---- clock guard (X-149; knowledge/clock_guard.py; KERNELBLASTER_CLOCK_GUARD=1, default off)
+    async def _clock_run(self, device, cmd: str) -> Optional[str]:
+        """Run a short command on the GPU's host (here: a local shell); its output, None on failure."""
+        proc = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE,
+                                                     stderr=asyncio.subprocess.STDOUT)
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), 30)
+        except BaseException:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            return None
+        return out.decode(errors="replace") if proc.returncode == 0 else None
+
+    def _clock_obj(self):
+        from .clock_guard import ClockGuard
+
+        if getattr(self, "_clockg", None) is None:
+            self._clockg = ClockGuard()
+        return self._clockg
+
+    def clock_stats(self) -> Optional[dict]:
+        from .clock_guard import enabled
+
+        return self._clock_obj().stats() if enabled() else None
+
+    async def _clock_check(self, lease, phase: str):
+        dev = lease.device
+        try:
+            return await self._clock_obj().check(lambda cmd: self._clock_run(dev, cmd), ident=dev.ident, index=dev.index,
+                                                 phase=phase, key=dev.key, label=dev.label())
+        except Exception as e:                      # the guard must never break a run
+            _log().warning(f"clock guard on {dev.label()}: {type(e).__name__}: {e}")
+            return None
+
+    def _clock_flag(self, lease, v, where: str) -> None:
+        """Loud warning + the lease's quarantine (applied when it is released) for a suspect verdict."""
+        from .. import telemetry as tel
+
+        reason = "; ".join(v.reasons)
+        lease.clock_suspect, lease.quarantine_s = f"clock-suspect ({v.state}): {reason}", self._clock_obj().quarantine_s
+        tel.count("clock.suspect")
+        _log().warning(f"*** CLOCK GUARD: {lease.device.label()} {v.state.upper()} ({where}): {reason}. Timings on it are "
+                       f"marked clock-suspect; the GPU is quarantined for {lease.quarantine_s:.0f}s. The flow never resets "
+                       f"clocks: on the node `sudo rusu reset-gpu -i {lease.device.index if lease.device.index is not None else '<id>'}` "
+                       f"(or release the allocation); see analysis/ncu_clock_guard.md")
+
+    async def _clock_gate(self, pool, lease, group, can_skip: bool) -> bool:
+        """Before a timed step on the leased GPU: False = do not time here (it is suspect and another device exists:
+        the caller re-times on that one); True = go (guard off / clean / no alternative: the result is flagged)."""
+        from . import clock_guard as cg
+
+        if not cg.enabled():
+            return True
+        v = await self._clock_check(lease, "pre")
+        if v is None:
+            return True
+        cv = _CLOCKV.get()
+        if cv is not None:
+            cv["verdict"] = v
+        if v.suspect:
+            self._clock_flag(lease, v, "before a timed step")
+            if can_skip and pool.healthy_others(lease.device, group):
+                from .. import telemetry as tel
+
+                tel.count("clock.retime")
+                _log().warning(f"clock guard: re-timing on another GPU instead of {lease.device.label()}")
+                return False
+        elif v.state == cg.OK:
+            pool.unquarantine(lease.device)
+        return True
+
+    async def _clock_post(self, lease, text: Optional[str], prefix: str) -> None:
+        """Right after an ncu run that timed out or failed: query the GPU (always) and quarantine it if suspect."""
+        from . import clock_guard as cg
+
+        if not prefix or not cg.enabled():
+            return
+        from .ncu import ncu_error
+
+        if text is not None and ncu_error(text) is None and "==ERROR==" not in text:
+            return
+        v = await self._clock_check(lease, "post_ncu")
+        if v is not None and v.suspect:
+            self._clock_flag(lease, v, "after an ncu " + ("timeout" if text is None else "failure"))
+
     async def _timed_run(self, problem, exe: Path, env: Optional[dict] = None, prefix: str = "") -> Optional[str]:
         """``_run`` on a leased GPU; an infrastructure failure (device or link
         down, not the candidate) is retried on another device."""
@@ -598,7 +688,11 @@ class LocalEvaluator(Evaluator):
         for attempt in range(self.infra_retries + 1):
             async with pool.lease(str(problem.root), avoid) as lease:
                 _leased(lease.device)
+                if not await self._clock_gate(pool, lease, str(problem.root), attempt < self.infra_retries):
+                    avoid.add(lease.device.key)
+                    continue
                 text = await self._run(exe, env, prefix, device=lease.device, problem=problem)
+                await self._clock_post(lease, text, prefix)
                 lease.infra_error = text is not None and is_infra_failure(text) and \
                     not re.search(r"^passed$", text, re.M)
             if not lease.infra_error:
@@ -815,10 +909,14 @@ class LocalEvaluator(Evaluator):
         tok = _LEASED.set(None)
         info: dict = {}
         tok2 = _RUNINFO.set(info)
+        cvd: dict = {}
+        tok3 = _CLOCKV.set(cvd)
         try:
             res = await self._evaluate(problem, sources, tag, only_slots, screen, incumbent)
             if res is not None and res.gpu is None:
                 res.gpu = self.gpu_info(_LEASED.get())
+            if res is not None and cvd.get("verdict") is not None:      # X-149: the clocks of the GPU it was timed on
+                res.gpu = {**(res.gpu or {}), "clock": cvd["verdict"].to_dict()}
             if res is not None and res.ok:
                 if res.eval_wall_s is None and info.get("wall") is not None:
                     res.eval_wall_s = round(info["wall"], 3)
@@ -828,6 +926,7 @@ class LocalEvaluator(Evaluator):
         finally:
             _LEASED.reset(tok)
             _RUNINFO.reset(tok2)
+            _CLOCKV.reset(tok3)
 
     async def _evaluate(self, problem, sources, tag, only_slots, screen, incumbent):
         if self._use_host(problem):
@@ -1033,6 +1132,9 @@ class LocalEvaluator(Evaluator):
             async with pool.lease(str(problem.root), avoid) as lease:
                 dev = lease.device
                 _leased(dev)
+                if not await self._clock_gate(pool, lease, str(problem.root), attempt < self.infra_retries):
+                    avoid.add(dev.key)
+                    continue
                 key = (str(problem.root), dev.key, str(exe))
                 h = await self._hosts.get(key, dev.key, lambda: HostClient(
                     [str(exe)], env=host_env(dev.env()), label=f"{problem.name}@{dev.label()}",
@@ -1054,6 +1156,7 @@ class LocalEvaluator(Evaluator):
     def host_stats(self) -> dict:
         return {"runtime": self.runtime, **self._hosts.stats.to_json(),
                 "fallbacks": {Path(k).name: v for k, v in self._host_off.items()},
+                **({"clock_guard": self.clock_stats()} if self.clock_stats() else {}),
                 **({"build_cache": self._cache.stats()} if self._cache is not None and self._shared_cache is not None
                    else {})}
 
@@ -1190,6 +1293,12 @@ class SSHEvaluator(RemoteBuildMixin, LocalEvaluator):
         if not devs:
             raise NoDevice(f"no usable GPU on {', '.join(self.hosts)}")
         return devs
+
+    async def _clock_run(self, device, cmd: str) -> Optional[str]:
+        """The clock guard's nvidia-smi query, over the existing ssh path to the device's host."""
+        host = device.host if device is not None and device.host else self.host
+        rc, out = await self._sh(self.ssh, *self._ssh_base(), host, cmd, timeout=40)
+        return out if rc == 0 else None
 
     def _stage_dir(self, host: str) -> str:
         """This evaluator's own directory on ``host`` for what it stages."""
@@ -1555,8 +1664,11 @@ class SSHEvaluator(RemoteBuildMixin, LocalEvaluator):
                 run_env = {**(env or {}), **({"MB_DATA_PATH": data} if data else {})}
                 async with pool.lease(group, host=host) as lease:
                     _leased(lease.device)
+                    if not await self._clock_gate(pool, lease, group, attempt < self.infra_retries):
+                        continue                          # suspect GPU quarantined on release; another one next
                     text = await self._exec_staged(host, name, basis, run_env, prefix, device=lease.device,
                                                    problem=problem)
+                    await self._clock_post(lease, text, prefix)
                     missing = self._data_missing(text, data)
                     lease.infra_error = missing or (text is not None and is_infra_failure(text) and
                                                     not re.search(r"^passed$", text, re.M))
@@ -1662,6 +1774,8 @@ class SSHEvaluator(RemoteBuildMixin, LocalEvaluator):
             async with pool.lease(group, host=host) as lease:
                 dev = lease.device
                 _leased(dev)
+                if not await self._clock_gate(pool, lease, group, attempt < self.infra_retries):
+                    continue
                 key = (group, dev.key, hname)
                 # the host maps data.bin once at start-up: MB_DATA_PATH is the process's
                 envs = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in

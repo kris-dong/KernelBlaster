@@ -54,6 +54,17 @@ _SMEM = ("Launch Statistics", "Static Shared Memory Per Block")
 _WAVES = ("Launch Statistics", "Waves Per SM")
 
 
+#: ncu's ``--clock-control`` for the profiled kernels: ``base`` (ncu's default: it locks the GPU to base clocks and
+#: restores them on a clean exit; a timeout / SIGKILL leaves them locked, X-144 / X-149) or ``none``.
+#: ``KERNELBLASTER_NCU_CLOCK_CONTROL=base|none`` (ModelBlaster ``--ncu-clock-control``).
+DEFAULT_CLOCK_CONTROL = "base"
+
+
+def ncu_clock_control() -> str:
+    v = os.getenv("KERNELBLASTER_NCU_CLOCK_CONTROL", "").strip().lower()
+    return v if v in ("base", "none") else DEFAULT_CLOCK_CONTROL
+
+
 def ncu_command(*, prefix: str = "mbslot_", slot: Optional[str] = None, slots=None,
                 launch_count: int = 256) -> str:
     """ncu prefix for ``MB_MODE=profile <exe>``: every slot, just ``slot``, or
@@ -68,8 +79,11 @@ def ncu_command(*, prefix: str = "mbslot_", slot: Optional[str] = None, slots=No
     secs = " ".join(f"--section={s}" for s in SECTIONS)
     if os.getenv("KB_NCU_ACCESS_METRICS", "1").lower() not in ("0", "false", "no", "off"):
         secs += " --metrics " + ",".join(ACCESS_METRICS)
-    return (f"ncu --kernel-name-base demangled --print-kernel-base mangled -k regex:'{rx}' "
-            f"--launch-count {launch_count} --page details {secs} --csv")
+    cmd = (f"ncu --kernel-name-base demangled --print-kernel-base mangled -k regex:'{rx}' "
+           f"--launch-count {launch_count} --page details {secs} --csv")
+    if ncu_clock_control() == "none":        # X-149; "base" (ncu's own default) adds nothing: the command is unchanged
+        cmd += " --clock-control none"
+    return cmd
 
 
 def ncu_error(text: str) -> Optional[str]:
