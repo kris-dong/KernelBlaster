@@ -24,6 +24,7 @@ escalates; comma-separated, applied in order, the first that fires is logged):
     share:X       the slot is >= X (0..1) of the partition time
     explore       a v2 hypothesis (an untested idea) rather than a known technique
     fix-escalate  the last fix attempt goes to codegen_hard (a fix rule)
+    fix-follow    a fix goes to the model that wrote the kernel (a fix rule; before fix-escalate)
     always / never
 
 Default policy: ``category,fix-escalate``. When every role names the same
@@ -65,7 +66,7 @@ class Rule:
     @classmethod
     def parse(cls, s: str) -> "Rule":
         kind, _, arg = s.strip().partition(":")
-        if kind not in ("category", "stall", "share", "explore", "fix-escalate", "always", "never"):
+        if kind not in ("category", "stall", "share", "explore", "fix-escalate", "fix-follow", "always", "never"):
             raise ValueError(f"unknown heterogeneity rule {s!r}")
         if kind in ("stall", "share"):
             if not arg:
@@ -132,10 +133,13 @@ class ModelRouter:
                 return self.models["codegen_hard"], "codegen_hard", why
         return self.models["codegen_simple"], "codegen_simple", "default"
 
-    def fix(self, *, attempt: int, max_attempts: int) -> tuple[str, str]:
-        """-> (model, role) for fix attempt ``attempt`` (1-based)."""
+    def fix(self, *, attempt: int, max_attempts: int, writer: Optional[str] = None) -> tuple[str, str]:
+        """-> (model, role) for fix attempt ``attempt`` (1-based). ``writer`` is the model that wrote the kernel
+        being fixed (used by the ``fix-follow`` rule; None = the fix role's model)."""
         if attempt >= max_attempts and any(r.kind == "fix-escalate" for r in self.policy):
             return self.models["codegen_hard"], "fix_escalated"
+        if writer and any(r.kind == "fix-follow" for r in self.policy):
+            return writer, "fix_escalated" if writer == self.models["codegen_hard"] != self.models["fix"] else "fix"
         return self.models["fix"], "fix"
 
     def describe(self) -> dict:

@@ -51,6 +51,8 @@ from ..knowledge.outcomes import (COMPILE_ERROR, IMPROVED, NEUTRAL, REGRESSED, R
                                   OutcomeLog, OutcomeRecord, classify_speedup)
 from ..knowledge.slots import EvalResult, Evaluator, SlotProblem, step_eval_options
 from . import hw_profile
+from . import experiment_tool
+from ..knowledge.v2 import experiments
 from .cost_tracker import lookup_pricing
 from .model_router import ModelRouter, technique_tier
 from .utils import generate_code_retry
@@ -505,6 +507,7 @@ def build_codegen_messages(*, problem: SlotProblem, sid: str, source: str, techn
         best_note,
         f"C reference implementation (semantics oracle, not fast):\n```c\n{ref[:4000]}\n```" if ref else "",
         hw_profile.recurrent_text(arch) if slot.op_class == "recurrent" and tp.name == "cuda" else "",
+        experiment_tool.model_context_text(problem.manifest),     # ModelBlaster --model-context (absent: "")
     ]
     if neighbours:
         parts.append("Neighbouring slots (read-only, for context):\n" + "\n".join(
@@ -1014,6 +1017,85 @@ class MultiSlotAgent:
         self._count_usage(u, model, role, key)
         return text
 
+    async def _multiturn(self, msgs, model, role, jkey, sid, tech, extra=None) -> str:
+        """One codegen step as a bounded conversation with the experiment tool (agents/experiment_tool.py)."""
+        if getattr(self, "_xtool", None) is None:
+            self._xtool = experiment_tool.ExperimentTool(self.ev, self.p, self.arch, self.out / "experiments")
+            self.mt_stats = {"steps": 0, "turns": 0, "runs": 0, "refused": 0, "compile_failed": 0, "seconds": 0.0,
+                             "forced_final": 0, "budget": experiment_tool.budget()}
+        b = experiment_tool.budget()
+
+        async def llm(conv, key, extra=None):
+            return await self._llm(conv, model, role, key=key, extra=extra)
+        rec_on = experiments.record_enabled()                  # X-145 (default off)
+        xtext, fact_ids = self._experiment_prompt(sid, tech) if rec_on or experiments.prompt_n() else ("", [])
+        kw = {"record": True, "extra_prompt": xtext} if (rec_on or xtext) else {}
+        text, log = await experiment_tool.converse(llm, msgs, self._xtool, b, key=f"{jkey}c0", extra=extra, **kw)
+        st = self.mt_stats
+        st["steps"] += 1
+        for k in ("turns", "runs", "refused", "compile_failed"):
+            st[k] += getattr(log, k)
+        st["seconds"] = round(st["seconds"] + log.seconds, 2)
+        st["forced_final"] += int(log.forced_final)
+        with open(self.out / "multiturn.jsonl", "a") as f:
+            f.write(json.dumps({"key": jkey, "slot": sid, "technique": tech, **log.to_json()}) + "\n")
+        if rec_on:
+            try:
+                sl = self.p.slots[sid]
+                self._exp_recorder().record_step(
+                    jkey, log, slot=sid, technique=tech, op=sl.op, op_class=sl.op_class,
+                    shape_bucket=shape_bucket(sl.op_class, sl.shapes()[0] if sl.instances else {}),
+                    model=model, role=role, rationale=log.rationale, extra_prompt=xtext, fact_ids=fact_ids)
+            except Exception as e:                              # noqa: BLE001 -- recording must never break a step
+                self.log.warning(f"experiment record failed: {e!r}")
+        return text
+
+    # ---- X-145 experiment recording (knowledge/v2/experiments.py); every method is a no-op with the flags off
+    def _exp_recorder(self):
+        rec = getattr(self, "_exp", None)
+        if rec is None:
+            rec = self._exp = experiments.ExperimentRecorder(self.out, run_id=self.run_id, problem=self.p.name,
+                                                             arch=self.arch_label, target=self.p.target,
+                                                             dtype=self.p.dtype)
+        return rec
+
+    def _experiment_prompt(self, sid: str, tech: str) -> tuple:
+        n = experiments.prompt_n()
+        if not n or self.kv is None:
+            return "", []
+        try:
+            return experiments.prompt_text(self.kv.claims, self.kv.root, arch=self.arch_label,
+                                           op_class=self.p.slots[sid].op_class, technique=tech, n=n)
+        except Exception:                                       # noqa: BLE001
+            return "", []
+
+    def _experiment_outcome(self, ridx, step, sid, seed_src, code, status, speedup, reward, d, before, after,
+                            impl_id, oid) -> None:
+        rec = getattr(self, "_exp", None)
+        if rec is None:
+            return
+        try:
+            key = f"r{ridx}s{step}"
+            ov = None
+            if code and rec.n_records:
+                progs = [experiments.load_program(r, rec.blobs) for r in experiments.read_jsonl(rec.path)
+                         if r.get("type") == "experiment" and r.get("step_key") == key and r.get("program_sha")]
+                progs = [p for p in progs if p]
+                if progs:
+                    ov = experiments.reference_overlap(seed_src, code, "\n".join(progs))
+            rec.record_outcome(key, status=status, speedup=speedup, reward=reward,
+                               e2e_gain=(d["ctx"].get("gain") if d is not None else None),
+                               slot_us_before=before, slot_us_after=after, impl_id=impl_id, outcome_id=oid, overlap=ov)
+            if experiments.ingest_enabled() and self.kv is not None:
+                gpu = None
+                try:
+                    gpu = {"name": getattr(self.ev, "gpu_name", None), "arch": self.arch_label}
+                except Exception:                               # noqa: BLE001
+                    pass
+                experiments.ingest(self.out, self.kv.root, self.kv.claims, gpu=gpu)
+        except Exception as e:                                  # noqa: BLE001 -- never break a committed step
+            self.log.warning(f"experiment outcome record failed: {e!r}")
+
     def _count_usage(self, u: dict, model: str, role: str, key: Optional[str]) -> None:
         if key is not None:
             self._counted.add(key)
@@ -1373,8 +1455,12 @@ class MultiSlotAgent:
             self._inflight[skey].update(model=model, role=role, why=why)
         # the plan goes with the response: a step killed before any checkpoint saw it is
         # resumed with the same slot / technique, so its journaled response still applies
-        text = await self._llm(msgs, model, role, key=f"{jkey}c0",
-                               extra={"plan": self._inflight.get(skey) or plan})
+        if experiment_tool.enabled():             # multi-turn codegen with the experiment tool (A2; default off)
+            text = await self._multiturn(msgs, model, role, jkey, sid, tech,
+                                         extra={"plan": self._inflight.get(skey) or plan})
+        else:
+            text = await self._llm(msgs, model, role, key=f"{jkey}c0",
+                                   extra={"plan": self._inflight.get(skey) or plan})
         tel.lap("candidate", technique=tech)
         code = extract_code(text)
         fix_models, capture_defects = [], []
@@ -1398,7 +1484,7 @@ class MultiSlotAgent:
                 break
             fixes += 1
             trace.attempt(fixes)
-            fmodel, frole = self.router.fix(attempt=fixes, max_attempts=self.max_fix)
+            fmodel, frole = self.router.fix(attempt=fixes, max_attempts=self.max_fix, writer=model)
             fix_models.append(fmodel)
             if capture:
                 capture_defects.append(res.graph_skip)
@@ -1450,6 +1536,7 @@ class MultiSlotAgent:
         if self.kv is None:
             self.bandit.update(key, tech, reward)
         impl_id, parent = None, self.best[sid].impl_id
+        cur_prev = cur[sid]                                     # the step's seed source (X-145 reference overlap)
         dsum = diff_summary(cur[sid], code) if code else None
         if res.ok:
             impl_id = self._store(sid, code, after, before, self.best[sid].techniques + [tech], parent,
@@ -1475,6 +1562,9 @@ class MultiSlotAgent:
         else:
             self.slot_stall[sid] += 1
         oid = self._rid("outcome", ridx, step)
+        if getattr(self, "_exp", None) is not None:             # X-145: the outcome of the step the experiments fed
+            self._experiment_outcome(ridx, step, sid, cur_prev, code, status, speedup, reward, d, before, after,
+                                     impl_id, oid)
         okw = dict(sid=sid, technique=tech, status=status, state_before=state, id=oid,
                    state_after=prof_after.get("state") if prof_after else None,
                    metric_before=before, metric_after=after, speedup=speedup,
@@ -2012,6 +2102,11 @@ class MultiSlotAgent:
         if self.kv is not None:
             result["knowledge"] = self.kv.summary()
             (self.out / "result.json").write_text(json.dumps(result, indent=1, default=str))
+        if getattr(self, "_exp", None) is not None and self.kv is not None and experiments.ingest_enabled():
+            try:                                              # X-145: final ingest, with the GPU of the result
+                experiments.ingest(self.out, self.kv.root, self.kv.claims, gpu=result.get("gpu"))
+            except Exception as e:                            # noqa: BLE001
+                self.log.warning(f"experiment ingest failed: {e!r}")
         if self.claims is not None and hasattr(self.claims, "save"):
             self.claims.save()
         self._checkpoint("done")
@@ -2030,6 +2125,8 @@ class MultiSlotAgent:
             "llm_calls": self.llm_calls,
             "llm_usage": {**self.llm_usage, "cost_usd": round(self.llm_usage["cost_usd"], 4)},
             "llm_usage_by_model": sorted(self.llm_usage_by.values(), key=lambda d: (d["role"], d["model"])),
+            **({"multiturn": self.mt_stats} if getattr(self, "mt_stats", None) else {}),
+            **({"experiments": self._exp.pointer()} if getattr(self, "_exp", None) is not None else {}),
             "ncu": {"mode": self.ncu, "runs": self.ncu_runs, "disabled": self.ncu_disabled,
                     "final": {sid: self._ncu_of(sid, b.source) for sid, b in self.best.items()
                               if self._ncu_of(sid, b.source)}},

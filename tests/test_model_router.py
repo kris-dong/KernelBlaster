@@ -87,3 +87,16 @@ def test_agent_routes_by_role(tmp_path):
     by = {(d["role"], d["model"]): d["calls"] for d in res["llm_usage_by_model"]}
     assert sum(by.values()) == res["llm_calls"] == len(calls)
     assert res["models"]["heterogeneous"] and res["models"]["policy"] == "category,fix-escalate"
+
+
+def test_fix_follow_writer():
+    """fix-follow: a fix goes to the model that wrote the kernel; fix-escalate still wins on the last attempt;
+    without the rule (or without a writer) the fix role is unchanged."""
+    m = {"codegen_simple": "S", "codegen_hard": "H", "fix": "F"}
+    r = ModelRouter(dict(m), parse_policy("category,stall:5,fix-follow,fix-escalate"))
+    assert r.fix(attempt=1, max_attempts=2, writer="H") == ("H", "fix_escalated")
+    assert r.fix(attempt=1, max_attempts=2, writer="S") == ("S", "fix")
+    assert r.fix(attempt=2, max_attempts=2, writer="S") == ("H", "fix_escalated")
+    assert r.fix(attempt=1, max_attempts=2) == ("F", "fix")
+    plain = ModelRouter(dict(m), parse_policy("category,fix-escalate"))
+    assert plain.fix(attempt=1, max_attempts=2, writer="H") == ("F", "fix")

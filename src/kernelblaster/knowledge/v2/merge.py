@@ -144,10 +144,14 @@ class Policy:
     # A5 (impl database / knowledge store), all off by default -- the defaults reproduce the behaviour above
     impl_pool: bool = False                  # merge: keep per (op, signature, arch, dtype) a pool + cross-shape matrix
     pool_max_kernels: int = 16               # pool retention cap (usefulness + diversity, impl_pool.Pool.retain)
-    pool_min_speedup: float = 1.0            # pool input: verified records at least this fast vs their seed
+    pool_min_speedup: float = 1.02           # pool input: verified records at least this fast vs their seed (as impl)
     seed_pool: bool = False                  # materialize: ship the partition's pools into impl/pool/
     struct_outcomes: bool = False            # merge: structural decisions (fusion / layout / attention) -> gk_struct
     seed_struct: bool = False                # materialize: write struct_priors.json (priors.StructPriors)
+    # X-145 (experiment recording), off by default -- no gk_experiments / gk_probes table, no experiment claims in seeds
+    experiments: bool = False                # merge: <kdir>/experiments/records.jsonl -> gk_experiments + gk_probes
+    seed_experiments: bool = False           # materialize: ship experiment claims + probes + slim records
+    max_experiments: int = 4000              # gk_experiments rows kept per partition (oldest dropped)
 
     @classmethod
     def from_json(cls, s) -> "Policy":
@@ -690,9 +694,12 @@ def materialize(store: GlobalStore, part: str, out_dir, *, problem: Optional[str
     os.replace(tmp, dst)
     if g is not None:
         man["impl"] = _seed_impl(store, vid, part, out / "impl")
-        if pol.seed_pool or pol.seed_struct:
+        if pol.seed_pool or pol.seed_struct or pol.seed_experiments:
             g2 = _connect(store.path(vid), ro=True)
             try:
+                if pol.seed_experiments:
+                    from .experiments import seed_experiments
+                    man["experiments"] = seed_experiments(g2, store, part, out)
                 if pol.seed_pool:
                     from .pool_store import seed_pool
                     man["pool"] = seed_pool(g2, store, part, out / "impl")
@@ -805,6 +812,8 @@ def _fill_seed(k: sqlite3.Connection, g: sqlite3.Connection, part: str, problem:
                 picked.append((float("-inf"), cid, d, pv, True))
                 continue
         elif status != ACTIVE:
+            continue
+        if d.get("kind") == "experiment" and not pol.seed_experiments:   # X-145: only with the seed flag
             continue
         picked.append((_rank(d, pv, seq, pol), cid, d, pv, False))
     active = _select_claims([x for x in picked if not x[4]], seq, pol)
@@ -1035,6 +1044,10 @@ def merge_run(store: GlobalStore, run_db, base_db=None, *, info: RunInfo, impl_d
                         from .pool_store import merge_pool
                         rep["pool"] = merge_pool(g, store, [impl_dir], base_impl_dir, part=part, pol=pol,
                                                  prov=info.prov(), exclude=imported_impl_ids(rc), problem=info.problem)
+                    if pol.experiments and impl_dir:
+                        from .experiments import merge_experiments
+                        rep["experiments"] = merge_experiments(g, store, Path(impl_dir).parent, info=info, part=part,
+                                                               seq=seq, pol=pol)
                     if pol.struct_outcomes and struct_path and Path(struct_path).exists():
                         from .priors import merge_struct
                         rep["struct"] = merge_struct(g, struct_path, part=part, run_uid=info.run_uid,
@@ -1379,6 +1392,9 @@ def _apply_delta(g, R: KDB, B: KDB, *, info: RunInfo, part: str, seq: int, pol: 
             dcon = int(d.get("contradict", 0)) - int(b.get("contradict", 0))
             gd = fold(gd, [i for i in d.get("support_ids", []) if i not in bsup],
                       [i for i in d.get("contradict_ids", []) if i not in bcon], dsup, dcon)
+            if d.get("kind") == "experiment":                      # X-145: observations by experiment id
+                from .experiments import merge_fact_data
+                gd["data"] = merge_fact_data(gd.get("data"), d.get("data"))
             for f in ("text", "level", "family", "target", "arch", "state", "op_class", "technique"):
                 if hops:                                           # evidence only: the survivor keeps its own text
                     break
@@ -1434,6 +1450,9 @@ def _apply_delta(g, R: KDB, B: KDB, *, info: RunInfo, part: str, seq: int, pol: 
         if dup is not None and d.get("status") == ACTIVE:
             gd, pv, _, bck = gclaims[dup[0]]
             gd = fold(dict(gd), sup_ids, d.get("contradict_ids", []), dsup, int(d.get("contradict", 0)))
+            if d.get("kind") == "experiment":
+                from .experiments import merge_fact_data
+                gd["data"] = merge_fact_data(gd.get("data"), d.get("data"))
             pv = _prov_add(pv, prov, seq)
             pv["last_evidence"] = seq
             put(dup[0], gd, pv, bck)

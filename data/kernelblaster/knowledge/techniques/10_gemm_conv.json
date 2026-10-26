@@ -283,7 +283,7 @@
    "realizations": [
     {
      "scope": "node:simt_gpu",
-     "how": "Pick the tile loader per operand from the unit stride: a_sk==1 row-major A tile, a_sm==1 transposed load; same for B (b_sn / b_sk) and the C store (c_sn / c_sm). The composite seed's strided_copy calls and their workspace are then deleted."
+     "how": "Pick the tile loader per operand from the unit stride: a_sk==1 row-major A tile, a_sm==1 transposed load; same for B (b_sn / b_sk) and the C store (c_sn / c_sm). The composite seed's strided_copy calls and their workspace are then deleted. The hand seed (kernel_bmm_strided_f16: 64x64x32 tiles, mma.sync m16n8k16 + ldmatrix, 16-byte loads along the unit stride when aligned, scalar for tails) already does this; go further with multi-stage global->shared buffering, bigger / per-shape tiles and vectorized C stores."
     },
     {
      "scope": "target:cuda:sm_80+",

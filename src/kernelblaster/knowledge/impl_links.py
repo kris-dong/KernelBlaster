@@ -52,6 +52,7 @@ class ImplLinks:
             for i in c.get("contradict_ids") or []:
                 self.cites[i].append((c["id"], "contradict"))
         self.built = time.time()
+        self.exp = None                                      # X-145: ExperimentLinks, attached by from_db when present
 
     # ---- loading
     @classmethod
@@ -79,9 +80,15 @@ class ImplLinks:
                     cls_.append(dict(json.loads(data), id=cid))
                 except (TypeError, ValueError):
                     continue
-            return cls(outs, cls_)
+            lk = cls(outs, cls_)
         finally:
             c.close()
+        try:                                                  # X-145: experiments that preceded each winner (if recorded)
+            from .v2.experiments import ExperimentLinks
+            lk.exp = ExperimentLinks.from_db(db_path, part=part)
+        except Exception:                                     # noqa: BLE001 -- optional
+            lk.exp = None
+        return lk
 
     # ---- queries
     def _claims_of(self, oids: Iterable, kinds: Optional[tuple] = None) -> list:
@@ -120,9 +127,14 @@ class ImplLinks:
                             "error": (rec.get("error") or "")[:160] or None,
                             "why": [c["text"] for c in self._claims_of([o], ("pitfall", "applicability"))][:1]})
         neg.sort(key=lambda x: (x["status"] == "regressed", x["speedup"] or 0))
-        return {"impl_id": impl_id, "produced_by": pb, "claims": self._claims_of(prod)[:k_claims],
-                "hypotheses": sorted({p["hypothesis_id"] for p in pb if p["hypothesis_id"]}),
-                "children": dict(counts), "negatives": neg[:k_neg]}
+        res = {"impl_id": impl_id, "produced_by": pb, "claims": self._claims_of(prod)[:k_claims],
+               "hypotheses": sorted({p["hypothesis_id"] for p in pb if p["hypothesis_id"]}),
+               "children": dict(counts), "negatives": neg[:k_neg]}
+        if self.exp is not None:                              # only with recorded experiments (X-145)
+            ex = self.exp.for_impl(impl_id)
+            if ex:
+                res["experiments"] = ex
+        return res
 
     def negatives(self, *, op_kind: Optional[str] = None, shape_bucket: Optional[str] = None, k: int = 5) -> list:
         """Failed / regressed outcomes of an op kind (optionally one shape bucket) with the claims explaining them."""
@@ -156,7 +168,7 @@ class ImplLinks:
         lines = []
         for iid in dict.fromkeys(i for i in impl_ids if i):
             L = self.links(iid, k_claims=2, k_neg=3)
-            if not (L["produced_by"] or L["claims"] or L["negatives"]):
+            if not (L["produced_by"] or L["claims"] or L["negatives"] or L.get("experiments")):
                 continue
             head = f"- impl {iid}" + (f" ({labels[iid]})" if labels and iid in labels else "")
             pb = L["produced_by"][0] if L["produced_by"] else None
@@ -167,6 +179,9 @@ class ImplLinks:
             lines.append(head)
             for c in L["claims"]:
                 lines.append(f"  lesson (+{c['support']}/-{c['contradict']}): {c['text'][:180]}")
+            for x in L.get("experiments") or []:
+                lines.append(f"  preceded by a {x.get('probe_kind')} experiment: "
+                             + (x.get("purpose") or ", ".join(x.get("measurements") or [])))
             ch = L["children"]
             if ch:
                 lines.append("  tried on top of it: " + ", ".join(f"{v} {k}" for k, v in sorted(ch.items())))
@@ -177,8 +192,10 @@ class ImplLinks:
         if not lines:
             return ""
         text = "Knowledge linked to these implementations (from earlier steps / runs):\n"
+        n = 0
         for ln in lines:
             if len(text) + len(ln) + 1 > max_chars:
                 break
             text += ln + "\n"
-        return text.rstrip()
+            n += 1
+        return text.rstrip() if n else ""
