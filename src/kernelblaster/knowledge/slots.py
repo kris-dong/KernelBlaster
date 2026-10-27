@@ -35,6 +35,9 @@ from .. import trace
 from .remote_build import RemoteBuildMixin
 
 FORMAT = "mb-kb-problem/1"
+# isolated-op bound per slot storage dtype (ModelBlaster's; a manifest slot states its own)
+SLOT_BOUNDS = {"fp32": {"slot_rel": 1e-3, "slot_abs": 0.0}, "fp16": {"slot_rel": 2e-3, "slot_abs": 2.0 ** -23},
+               "bf16": {"slot_rel": 1.6e-2, "slot_abs": 0.0}}
 
 
 # ---------------------------------------------------------------- problem
@@ -51,6 +54,8 @@ class Slot:
     reference_path: Optional[Path]
     instances: list
     seed_source: str = "hand"
+    dtype: str = "fp32"                                # this slot's storage dtype (a mixed problem's slots differ)
+    tolerance: dict = field(default_factory=dict)      # {"slot_rel", "slot_abs"}: its isolated-op bound
 
     @property
     def signature_sha(self) -> str:
@@ -71,9 +76,14 @@ class SlotProblem:
         m = self.manifest
         self.name: str = m["name"]
         self.target: str = m.get("target", "cuda")
-        # storage dtype (fp32 / fp16 / bf16) and the driver's bounds for it
+        # storage dtype (fp32 / fp16 / bf16, or mixed: the slots differ) and the driver's bounds for it
+        # (mixed: the narrowest slot dtype's, i.e. the loosest)
         self.dtype: str = m.get("dtype", "fp32")
         self.tolerance: dict = m.get("tolerance", {})
+        # a slot without its own dtype / bound (older manifests) has the problem's; fp32's in a mixed problem
+        dt0 = "fp32" if self.dtype == "mixed" else self.dtype
+        tol0 = SLOT_BOUNDS["fp32"] if self.dtype == "mixed" else {
+            k: v for k, v in self.tolerance.items() if k in ("slot_rel", "slot_abs")}
         self.slots: dict[str, Slot] = {}
         for s in m["slots"]:
             self.slots[s["id"]] = Slot(
@@ -81,12 +91,18 @@ class SlotProblem:
                 signature=s["signature"], semantics=s.get("semantics", ""),
                 seed_path=self.root / s["file"],
                 reference_path=(self.root / s["reference_file"]) if s.get("reference_file") else None,
-                instances=s.get("instances", []), seed_source=s.get("seed_source", "hand"))
+                instances=s.get("instances", []), seed_source=s.get("seed_source", "hand"),
+                dtype=s.get("dtype") or dt0, tolerance=dict(s.get("tolerance") or tol0))
         self.order: list[str] = m["assembly"]["order"]
         # concurrent instances of one slot (ModelBlaster --graph-concurrency): lane k > 0 is the slot's source again,
         # in namespace <prefix><id>__lane<k>, so each instance has its own static state
         self.lanes: dict[str, int] = {k: int(v) for k, v in (m["assembly"].get("lanes") or {}).items()}
         self.driver_path = self._local_driver(self.root / m["driver"], self.root / m["data"])
+
+    @property
+    def dtypes(self) -> list[str]:
+        """The slots' storage dtypes, sorted (one entry unless the problem is mixed)."""
+        return sorted({s.dtype for s in self.slots.values()})
 
     @staticmethod
     def _local_driver(driver: Path, data: Path) -> Path:

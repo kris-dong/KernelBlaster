@@ -150,8 +150,8 @@ def techniques_for(op_class: str, techniques: Optional[dict] = None,
 
 # ---------------------------------------------------------------- roofline
 
-# element bytes per manifest buffer dtype (fp16 / bf16 problems move half the bytes)
-BUFFER_BYTES = {"f32": 4, "f16": 2, "bf16": 2, "i32": 4, "i64": 8}
+# element bytes per manifest buffer dtype (fp16 / bf16 problems move half the bytes; b8 = bool)
+BUFFER_BYTES = {"f32": 4, "f16": 2, "bf16": 2, "i32": 4, "i64": 8, "b8": 1, "u8": 1}
 
 
 def _is_infra(text: Optional[str]) -> bool:
@@ -354,6 +354,17 @@ def propose_splits(problem: SlotProblem, result: EvalResult, arch: str, min_gain
 
 # ---------------------------------------------------------------- bandit
 
+def slot_dtype(problem, sid: str) -> str:
+    """The slot's storage dtype (a mixed problem's slots differ; else the problem's)."""
+    d = getattr(problem.slots[sid], "dtype", None) or problem.dtype
+    return "fp32" if d == "mixed" else d
+
+
+def bandit_key(op_class: str, state: str, dtype: str = "fp32") -> str:
+    """Bandit arm key of a slot: ``op_class|state``, ``|<dtype>`` appended unless the slot is fp32."""
+    return f"{op_class}|{state}" + ("" if dtype == "fp32" else f"|{dtype}")
+
+
 class TechniqueBandit:
     """UCB1 over techniques per key, with cross-key prior transfer."""
 
@@ -419,7 +430,8 @@ are hoisted out. Macros MB_THREADS (256), MB_GRID(n) and MB_TID are predefined; 
 {dtype_rules}
 - Return the COMPLETE slot source in a single ```cuda code block, nothing after it."""
 
-# Per storage dtype (the manifest's `dtype`); {slot_rel} is the manifest's isolated-op bound.
+# Per storage dtype (the manifest's or, in a mixed problem, each slot's `dtype`); {slot_rel} is that dtype's
+# isolated-op bound.
 DTYPE_RULES = {
     "fp32": "- fp32 in/out. Each op is checked alone against the reference: max error <= {slot_rel} "
             "relative to the largest input/output magnitude. Accumulate dot products in fp32 or better.",
@@ -445,12 +457,30 @@ DTYPE_RULES = {
 }
 
 
-def system_prompt(dtype: str = "fp32", tolerance: Optional[dict] = None, arch: Optional[str] = None) -> str:
+MIXED_RULE = ("- This problem mixes storage dtypes: each slot's signature shows its pointer types, and the rule of "
+              "its dtype above applies. Keep exactly the signature's types. A cast slot converts between them: "
+              "compute in fp32, round once to a float destination, truncate toward zero to an integer one.")
+
+
+def _bound(tolerance: Optional[dict]) -> str:
     rel = (tolerance or {}).get("slot_rel", 1e-3)
     rel_s = f"{rel:.0e}" if float(f"{rel:.0e}") == rel else f"{rel:.1e}"
-    rel_s = rel_s.replace("e-0", "e-")                            # 1e-3, 2e-3, 1.6e-2
-    rules = DTYPE_RULES.get(dtype, DTYPE_RULES["fp32"]).format(slot_rel=rel_s)
-    hw = hw_profile.hardware_text(arch, dtype) if arch else ""
+    return rel_s.replace("e-0", "e-")                             # 1e-3, 2e-3, 1.6e-2
+
+
+def system_prompt(dtype: str = "fp32", tolerance: Optional[dict] = None, arch: Optional[str] = None,
+                  slot_dtypes: Optional[dict] = None) -> str:
+    """``dtype`` "mixed": ``slot_dtypes`` maps each slot dtype present to its tolerance; every one's rule (with
+    its own bound) + :data:`MIXED_RULE`."""
+    if dtype == "mixed":
+        sd = slot_dtypes or {"fp32": None}
+        rules = "\n".join(DTYPE_RULES.get(d, DTYPE_RULES["fp32"]).format(slot_rel=_bound(sd[d]))
+                           for d in sorted(sd)) + "\n" + MIXED_RULE
+        hw_dt = "fp16" if "fp16" in sd else "fp32"               # the fp16 tensor-core block if any slot is fp16
+    else:
+        rules = DTYPE_RULES.get(dtype, DTYPE_RULES["fp32"]).format(slot_rel=_bound(tolerance))
+        hw_dt = dtype
+    hw = hw_profile.hardware_text(arch, hw_dt) if arch else ""
     return SYSTEM_PROMPT_TEMPLATE.format(dtype_rules=rules) + (f"\n\n## Target hardware\n{hw}" if hw else "")
 
 
@@ -471,6 +501,9 @@ class TargetProfile:
 
     def prompt_for(self, problem, arch: Optional[str] = None) -> str:
         if self.name == "cuda":                       # dtype rules + the manifest's isolated bound + the target GPU
+            if problem.dtype == "mixed":              # each slot dtype's rule with that dtype's bound
+                sd = {s.dtype: s.tolerance for s in problem.slots.values()}
+                return system_prompt("mixed", problem.tolerance, arch, slot_dtypes=sd)
             return system_prompt(problem.dtype, problem.tolerance, arch)
         return self.system_prompt
 
@@ -981,7 +1014,7 @@ class MultiSlotAgent:
         k_sim = int(os.environ.get("KERNELBLASTER_IMPL_SIMILAR", "0") or 0)
         return self.store.retrieve(target=self.p.target, arch=self.arch_label, op=s.op, op_class=s.op_class,
                                    signature=s.signature, shapes=s.shapes(), exclude_problem=self.problem_id,
-                                   dtype=self.p.dtype, **({"similar_k": k_sim} if k_sim > 0 else {}))
+                                   dtype=slot_dtype(self.p, sid), **({"similar_k": k_sim} if k_sim > 0 else {}))
 
     def _impl_links_text(self, sid: str, r: dict) -> str:
         """A5 (opt-in, KERNELBLASTER_IMPL_LINKS=1): claims / hypotheses / negative results linked to the retrieved
@@ -1071,7 +1104,7 @@ class MultiSlotAgent:
                     jkey, log, slot=sid, technique=tech, op=sl.op, op_class=sl.op_class,
                     shape_bucket=shape_bucket(sl.op_class, sl.shapes()[0] if sl.instances else {}),
                     model=model, role=role, rationale=log.rationale, extra_prompt=xtext, fact_ids=fact_ids,
-                    usage=usage)
+                    usage=usage, dtype=slot_dtype(self.p, sid))
             except Exception as e:                              # noqa: BLE001 -- recording must never break a step
                 self.log.warning(f"experiment record failed: {e!r}")
         return text
@@ -1180,7 +1213,7 @@ class MultiSlotAgent:
         rec = OutcomeRecord(target=self.p.target, arch=self.arch_label, problem_id=self.problem_id,
                             run_id=self.run_id, slot=sid, op_kind=s.op, op_class=s.op_class,
                             shape_bucket=shape_bucket(s.op_class, s.shapes()[0] if s.instances else {}),
-                            dtype=self.p.dtype, **kw)
+                            dtype=slot_dtype(self.p, sid), **kw)
         trace.link(outcome_id=rec.id)
         return rec
 
@@ -1219,7 +1252,8 @@ class MultiSlotAgent:
             launches = max(int(round(res.attr_slot_launches[sid])), 1)
             ovh = overhead_per_launch(res) * res.attr_slot_launches[sid]
             lfrac = ovh / max(slot_us + ovh, 1e-9)
-        pk = hw_profile.peaks(self.arch, self.p.dtype, self.p.slots[sid].op_class) if self.tp.name == "cuda" else None
+        pk = (hw_profile.peaks(self.arch, slot_dtype(self.p, sid), self.p.slots[sid].op_class)
+              if self.tp.name == "cuda" else None)
         return RooflineInput(bytes=byt, flops=fl, time_us=slot_us, work_items=work or None, launches=launches,
                              launch_frac=lfrac, peak_gflops=pk[0] if pk else None)
 
@@ -1251,7 +1285,7 @@ class MultiSlotAgent:
                              speedup=(baseline_us / slot_us) if baseline_us and slot_us else None,
                              seed_us=seed_us, speedup_vs_seed=(seed_us / slot_us) if seed_us and slot_us else None,
                              techniques=techniques, parent_id=parent, problem_id=self.problem_id,
-                             run_id=self.run_id, slot=sid, max_rel_err=rel_err, dtype=self.p.dtype,
+                             run_id=self.run_id, slot=sid, max_rel_err=rel_err, dtype=slot_dtype(self.p, sid),
                              **({"id": rid} if rid else {}))
         return rec.id
 
@@ -1434,9 +1468,9 @@ class MultiSlotAgent:
             async with self._lock:
                 sid = self._pick_slot()
                 self.slot_tries[sid] += 1
-            slot = self.p.slots[sid]
+            slot, sdt = self.p.slots[sid], slot_dtype(self.p, sid)
             state, nums = slot_state(self.p, sid, cur_us[sid], self.arch,
-                                     (hw_profile.peaks(self.arch, self.p.dtype, slot.op_class)
+                                     (hw_profile.peaks(self.arch, sdt, slot.op_class)
                                       if self.tp.name == "cuda" else None) or self.tp.peaks_for(self.arch))
             prof_before = self._ncu_of(sid, cur[sid])
             if prof_before:
@@ -1445,19 +1479,19 @@ class MultiSlotAgent:
                 vec_before = self.kv.vector(self._tkey, estimate=self._roofline_input(sid, cur_us[sid], info),
                                             profile=prof_before, profile_kind=self._profile_kind)
                 cls = self.kv.classify(vec_before, target_key=self._tkey, op_class=slot.op_class,
-                                       dtype=self.p.dtype)
-                choice = self.kv.select(target_key=self._tkey, op_class=slot.op_class, dtype=self.p.dtype, cls=cls,
+                                       dtype=sdt)
+                choice = self.kv.select(target_key=self._tkey, op_class=slot.op_class, dtype=sdt, cls=cls,
                                         vec=vec_before, rng=self.rng, op_kind=slot.op)
                 tech, desc, state = choice.item_id, choice.desc, cls.label()
                 nums = {**nums, **cls.decided_by}
             else:
                 lb = e2e and (self.runtime_info.get("launch_bound") or slot_launch_bound(info, sid, self.p))
                 techs = techniques_for(slot.op_class, self.tp.techniques, launch_bound=bool(lb),
-                                       arch=self.arch if self.tp.name == "cuda" else None, dtype=self.p.dtype)
-                # fp16 arms are their own keys (half2 / tensor-core techniques pay off
+                                       arch=self.arch if self.tp.name == "cuda" else None, dtype=sdt)
+                # fp16 / bf16 arms are their own keys (half2 / tensor-core techniques pay off
                 # differently); fp32 keys keep their names, and the cross-key prior
-                # still seeds an untried fp16 arm from its fp32 record
-                key = f"{slot.op_class}|{state}" + ("" if self.p.dtype == "fp32" else f"|{self.p.dtype}")
+                # still seeds an untried fp16 arm from its fp32 record (per slot dtype: mixed problems)
+                key = bandit_key(slot.op_class, state, sdt)
                 tech = self.bandit.select(key, [t for t, _ in techs], self.rng)
                 desc = dict(techs)[tech]
             # no await since the pick: a checkpoint never sees the tries / draws without the plan
@@ -1479,8 +1513,8 @@ class MultiSlotAgent:
         if r["adapt"] is not None and self.store is not None:
             adapt = (f"{json.dumps(r['adapt'].shapes[:2])}", self.store.code(r["adapt"]))
         if self.kv is not None:
-            ktext = self.kv.retrieve(target_key=self._tkey, op_class=slot.op_class, dtype=self.p.dtype, cls=cls,
-                                     vec=vec_before, problem_id=self.problem_id, slot=sid, technique=tech,
+            ktext = self.kv.retrieve(target_key=self._tkey, op_class=slot.op_class, dtype=slot_dtype(self.p, sid),
+                                     cls=cls, vec=vec_before, problem_id=self.problem_id, slot=sid, technique=tech,
                                      op_kind=slot.op)
             tried = self.kv.already_tried(self.problem_id, sid)
         else:
@@ -1655,7 +1689,7 @@ class MultiSlotAgent:
                 else:
                     v2 = self.kv.record(self._outcome(**okw), choice=choice, reward=reward, cls=cls,
                                         before=vec_before, after=vec_after, op_class=slot.op_class,
-                                        dtype=self.p.dtype,
+                                        dtype=slot_dtype(self.p, sid),
                                         extra={"lineage": list(self.best[sid].techniques),
                                                "ncu_rules": (prof_before or {}).get("rules", []),
                                                "diff_excerpt": diff_excerpt(cur[sid], code) if code else "",
