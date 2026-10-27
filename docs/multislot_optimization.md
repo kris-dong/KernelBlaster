@@ -272,6 +272,19 @@ Fixtures: `tests/fixtures/mb_lenet_f16` and `mb_lenet_bf16` (LeNet, `kb_export` 
 `--quant fp16` / `--quant bf16` extract); tests: `tests/test_multislot_fp16.py`,
 `tests/test_multislot_bf16.py`.
 
+A `mixed` manifest (ModelBlaster `extract_graph --quant native`) has slots of several storage
+dtypes; explicit cast slots (`cast_<src>_to_<dst>`, class `elementwise`) convert between them,
+and buffers may also be `i32`, `b8` or `u8` (1 byte each in the roofline). Each manifest slot
+states its own `dtype` and `tolerance` (`slot_rel`, `slot_abs`); the problem `tolerance` is
+the narrowest dtype's. `Slot.dtype` / `Slot.tolerance` fall back to the problem's (fp32 for a
+`mixed` problem) on older manifests, and `SlotProblem.dtypes` lists the slots' dtypes. The
+system prompt has the rule of each dtype present, each with its own bound, plus one rule that a
+slot keeps exactly its signature's pointer types and that cast slots round once to a float
+destination and truncate to an integer one. Everything keyed per slot above (records, retrieval,
+bandit arms, roofline peaks) uses the slot's dtype, so an fp32 slot of a mixed problem keeps the
+fp32 keys and knowledge. Single-dtype prompts are unchanged. Tests:
+`tests/test_multislot_mixed.py`.
+
 ## Proposals
 
 - `fuse`: a producer -> consumer pair where the consumer is elementwise and the only reader of

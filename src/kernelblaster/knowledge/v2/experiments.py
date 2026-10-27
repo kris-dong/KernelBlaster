@@ -458,9 +458,10 @@ class ExperimentRecorder:
 
     def record_step(self, key: str, log, *, slot: str, technique: str, op: str = "", op_class: str = "",
                     shape_bucket: str = "", model: str = "", role: str = "", rationale: str = "",
-                    extra_prompt: str = "", fact_ids: Iterable = (), usage: Optional[dict] = None) -> list[str]:
+                    extra_prompt: str = "", fact_ids: Iterable = (), usage: Optional[dict] = None,
+                    dtype: Optional[str] = None) -> list[str]:
         """One line per experiment of the step (``log.records`` from ``experiment_tool.converse``) + one ``step``
-        line. Returns the experiment ids. Ids are deterministic, so a resumed step that reruns its probes does not
+        line (``dtype``: the slot's storage dtype, over the run's). Returns the experiment ids. Ids are deterministic, so a resumed step that reruns its probes does not
         add a second record (readers keep the last line per id)."""
         self.out.mkdir(parents=True, exist_ok=True)
         m = re.match(r"r(\d+)s(\d+)", key or "")
@@ -479,8 +480,8 @@ class ExperimentRecorder:
             psha = self._blob(prog) if prog else None
             ms = parse_measurements(r.get("out") or "")
             eid = sha1(self.ctx["run_id"], key, r.get("turn"), r.get("idx"), psha)[:16]
-            rec = {"type": "experiment", "schema": SCHEMA, "id": eid, **self.ctx, "step_key": key, "ridx": ridx,
-                   "step": step, "turn": r.get("turn"), "idx": r.get("idx"), "slot": slot, "technique": technique,
+            rec = {"type": "experiment", "schema": SCHEMA, "id": eid, **self.ctx, **({"dtype": dtype} if dtype else {}),
+                   "step_key": key, "ridx": ridx, "step": step, "turn": r.get("turn"), "idx": r.get("idx"), "slot": slot, "technique": technique,
                    "op_kind": op, "op_class": op_class, "shape_bucket": shape_bucket,
                    "gpu": {"device": r.get("device"), "arch": self.ctx["arch"]}, "model": model, "role": role,
                    "purpose": r.get("purpose") or None, "conclusion": r.get("conclusion") or None,
