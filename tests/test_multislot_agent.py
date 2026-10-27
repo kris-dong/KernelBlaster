@@ -4,6 +4,7 @@ Needs nvcc + a CUDA GPU; skipped otherwise.
 """
 import asyncio
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -21,6 +22,8 @@ FIX = Path(__file__).parent / "fixtures" / "mb_lenet"
 
 def _gpu_arch():
     if shutil.which("nvcc") is None:
+        return None
+    if os.environ.get("CUDA_VISIBLE_DEVICES") in ("", "-1"):    # GPUs hidden (nvidia-smi ignores it)
         return None
     try:
         out = subprocess.run(["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
