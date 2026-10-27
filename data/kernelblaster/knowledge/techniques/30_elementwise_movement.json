@@ -25,7 +25,7 @@
    "realizations": [
     {
      "scope": "target:cuda",
-     "how": "Grid-stride loop with float4 accesses (half2 x4 for fp16); grid = a few waves of the SM count; minimal integer math per element."
+     "how": "Grid-stride loop with float4 accesses (half2 / __nv_bfloat162 x4 for fp16 / bf16); grid = a few waves of the SM count; minimal integer math per element."
     },
     {
      "scope": "target:opencl",

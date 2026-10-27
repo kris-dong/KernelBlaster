@@ -70,7 +70,7 @@
    "realizations": [
     {
      "scope": "target:cuda",
-     "how": "Use float4/float2 (half2 / __half2 for fp16) loads and stores where alignment and sizes allow (check (uintptr_t)p % 16 and n % 4); keep a scalar tail."
+     "how": "Use float4/float2 (half2 / __half2 for fp16, __nv_bfloat162 for bf16) loads and stores where alignment and sizes allow (check (uintptr_t)p % 16 and n % 4); keep a scalar tail."
     },
     {
      "scope": "target:opencl",
@@ -773,18 +773,20 @@
     "compression_techniques",
     "half2_arithmetic"
    ],
-   "mechanism": "half the bytes per element and twice the arithmetic rate on fp16 paths",
+   "mechanism": "half the bytes per element (fp16 / bf16 storage) and twice the arithmetic rate on fp16 paths",
    "preconditions": {
     "dtype": "in",
     "v": [
-     "fp16"
+     "fp16",
+     "bf16"
     ]
    },
    "predicts": {
     "bw_util": "down_or_flat"
    },
    "risks": [
-    "fp16 accumulation exceeds tolerance: accumulate in fp32"
+    "fp16 accumulation exceeds tolerance: accumulate in fp32",
+    "bf16 keeps 8 significant bits: rounding an intermediate to bf16 costs ~4e-3 relative; keep intermediates in fp32"
    ],
    "states": [],
    "op_classes": [],
@@ -796,7 +798,7 @@
    "realizations": [
     {
      "scope": "target:cuda",
-     "how": "half2 loads (__half22float2) and fp32 math, store with __floats2half2_rn; never accumulate in __half."
+     "how": "half2 loads (__half22float2) and fp32 math, store with __floats2half2_rn; never accumulate in __half. bf16: __nv_bfloat162 loads (__bfloat1622float2), fp32 math, store with __floats2bfloat162_rn (sm_75 has no bf16 arithmetic; the conversions compile everywhere)."
     },
     {
      "scope": "target:opencl",

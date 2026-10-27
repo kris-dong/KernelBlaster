@@ -26,6 +26,8 @@ RELU = ROOT / "data" / "kernelbench-cuda" / "level1" / "019_ReLU"
 def _gpu_arch():
     if shutil.which("nvcc") is None:
         return None
+    if os.environ.get("CUDA_VISIBLE_DEVICES") in ("", "-1"):    # GPUs hidden (nvidia-smi ignores it)
+        return None
     try:
         out = subprocess.run(["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
                              capture_output=True, text=True, timeout=30).stdout.split()
