@@ -70,7 +70,7 @@ class SlotProblem:
         m = self.manifest
         self.name: str = m["name"]
         self.target: str = m.get("target", "cuda")
-        # storage dtype (fp32 / fp16) and the driver's bounds for it
+        # storage dtype (fp32 / fp16 / bf16) and the driver's bounds for it
         self.dtype: str = m.get("dtype", "fp32")
         self.tolerance: dict = m.get("tolerance", {})
         self.slots: dict[str, Slot] = {}

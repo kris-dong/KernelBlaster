@@ -120,8 +120,8 @@ def techniques_for(op_class: str, techniques: Optional[dict] = None,
 
 # ---------------------------------------------------------------- roofline
 
-# element bytes per manifest buffer dtype (fp16 problems move half the bytes)
-BUFFER_BYTES = {"f32": 4, "f16": 2, "i32": 4, "i64": 8}
+# element bytes per manifest buffer dtype (fp16 / bf16 problems move half the bytes)
+BUFFER_BYTES = {"f32": 4, "f16": 2, "bf16": 2, "i32": 4, "i64": 8}
 
 
 def _is_infra(text: Optional[str]) -> bool:
@@ -391,12 +391,23 @@ DTYPE_RULES = {
             "- Each op is checked alone against a reference that rounds the exact fp32 result to fp16 "
             "once: max error <= {slot_rel} relative to the largest input/output magnitude (about two fp16 "
             "ulps).",
+    "bf16": "- bf16 storage, fp32 math: every float pointer is `__nv_bfloat16` (bfloat16: fp32's exponent "
+            "range, 8 significant bits; <cuda_bf16.h> is included), integer pointers stay int. Widen on load "
+            "(`__bfloat162float`, or `__bfloat1622float2` on aligned `__nv_bfloat162` pairs), compute and "
+            "accumulate in fp32, round once on store (`__float2bfloat16_rn`); never accumulate or chain "
+            "arithmetic in `__nv_bfloat16`. bf16 tensor cores (`wmma` / `mma.sync` with bf16 inputs and fp32 "
+            "accumulators) exist on sm_80 and newer only; sm_75 has no bf16 arithmetic (conversions are "
+            "emulated), so compute in fp32 there.\n"
+            "- Each op is checked alone against a reference that rounds the exact fp32 result to bf16 "
+            "once: max error <= {slot_rel} relative to the largest input/output magnitude (about two bf16 "
+            "ulps).",
 }
 
 
 def system_prompt(dtype: str = "fp32", tolerance: Optional[dict] = None) -> str:
     rel = (tolerance or {}).get("slot_rel", 1e-3)
-    rel_s = f"{rel:.0e}".replace("e-0", "e-")                    # 1e-3, 2e-3
+    rel_s = f"{rel:.0e}" if float(f"{rel:.0e}") == rel else f"{rel:.1e}"
+    rel_s = rel_s.replace("e-0", "e-")                            # 1e-3, 2e-3, 1.6e-2
     rules = DTYPE_RULES.get(dtype, DTYPE_RULES["fp32"]).format(slot_rel=rel_s)
     return SYSTEM_PROMPT_TEMPLATE.format(dtype_rules=rules)
 
