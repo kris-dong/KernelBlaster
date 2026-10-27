@@ -25,6 +25,7 @@
    },
    "risks": [
     "fp16/tf32 inputs exceed fp32 tolerances (1e-3 relative with K >= 1024 often fails)",
+    "bf16 tensor cores need sm_80+; on sm_75 a bf16 slot computes in fp32 (bf16 -> fp16 is exact only inside fp16's range)",
     "fragment layout mistakes",
     "M/N/K not multiples of 16: pad tiles in on-chip memory"
    ],
@@ -47,11 +48,11 @@
    "realizations": [
     {
      "scope": "target:cuda",
-     "how": "nvcuda::wmma 16x16x16 fragments with fp16 inputs and fp32 accumulators (sm_75: fp16 only; for fp32 problems only if the tolerance allows rounding inputs to fp16 -- usually it does not for K >= 1024)."
+     "how": "nvcuda::wmma 16x16x16 fragments with fp16 inputs and fp32 accumulators (sm_75: fp16 only; for fp32 problems only if the tolerance allows rounding inputs to fp16 -- usually it does not for K >= 1024; bf16 problems: no bf16 tensor cores on sm_75, compute in fp32)."
     },
     {
      "scope": "target:cuda:sm_80+",
-     "how": "wmma::precision::tf32 (m16n16k8) or mma.sync bf16/tf32 with fp32 accumulators; tf32 keeps 10 mantissa bits, check the tolerance."
+     "how": "wmma::precision::tf32 (m16n16k8) or mma.sync bf16/tf32 with fp32 accumulators; tf32 keeps 10 mantissa bits, check the tolerance. bf16 problems: wmma 16x16x16 / mma.sync m16n8k16 on __nv_bfloat16 inputs with fp32 accumulators -- the products of bf16 inputs are exact, so only the fp32 accumulation order differs from the reference."
     },
     {
      "scope": "target:cuda:sm_90+",

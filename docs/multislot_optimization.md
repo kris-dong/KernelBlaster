@@ -182,6 +182,27 @@ process per run).
 Measurements and design: ModelBlaster `docs/gpu_harness_perf.md`; bench script
 `scripts/bench_runtime.py`.
 
+## Storage dtypes
+
+A manifest's `dtype` is `fp32`, `fp16` or `bf16` (ModelBlaster `docs/fp16_cuda.md`,
+`docs/bf16_cuda.md`). The 16-bit dtypes share one contract: 2-byte storage (`__half`,
+`__nv_bfloat16`), fp32 math, one rounding per stored value. What follows the dtype:
+
+- the system prompt's dtype rule and the manifest's isolated-op bound (`slot_rel`); the fp32
+  prompt is unchanged. The bf16 rule adds that bf16 tensor cores need sm_80+ (sm_75 has no
+  bf16 arithmetic; the conversions are emulated, so slots compute in fp32 there);
+- the roofline counts 2 bytes per `f16` / `bf16` buffer element; the peaks stay fp32;
+- outcome and implementation-store records carry `dtype`; retrieval, examples and `winners`
+  match the slot's dtype, so no fp32 / fp16 / bf16 code stands in for another;
+- bandit arms are keyed `class|state|<dtype>` for non-fp32 dtypes (the fp32 prior still seeds
+  them); knowledge v2 adds a `<class>|<dtype>` stats node;
+- seed techniques: `half_precision` applies to fp16 and bf16 (`half2` / `__nv_bfloat162`
+  packed loads), `tensor_core_mma` gives bf16 `wmma` / `mma.sync` on sm_80+ only.
+
+Fixtures: `tests/fixtures/mb_lenet_f16` and `mb_lenet_bf16` (LeNet, `kb_export` of a
+`--quant fp16` / `--quant bf16` extract); tests: `tests/test_multislot_fp16.py`,
+`tests/test_multislot_bf16.py`.
+
 ## Proposals
 
 - `fuse`: a producer -> consumer pair where the consumer is elementwise and the only reader of

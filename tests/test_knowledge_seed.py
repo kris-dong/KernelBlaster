@@ -19,7 +19,7 @@ ONTO = Ontology.seed(REG)
 SAMPLE_VECTORS = [{}, {k: 50.0 for k in CANONICAL}, {k: 0.5 for k in CANONICAL},
                   {"mem_util": 80.0, "compute_util": 10.0, "arith_intensity": 0.2, "parallel_fill": 1.0}]
 CTXS = [{"op_class": oc, "dtype": dt, "family": "simt_gpu", "target": "cuda:sm_89"}
-        for oc in OP_CLASSES for dt in ("fp32", "fp16")]
+        for oc in OP_CLASSES for dt in ("fp32", "fp16", "bf16")]
 
 
 def _valid_scope(scope: str) -> bool:
