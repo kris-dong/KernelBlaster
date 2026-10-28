@@ -53,6 +53,7 @@ from ..knowledge.slots import EvalResult, Evaluator, SlotProblem, step_eval_opti
 from ..knowledge.clock_guard import clock_suspect
 from . import hw_profile
 from . import experiment_tool
+from . import slot_prompt_features as spf
 from ..knowledge.v2 import experiments
 from .cost_tracker import lookup_pricing
 from .model_router import ModelRouter, technique_tier
@@ -536,7 +537,8 @@ def build_codegen_messages(*, problem: SlotProblem, sid: str, source: str, techn
                            partition_us: float, neighbours: list[tuple[str, str]],
                            examples: list[tuple[str, str]], adapt: Optional[tuple[str, str]],
                            knowledge_text: str, already_tried: str, best_note: str,
-                           profile_text: str = "", runtime_text: str = "") -> list[dict]:
+                           profile_text: str = "", runtime_text: str = "", history_text: str = "",
+                           freedom: str = "none") -> list[dict]:
     slot = problem.slots[sid]
     tp = target_profile(problem.target)
     ref = problem.reference_text(sid)
@@ -566,7 +568,9 @@ def build_codegen_messages(*, problem: SlotProblem, sid: str, source: str, techn
         parts.append("Lessons from earlier optimisation runs:\n" + knowledge_text)
     if already_tried:
         parts.append("Already tried on this slot (avoid repeating dead ends):\n" + already_tried)
-    parts.append(f"## Technique to apply: {technique}\n{technique_desc}")
+    if history_text:                          # MB_SLOT_HISTORY (default off: "")
+        parts.append(history_text)
+    parts.append(spf.technique_block(freedom, technique, technique_desc))   # MB_STEP_FREEDOM (default none: as before)
     parts.append(f"Current slot source:\n```{tp.fence}\n{source}\n```")
     return [{"role": "system", "content": tp.prompt_for(problem, arch)},
             {"role": "user", "content": "\n\n".join(p for p in parts if p)}]
@@ -1519,6 +1523,14 @@ class MultiSlotAgent:
             tried = self.kv.already_tried(self.problem_id, sid)
         else:
             ktext, tried = self._knowledge(sid, state, tech)
+        hist_k = spf.history_k()
+        hist_text = ""
+        if hist_k and self.kv is not None:
+            try:
+                hist_text = spf.slot_history_text(spf.history_rows(self.kv, self.problem_id, sid, self.run_id), hist_k)
+            except Exception as e:                                # a prompt feature must never break a step
+                self.log.warning(f"slot history failed: {e!r}")
+        freedom = spf.step_freedom()
         ltext = self._impl_links_text(sid, r)
         if ltext:
             ktext = (ktext + "\n\n" + ltext) if ktext else ltext
@@ -1534,7 +1546,8 @@ class MultiSlotAgent:
                                       examples=examples, adapt=adapt, knowledge_text=ktext,
                                       already_tried=tried, best_note=best_note,
                                       profile_text=self.tp.profiler.render(prof_before) if prof_before else "",
-                                      runtime_text=runtime_text(info, sid, self.p) if e2e else "")
+                                      runtime_text=runtime_text(info, sid, self.p) if e2e else "",
+                                      history_text=hist_text, freedom=freedom)
         tdef = self.kv.ontology.techniques.get(tech) if self.kv is not None else None
         model, role, why = self.router.codegen(technique=tech, tier=technique_tier(tech, tdef),
                                                share=self._share(sid), stall=self.slot_stall[sid],
@@ -1553,6 +1566,7 @@ class MultiSlotAgent:
                                    extra={"plan": self._inflight.get(skey) or plan})
         tel.lap("candidate", technique=tech)
         code = extract_code(text)
+        declared = spf.parse_declared_techniques(code) if freedom != "none" else None
         fix_models, capture_defects = [], []
         fixes, res, status = 0, None, None
         before = cur_us[sid]
@@ -1587,6 +1601,8 @@ class MultiSlotAgent:
             if not new or new == code:
                 break
             code = new
+            if freedom != "none":                 # a fix may drop / rewrite the line: the final code's wins
+                declared = spf.parse_declared_techniques(code) or declared
         if e2e:
             d = await self._decide_e2e(ridx, step, sid, tech, code, res, before, cur, meta)
             after, speedup, status, reward = d["after"], d["speedup"], d["status"], d["reward"]
@@ -1629,11 +1645,14 @@ class MultiSlotAgent:
         async with self._lock:
             self._commit_step(ridx, step, t0, sid, slot, tech, key, state, choice, cls, vec_before, prof_before,
                               prof_after, code, res, d, before, after, speedup, status, reward, fixes, fix_models,
-                              capture_defects, cur, cur_us, meta, r, ktext, tried, model, role, why, e2e)
+                              capture_defects, cur, cur_us, meta, r, ktext, tried, model, role, why, e2e,
+                              prompt_features={**spf.features_tag(), "history_chars": len(hist_text),
+                                               "declared_techniques": declared})
 
     def _commit_step(self, ridx, step, t0, sid, slot, tech, key, state, choice, cls, vec_before, prof_before,
                      prof_after, code, res, d, before, after, speedup, status, reward, fixes, fix_models,
-                     capture_defects, cur, cur_us, meta, r, ktext, tried, model, role, why, e2e) -> None:
+                     capture_defects, cur, cur_us, meta, r, ktext, tried, model, role, why, e2e,
+                     prompt_features=None) -> None:
         if self.kv is None:
             self.bandit.update(key, tech, reward)
         impl_id, parent = None, self.best[sid].impl_id
@@ -1693,7 +1712,10 @@ class MultiSlotAgent:
                                         extra={"lineage": list(self.best[sid].techniques),
                                                "ncu_rules": (prof_before or {}).get("rules", []),
                                                "diff_excerpt": diff_excerpt(cur[sid], code) if code else "",
-                                               **({"e2e": d["ctx"]} if d is not None else {})})
+                                               **({"e2e": d["ctx"]} if d is not None else {}),
+                                               **({"declared_techniques": prompt_features["declared_techniques"]}
+                                                  if prompt_features and prompt_features.get("declared_techniques")
+                                                  is not None else {})})
             except Exception as e:                                # knowledge must never break a step
                 self.log.warning(f"knowledge-v2 record failed: {e!r}")
         else:
@@ -1702,7 +1724,8 @@ class MultiSlotAgent:
                "examples": [e.id for e in r["examples"]],
                "claims": ktext.count("\n") + 1 if ktext else 0, "already_tried": bool(tried),
                "ncu": bool(prof_before), "state": state, "model": model, "model_role": role,
-               "model_why": why, **({"clock_suspect": True, "gpu_clock": (res.gpu or {}).get("clock")} if csus else {})}
+               "model_why": why, "prompt_features": prompt_features or spf.features_tag(),
+               **({"clock_suspect": True, "gpu_clock": (res.gpu or {}).get("clock")} if csus else {})}
         if fix_models:
             ctx["fix_models"] = fix_models
         if capture_defects or (res is not None and self._capture_defect(res)):
