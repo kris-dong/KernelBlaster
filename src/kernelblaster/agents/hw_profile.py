@@ -65,7 +65,7 @@ def peaks(arch: str, dtype: str = "fp32", op_class: str = "") -> Optional[tuple]
     h = info(arch)
     if h is None:
         return None
-    tc = dtype == "fp16" and op_class in ("gemm", "conv", "attention")
+    tc = dtype in ("fp16", "bf16") and op_class in ("gemm", "conv", "attention")
     return (float(h["fp16_tc_gflops"] if tc else h["fp32_gflops"]), float(h["dram_gbs"]))
 
 
@@ -79,8 +79,8 @@ def hardware_text(arch: str, dtype: str = "fp32") -> str:
              f"{h['l2_mb']} MB L2, {h['dram_gbs'] / 1000:.2f} TB/s DRAM; fp32 CUDA-core peak "
              f"{h['fp32_gflops'] / 1000:.0f} TFLOP/s" +
              (f", fp16 tensor-core peak {h['fp16_tc_gflops'] / 1000:.0f} TFLOP/s (dense, fp32 accumulate)."
-              if dtype == "fp16" else ".")]
-    if dtype == "fp16":
+              if dtype in ("fp16", "bf16") else ".")]
+    if dtype in ("fp16", "bf16"):
         isa = [_ISA["mma"]]
         if sm >= 90:
             isa.append(_ISA["hopper"])
@@ -184,8 +184,8 @@ def tensor_core_techniques(arch: str, dtype: str, op_class: str) -> list[tuple[s
     class gets only its W_hh fragment technique)."""
     sm = _sm(arch)
     if op_class == "recurrent":
-        return [(n, d) for lo, n, d in _TC_RECURRENT if sm >= lo] if dtype == "fp16" else []
-    if dtype != "fp16" or op_class not in ("gemm", "conv", "attention") or sm < 80:
+        return [(n, d) for lo, n, d in _TC_RECURRENT if sm >= lo] if dtype in ("fp16", "bf16") else []
+    if dtype not in ("fp16", "bf16") or op_class not in ("gemm", "conv", "attention") or sm < 80:
         return []
     out = [(n, d) for lo, n, d in _TC if sm >= lo]
     if op_class == "attention":         # flash-style structure first: the GEMM techniques apply inside it

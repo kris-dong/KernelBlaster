@@ -40,8 +40,10 @@ KAPPA = 3.0
 
 
 def path(registry: TargetRegistry, *, target_key: str, op_class: str, chain: list,
-         dtype: Optional[str] = None) -> list[tuple]:
-    """Nodes (level, scope, op, state), most specific first."""
+         dtype: Optional[str] = None, read: bool = False) -> list[tuple]:
+    """Nodes (level, scope, op, state), most specific first. ``read=True`` (selection / retrieval only; writes are unchanged) also
+    reads the op-level rows (state ANY) of every scope node: node rows are otherwise keyed by the exact leaf state, so evidence
+    lifted to nvidia_gpu from another architecture's state chain would never be read by a slot with a different leaf."""
     t = registry.get(target_key)
     leaf = chain[-1] if chain else ANY
     nodes = []
@@ -53,6 +55,8 @@ def path(registry: TargetRegistry, *, target_key: str, op_class: str, chain: lis
     for s in reversed(chain[:-1]):
         nodes.append((UNIVERSAL, "", op_class, s))
     if leaf != ANY:
+        if read:
+            nodes += [(NODE, n, op_class, ANY) for n in registry.ancestors(t.node) if n != ROOT]
         nodes.append((UNIVERSAL, "", op_class, ANY))
     nodes.append((UNIVERSAL, "", ANY, ANY))
     return nodes
