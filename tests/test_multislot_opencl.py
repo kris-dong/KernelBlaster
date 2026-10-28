@@ -243,6 +243,24 @@ def test_board_evaluator(tmp_path):
         asyncio.run(ev.close())
 
 
+def test_board_evaluator_lock(tmp_path):
+    """A shared board: every build + run holds flock on the board's lock file and has a board-side timeout."""
+    p = SlotProblem(FIX)
+    ev = AdrenoEvaluator("u@board", remote_dir="/r/kb", work_root=tmp_path / "work", lock="/r/board.lock",
+                         timeout_s=60)
+    calls = []
+
+    async def fake_cmd(*argv, timeout=None, stdin=None):
+        calls.append(argv)
+        return 0, "MB_PARTITION_US 1.0 reps=3\npassed\n" if argv[0] == "ssh" and "flock" in argv[-1] else ""
+
+    ev._cmd = fake_cmd
+    asyncio.run(ev.evaluate(p, p.seed_sources(), "t"))
+    run = [a[-1] for a in calls if a[0] == "ssh" and "main.cpp" in a[-1]]
+    assert len(run) == 1 and "flock /r/board.lock sh -c" in run[0] and "timeout -k 10 60 env" in run[0]
+    assert run[0].index("flock") < run[0].index("rm -rf /r/kb/")     # the candidate dir goes after the lock
+
+
 def test_server_evaluator_plumbing(tmp_path, monkeypatch):
     """OpenCLServerEvaluator: one main.cpp through compile_opencl, data.bin as a kernel file,
     the driver pointed at ./data.bin (and `profile` as argv[2]); the servers are faked here."""

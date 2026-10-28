@@ -498,7 +498,9 @@ cl_event timing). What is target-specific on this side:
 ```bash
 # on the board (RB5 over ssh; default host $KERNELBLASTER_ADRENO_BOARD_HOST)
 python scripts/run_multislot.py OUT --out runs/cl --evaluator board --board-host root@rb5 --arch adreno650 \
-    --model us.anthropic.claude-haiku-5-5 --ncu best
+    --remote-dir /root/kb_work --board-lock /root/board.lock --model us.anthropic.claude-haiku-5-5 --ncu best
+# --remote-dir on persistent storage (the RB5's /tmp is a 3.8 GB tmpfs); --board-lock (or
+# $KERNELBLASTER_ADRENO_BOARD_LOCK): every build + run holds `flock` on that file on a shared board
 # functional stand-in: any local OpenCL 2.0 GPU with coarse-grained SVM (times are not Adreno's)
 python scripts/run_multislot.py OUT --out runs/cl --evaluator local --arch titanrtx ...
 ```
