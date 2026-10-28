@@ -89,7 +89,7 @@ from kernelblaster.knowledge.outcomes import OutcomeLog  # noqa: E402
 from kernelblaster.knowledge.reflect import SemanticUpdater  # noqa: E402
 from kernelblaster.knowledge.slots import (AdrenoEvaluator, LocalEvaluator, OpenCLLocalEvaluator,  # noqa: E402
                                            OpenCLServerEvaluator, ServerEvaluator, SlotProblem, SSHEvaluator,
-                                           find_problems)
+                                           board_env, find_problems)
 
 
 def _start_servers(gpu_name: str, log_dir: Path):
@@ -309,7 +309,7 @@ async def _run_inner(args, run_span) -> int:
         kv = KnowledgeV2(kdir, upkeep_model=args.upkeep_model, logger=logger, upkeep_every=args.upkeep_every,
                          explore_frac=args.explore_frac)
         for gh in args.graph_hints or [x for x in os.getenv("KB_GRAPH_HINTS", "").split(os.pathsep) if x]:
-            kv.sync_graph_hints(gh, target_key=f"cuda:sm_{args.arch or '75'}")   # MB decisions so far
+            kv.sync_graph_hints(gh, target_key=hints_target_key(args.arch))   # MB decisions so far
         olog, claims = kv.outcomes, kv.claims
         updater = (SemanticUpdaterV2(kv, model=args.reflect_model, every_n=args.reflect_every, logger=logger,
                                      trace_dir=kdir / "reflect_traces") if args.reflect_model else None)
@@ -332,12 +332,14 @@ async def _run_inner(args, run_span) -> int:
         elif target == "opencl":
             if args.evaluator == "board":
                 ev = AdrenoEvaluator(args.board_host, remote_dir=args.remote_dir or "/tmp/kernelblaster_multislot",
-                                     ssh_key=args.ssh_key, work_root=out / "work")
+                                     ssh_key=args.ssh_key, work_root=out / "work", lock=args.board_lock,
+                                     env=board_env(args.board_env), arch=arch_for("opencl"))
             elif args.evaluator == "server":
                 from kernelblaster.config import GPUType
                 ev = OpenCLServerEvaluator(GPUType(args.gpu), out / "work")
             elif args.evaluator == "local":
-                ev = OpenCLLocalEvaluator(work_root=out / "work", max_parallel=args.compile_jobs)
+                ev = OpenCLLocalEvaluator(work_root=out / "work", max_parallel=args.compile_jobs,
+                                          env=board_env(args.board_env), arch=arch_for("opencl"))
             else:
                 raise SystemExit(f"--evaluator {args.evaluator} does not run OpenCL problems (local|server|board)")
         elif args.evaluator == "server":
@@ -619,6 +621,13 @@ def _summary_row(res: dict) -> dict:
     return row
 
 
+def hints_target_key(arch) -> str:
+    """The knowledge target key ModelBlaster's graph hints are synced under: CUDA archs are
+    SM numbers (``cuda:sm_75``), OpenCL archs device labels (``opencl:adreno650``)."""
+    a = str(arch or "75").removeprefix("sm_")
+    return f"cuda:sm_{a}" if a.isdigit() else f"opencl:{a}"
+
+
 def _ssh_hosts(args) -> tuple[list[str], dict]:
     """--ssh-host (repeatable) + --cuda-visible-devices (one for every host, or one per host)."""
     hosts = args.ssh_host or []
@@ -742,6 +751,12 @@ def build_parser() -> argparse.ArgumentParser:
                          "build + run on the Adreno board over ssh (OpenCL)")
     ap.add_argument("--board-host", default=None, help="user@board for --evaluator board "
                     "(default $KERNELBLASTER_ADRENO_BOARD_HOST)")
+    ap.add_argument("--board-lock", default=None,
+                    help="flock file on the board held for every build + run (default $KERNELBLASTER_BOARD_LOCK, "
+                         "else ~/mb_board.lock; off: none)")
+    ap.add_argument("--board-env", action="append", default=[],
+                    help="NAME=value added to every OpenCL run (--evaluator board|local), e.g. "
+                         "CUDA_VISIBLE_DEVICES=2 for an NVIDIA OpenCL stand-in; repeatable")
     ap.add_argument("--gpu", default="titanrtx", help="GPUType for --evaluator server")
     ap.add_argument("--ssh-host", action="append", default=[],
                     help="user@host with GPUs (--evaluator ssh); repeatable, runs spread over every host's GPUs")
