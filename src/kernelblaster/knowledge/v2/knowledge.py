@@ -169,12 +169,16 @@ class KnowledgeV2:
             for o in d.get("outcomes", []):
                 if o["item"] not in self.ontology.techniques or o["id"] in have:   # no double counting
                     continue
+                scopes = o.get("lift_scopes")            # lifted evidence: write ONLY these scope ids (e.g. ["nvidia_gpu"])
+                w = float(o.get("weight", 1.0))          # optional pseudo-count weight of one outcome
                 for node in stat_path(self.registry, target_key=o["target"], op_class=o["op_class"],
                                       chain=o.get("chain") or [], dtype=o.get("dtype")):
+                    if scopes is not None and ("universal" if node[0] == "universal" else node[1]) not in scopes:
+                        continue
                     a = agg.setdefault((o["item"], *node), [0.0, 0.0, 0.0])
-                    a[0] += 1
-                    a[1] += o["reward"]
-                    a[2] += o["reward"] ** 2
+                    a[0] += w
+                    a[1] += w * o["reward"]
+                    a[2] += w * o["reward"] ** 2
             self.db.add_stats_bulk(agg)
         from ..claims import Claim
         from .reflect_v2 import set_claim_scope
@@ -265,7 +269,7 @@ class KnowledgeV2:
         chain = cls.chain
         techs, hyps = self.candidates(target_key=target_key, op_class=op_class, dtype=dtype, chain=chain, vec=vec,
                                       op_kind=op_kind)
-        nodes = stat_path(self.registry, target_key=target_key, op_class=op_class, chain=chain, dtype=dtype)
+        nodes = stat_path(self.registry, target_key=target_key, op_class=op_class, chain=chain, dtype=dtype, read=True)
         self.n_selected += 1
         if exclude:                               # beam search: not a hypothesis a sibling already tests
             hyps = [h for h in hyps if h.id not in exclude]
@@ -317,7 +321,7 @@ class KnowledgeV2:
                          f"Meaning: {mech}.")
         techs, hyps = self.candidates(target_key=target_key, op_class=op_class, dtype=dtype, chain=cls.chain, vec=vec,
                                       op_kind=op_kind)
-        nodes = stat_path(self.registry, target_key=target_key, op_class=op_class, chain=cls.chain, dtype=dtype)
+        nodes = stat_path(self.registry, target_key=target_key, op_class=op_class, chain=cls.chain, dtype=dtype, read=True)
         ranked = sorted(((self.stats.estimate(t.id, nodes, t.prior or None), t) for t in techs), key=lambda x: -x[0])
         rows = []
         for est, t in ranked[:k_tech]:
