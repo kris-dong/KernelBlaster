@@ -39,7 +39,7 @@ from .predictions import PredictionBook
 from .states import Classification, State, StateHierarchy, load_seed
 from .stats import HierStats, path as stat_path
 from .store import KnowledgeDB, SQLiteClaimStore, SQLiteOutcomeLog
-from .targets import DATA_DIR, TargetRegistry
+from .targets import DATA_DIR, TargetRegistry, empty_seed
 
 MAX_PORT_TRIGGERS = 1        # per generation call
 GAP_MIN_TRIES = 4
@@ -62,6 +62,12 @@ class Choice:
     @property
     def hypothesis_id(self) -> Optional[str]:
         return self.item_id if self.kind == "hypothesis" else None
+
+
+FREE_FORM_ID = "free_form_optimization"
+FREE_FORM_DESC = ("No catalogued technique applies (the knowledge base is empty). Choose the single most promising "
+                  "optimization for this slot yourself, from the code, the measured state and the profile above; "
+                  "state in a one-line comment at the top of the kernel which optimization you applied.")
 
 
 def seed_mined_enabled() -> bool:
@@ -270,6 +276,9 @@ class KnowledgeV2:
             return Choice(h.id, "hypothesis", h.as_technique_desc(), self.stats.estimate(h.id, nodes),
                           self.stats.count(h.id, nodes[0]), "hypothesis under test", explore=True)
         items = [t.id for t in techs if t.id not in exclude] or [t.id for t in techs]
+        if not items and empty_seed():      # KB_EMPTY_SEED=1: nothing catalogued -> a free-form step (the model picks)
+            return Choice(FREE_FORM_ID, "technique", FREE_FORM_DESC, 0.0, 0.0, "untested",
+                          ranked=[])
         if not items:
             raise RuntimeError(f"no technique applies to {target_key} {op_class} {cls.label()}")
         ranked = self.stats.ucb(items, nodes, rng, c=self.ucb_c, priors=self.priors(items))

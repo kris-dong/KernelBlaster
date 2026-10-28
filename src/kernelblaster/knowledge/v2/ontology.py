@@ -24,7 +24,7 @@ from typing import Iterable, Optional
 
 from . import predicates as P
 from .metrics import CANONICAL, MEASURED, flat_band
-from .targets import DATA_DIR, NODE, REPO_DATA_DIR, TARGET, UNIVERSAL, TargetRegistry
+from .targets import DATA_DIR, NODE, REPO_DATA_DIR, TARGET, UNIVERSAL, TargetRegistry, empty_seed
 
 CONFIRMED, CONTRADICTED, MECH_UNKNOWN = "confirmed", "contradicted", "unknown"
 DIRECTIONS = ("up", "down", "flat", "up_or_flat", "down_or_flat")
@@ -180,6 +180,8 @@ def _base_kind(kind: str) -> str:
 
 def load_seed_techniques(data_dir: Optional[Path] = None) -> list[dict]:
     """Curated seeds: every ``techniques/*.json`` (sorted), or the single v1 ``techniques.json``."""
+    if empty_seed() and not data_dir:
+        return []
     base = Path(data_dir) if data_dir else DATA_DIR
     files = sorted((base / "techniques").glob("*.json")) if (base / "techniques").is_dir() else [base / "techniques.json"]
     out, seen = [], {}
@@ -272,6 +274,8 @@ _FOOTERS = {"footer:cuda": ("optimization_database_footer.md", "target:cuda"),
 
 def seed_legacy(o: Ontology, db_path: Optional[Path] = None, footer_dir: Optional[Path] = None) -> dict:
     """Read the old technique DB + footers once; add every unfolded name. Returns counters."""
+    if empty_seed():                                # KB_EMPTY_SEED=1: the legacy DB / footers are knowledge too
+        return {"added": 0, "folded": 0, "added_names": []}
     base = REPO_DATA_DIR.parent                     # the v1 DB + footers live next to the seeds
     db_path = Path(db_path) if db_path else base / "optimization_database.json"
     footer_dir = Path(footer_dir) if footer_dir else base

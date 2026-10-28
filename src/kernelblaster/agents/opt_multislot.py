@@ -558,7 +558,8 @@ def build_codegen_messages(*, problem: SlotProblem, sid: str, source: str, techn
         profile_text,
         best_note,
         f"C reference implementation (semantics oracle, not fast):\n```c\n{ref[:4000]}\n```" if ref else "",
-        hw_profile.recurrent_text(arch) if slot.op_class == "recurrent" and tp.name == "cuda" else "",
+        (hw_profile.recurrent_text(arch) if slot.op_class == "recurrent" and tp.name == "cuda"
+         and os.environ.get("KB_EMPTY_SEED", "0").strip().lower() not in ("1", "on", "true", "yes") else ""),   # curated advice: off under KB_EMPTY_SEED
         experiment_tool.model_context_text(problem.manifest),     # ModelBlaster --model-context (absent: "")
     ]
     if neighbours:

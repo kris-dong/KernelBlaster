@@ -22,7 +22,7 @@ from typing import Iterable, Optional
 
 from . import predicates as P
 from .metrics import values as metric_values
-from .targets import DATA_DIR, UNIVERSAL, TargetRegistry
+from .targets import DATA_DIR, UNIVERSAL, TargetRegistry, empty_seed
 
 CORE, PROBATIONARY, RETIRED = "core", "probationary", "retired"
 CLASSIFIED, UNKNOWN, UNEXPLAINED = "classified", "unknown", "unexplained"
@@ -69,6 +69,8 @@ class Classification:
 
 
 def load_seed(path: Optional[Path] = None) -> tuple[list[State], dict]:
+    if empty_seed() and not path:                   # KB_EMPTY_SEED=1: no states; the classifier answers "unexplained"
+        return [], {}
     d = json.loads((Path(path) if path else DATA_DIR / "states.json").read_text())
     states = []
     for i, s in enumerate(d["states"]):
