@@ -879,8 +879,16 @@ class MultiSlotAgent:
                  stop_event: Optional[asyncio.Event] = None, on_checkpoint: Any = None,
                  stop_patience: int = 0, pause_at: Optional[int] = None,
                  search: str = "independent", beam_width: int = 4, beam_expand: int = 2, beam_refill: bool = False,
-                 beam_cap: Optional[int] = None):
+                 beam_cap: Optional[int] = None, region_loop: Any = None, region_backend: Any = None,
+                 region_llm: Any = None):
         self.p, self.ev, self.model = problem, evaluator, model
+        # region loop (agents/region_loop.py; ModelBlaster --region-loop on): a bounded tool-using loop on the problem's REGION slots
+        # before the rollouts. ``region_loop`` is a region_loop.LoopConfig (None = off: nothing below runs and no key is added to
+        # the snapshot / result); ``region_backend`` / ``region_llm`` replace the evaluator backend / the LLM call (tests)
+        self.region_cfg = region_loop
+        self.region_backend, self.region_llm = region_backend, region_llm
+        self._region_done: dict = {}                    # slot id -> the loop's result (a slot the loop ran on is not rolled out)
+        self._region_handled: set = set()
         if search not in SEARCHES:
             raise ValueError(f"search must be one of {SEARCHES}, not {search!r}")
         if beam_width < 1 or beam_expand < 1:
@@ -1013,7 +1021,8 @@ class MultiSlotAgent:
         Sampling (not argmax) spreads parallel rollouts over slots; the stall
         decay stops a big slot that keeps failing from starving the others."""
         total = sum(self.slot_tries.values()) + 1
-        cands = [s for s in self.best if self._share(s) >= self.min_share] or list(self.best)
+        pool = [s for s in self.best if s not in self._region_handled] or list(self.best)   # region loop slots: not rolled out
+        cands = [s for s in pool if self._share(s) >= self.min_share] or list(pool)
         w = [self._share(s) * (self.stall_decay ** self.slot_stall[s])
              * (1.0 + 0.5 * math.sqrt(math.log(total + 1) / (1 + self.slot_tries[s]))) for s in cands]
         if sum(w) <= 0:
@@ -1483,6 +1492,147 @@ class MultiSlotAgent:
             note(self.p, res.eval_wall_s)
         self.runtime_info = partition_runtime(res)
         self.composite_version = getattr(self, "composite_version", 0) + 1
+
+    # ---- region loop (agents/region_loop.py; ModelBlaster --region-loop on; default off: none of this runs)
+    def _region_knowledge(self, sid: str) -> tuple[str, list]:
+        """The knowledge section of a region loop's prompt: claims in scope (v1 or v2 claims store), what was already tried on this
+        slot, the technique menu of the slot's class (launch-bound techniques included: a region is launch-bound by construction),
+        the recurrent advice for a recurrence, and implementation-store examples. Never raises (knowledge must not block a loop)."""
+        slot, parts, examples = self.p.slots[sid], [], []
+        try:
+            claims = self.kv.claims if self.kv is not None else self.claims
+            if claims is not None:
+                cl = claims.relevant(target=self.p.target, arch=self.arch_label, op_class=slot.op_class, state=None, technique=None,
+                                     problem_id=self.problem_id, slot=sid, k=12)
+                if cl:
+                    parts.append("Lessons from earlier runs:\n" + claims.render(cl))
+                tried = claims.already_tried(self.problem_id, sid)
+                if tried:
+                    parts.append("Already tried on this slot:\n" + tried)
+            techs = techniques_for(slot.op_class, self.tp.techniques, launch_bound=True,
+                                   arch=self.arch if self.tp.name == "cuda" else None, dtype=slot_dtype(self.p, sid))
+            parts.append("Techniques the flow knows for this class (a region may combine several):\n"
+                         + "\n".join(f"- {t}: {d}" for t, d in techs[:12]))
+            if slot.op_class == "recurrent" and self.tp.name == "cuda":
+                parts.append(hw_profile.recurrent_text(self.arch))
+            r = self._retrieve(sid)
+            if self.store is not None:
+                examples = [(f"{e.op}, {e.speedup_vs_seed or 1:.1f}x over its seed", self.store.code(e)) for e in r["examples"][:2]]
+        except Exception as e:                                   # noqa: BLE001
+            self.log.warning(f"region loop knowledge for {sid} failed: {e!r}")
+        return "\n\n".join(parts), examples
+
+    def _region_event(self, sid: str, loop, ev: dict) -> None:
+        """A loop event -> an outcome record (knowledge flows like a slot step's): a failed verify, and every timing."""
+        kind = ev.get("kind")
+        if kind not in ("verify", "timing"):
+            return
+        before = loop.cur_us
+        if kind == "verify":
+            if ev.get("ok"):
+                return
+            stage = ev.get("stage")
+            status = {"compile": COMPILE_ERROR, "run": RUNTIME_ERROR, "lint": COMPILE_ERROR}.get(stage, WRONG_OUTPUT)
+            okw = dict(sid=sid, technique="region_loop", status=status, metric_before=before, metric_after=None, speedup=None,
+                       error=str(ev.get("error") or "")[:1500], timing_basis="e2e_" + (self.runtime_info.get("e2e_basis") or "eager"))
+            reward = -0.05 if status == COMPILE_ERROR else -0.1
+        else:
+            gain = float(ev.get("gain") or 0.0)
+            after = ev.get("cand_us")
+            speedup = 1.0 / (1.0 - gain) if gain < 0.999 else None
+            okw = dict(sid=sid, technique="region_loop", status=classify_speedup(speedup), metric_before=before, metric_after=after,
+                       speedup=speedup, timing_basis="e2e_" + (ev.get("basis") or "paired"), e2e_before=ev.get("cur_us"), e2e_after=after,
+                       partition_effect=gain)
+            reward = max(-1.0, min(1.0, gain))
+        pend = loop.pending
+        if pend is not None:
+            okw["diff_summary"] = diff_summary(loop.current[sid], pend.code)
+        self._region_n = getattr(self, "_region_n", 0) + 1
+        okw["id"] = self._rid("region", sid, self._region_n)
+        try:
+            if self.kv is not None:
+                rec = self._outcome(**okw)
+                if rec.id not in self._existing["outcome"]:
+                    self.kv.outcomes.append(rec, {"item_id": "region_loop", "kind": "region_loop", "reward": round(reward, 6), "chain": [],
+                                                  "classification": "region_loop", "metrics_before": {}, "metrics_after": {},
+                                                  "mechanism": {"label": "unknown", "agree": 0, "disagree": 0, "metrics": {}},
+                                                  "est": 0.0, "explore": False, "hypothesis_id": None})
+            else:
+                self._record_outcome(**okw)
+        except Exception as e:                                   # noqa: BLE001 -- knowledge must never break a loop
+            self.log.warning(f"region loop outcome failed: {e!r}")
+
+    async def _region_one(self, sid: str, cfg) -> dict:
+        from . import region_loop as rl
+        model = self.router.models["codegen_hard"]
+        backend = self.region_backend or rl.EvaluatorBackend(self.ev, self.p, self.arch, self.out / "region_loop" / sid)
+        base_llm = self.region_llm or rl.default_llm(model, self.log)
+
+        async def llm(messages, role):                       # the loop's usage joins the problem's totals (llm_usage_by "region_loop")
+            text, u = await base_llm(messages, role)
+            self._count_usage(u, model, "region_loop", None)
+            return text, u
+        ktext, examples = self._region_knowledge(sid)
+        box: dict = {}
+        loop = rl.RegionLoop(problem=self.p, sid=sid, backend=backend, llm=llm, model=model, sources=self._sources(), baseline_us=self.e2e_us,
+                             cfg=cfg, out_dir=self.out / "region_loop" / sid, knowledge_text=ktext, examples=examples,
+                             on_event=lambda ev: self._region_event(sid, box["loop"], ev), logger=self.log, tag=f"rl_{self.run_id}")
+        box["loop"] = loop
+        self.log.info(f"[{self.p.name}] region loop on {sid}: {cfg.max_turns} turns / {cfg.max_tool_calls} tools / ${cfg.max_usd:.2f} / "
+                      f"{cfg.max_wall_s / 60:.0f} min")
+        res = await loop.run()
+        if res["changed"] and (res.get("final_check") or {}).get("ok", True) and loop.final_res is not None:
+            code, fin = loop.current[sid], loop.final_res
+            old = self.best[sid]
+            us = self._slot_us(fin, sid) or old.slot_us
+            impl_id = self._store(sid, code, us, old.slot_us, old.techniques + ["region_loop"], old.impl_id,
+                                  fin.slot_checks.get(sid, {}).get("rel_err"), rid=self._rid("impl", "region", sid))
+            self.best[sid] = SlotBest(code, us, impl_id, old.techniques + ["region_loop"], event_us=fin.slot_us.get(sid))
+            self._set_composite(fin)
+            self.log.info(f"[{self.p.name}] region loop {sid}: {old.slot_us:.1f} -> {us:.1f} us, end to end {self.e2e_us or 0:.1f} us "
+                          f"({len(res['commits'])} commit(s), {res['stop']})")
+        return res
+
+    async def _region_phase(self) -> None:
+        """Run the region loop on every region slot of the problem (largest share first; the problem's budget is shared by share)."""
+        from . import region_loop as rl
+        sids = [s for s in rl.region_slots(self.p) if s in self.best and s not in self._region_done]
+        if not sids:
+            return
+        shares = {s: max(self._share(s), 1e-6) for s in sids}
+        tot = sum(shares.values())
+        for sid in sorted(sids, key=lambda x: -shares[x]):
+            if self.stopping:
+                break
+            cfg = self.region_cfg.scaled(1.0 if len(sids) == 1 else max(shares[sid] / tot, 0.2))
+            try:
+                res = await self._region_one(sid, cfg)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:                                # noqa: BLE001 -- the generic steps still run on this slot
+                self.log.error(f"[{self.p.name}] region loop on {sid} failed: {e!r}")
+                self._region_done[sid] = {"sid": sid, "error": repr(e)[:300], "stop": "error", "ledger": {"turns": 0}, "commits": []}
+                continue
+            self._region_done[sid] = {k: v for k, v in res.items() if k not in ("config",)}
+            if (res.get("ledger") or {}).get("turns", 0) > 0:
+                self._region_handled.add(sid)                     # the loop ran: no generic rollouts on this slot
+            self._checkpoint()
+        if self.semantic is not None:
+            try:
+                await self.semantic.maybe_reflect()
+            except Exception as e:                                # noqa: BLE001
+                self.log.warning(f"semantic update after the region loop failed: {e!r}")
+        elif self.kv is not None:
+            try:
+                await self.kv.maybe_upkeep()
+            except Exception as e:                                # noqa: BLE001
+                self.log.warning(f"knowledge-v2 upkeep after the region loop failed: {e!r}")
+
+    def _region_summary(self) -> dict:
+        slots = self._region_done
+        return {"config": self.region_cfg.describe() if self.region_cfg is not None else None, "slots": slots,
+                "usd": round(sum((r.get("ledger") or {}).get("usd", 0.0) for r in slots.values()), 4),
+                "commits": sum(len(r.get("commits") or []) for r in slots.values())}
 
     # ---- one step
     async def _step(self, ridx: int, step: int, cur: dict[str, str], cur_us: dict[str, float],
@@ -2251,6 +2401,7 @@ class MultiSlotAgent:
             "kv_counters": ({"n_selected": getattr(self.kv, "n_selected", 0), "n_explore": getattr(self.kv, "n_explore", 0)}
                             if self.kv is not None else None),
             "code": code,
+            **({"region_loop": {"done": self._region_done}} if self.region_cfg is not None else {}),
             **({"search": self.search, "beam_width": self.beam_width, "beam_expand": self.beam_expand,
                 "beam": None if self._beam is None else {
                     "step": self._beam["step"],
@@ -2289,6 +2440,9 @@ class MultiSlotAgent:
                                  "cur_us": x["cur_us"], "meta": x["meta"]}
                         for r, x in st.get("rollout_state", {}).items()}
         self._replay = dict(st.get("inflight", {}))
+        if st.get("region_loop") and self.region_cfg is not None:
+            self._region_done = dict(st["region_loop"].get("done") or {})
+            self._region_handled = set(self._region_done)
         if self.search == "beam":
             if st.get("beam"):
                 self._beam = {"step": st["beam"]["step"],
@@ -2442,6 +2596,8 @@ class MultiSlotAgent:
             else:
                 await self._verify_restored()
         if self.phase == "rollouts":
+            if self.region_cfg is not None:
+                await self._region_phase()               # --region-loop on: the tool-using loop on the region slots first
             if self.search == "beam":
                 await self._beam_search()
             else:
@@ -2515,6 +2671,7 @@ class MultiSlotAgent:
             "llm_usage": {**self.llm_usage, "cost_usd": round(self.llm_usage["cost_usd"], 4)},
             "llm_usage_by_model": sorted(self.llm_usage_by.values(), key=lambda d: (d["role"], d["model"])),
             **({"multiturn": self.mt_stats} if getattr(self, "mt_stats", None) else {}),
+            **({"region_loop": self._region_summary()} if self.region_cfg is not None else {}),
             **({"experiments": self._exp.pointer()} if getattr(self, "_exp", None) is not None else {}),
             **({"clock_suspect": {"steps": self.clock_suspect_steps}} if getattr(self, "clock_suspect_steps", 0) else {}),
             "ncu": {"mode": self.ncu, "runs": self.ncu_runs, "disabled": self.ncu_disabled,
