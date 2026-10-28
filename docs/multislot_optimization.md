@@ -36,6 +36,41 @@ reuse it across runs so later problems start from earlier winners and lessons. O
 problem: `result.json` (baseline/final times, per-slot results, every step), `best/slots/*.cu`,
 `proposals.json`.
 
+## Beam search (`--search beam`)
+
+`--search independent` (default) is the rollout scheme described below. `--search beam
+--beam-width B --beam-expand K` replaces the independent rollouts by a beam search, so
+rollouts build on the best states found so far instead of each walking its own path (many
+independent rollouts re-derive the same early kernel from the seed; the later gains come from
+the ones that keep building on their own best).
+
+* A beam member is a full per-slot source set plus its end-to-end time. Step 0 expands the
+  baseline into `max(B*K, --rollouts)` candidates; every later step expands each member `K` ways.
+* The `K` candidates of one parent get different techniques: the usual selector (v2 knowledge
+  `select(exclude=...)` or the v1 bandit over the techniques not yet taken) picks, and each pick
+  is excluded for the parent's siblings (falls back to repeats only when the catalogue is
+  exhausted). Slot choice, prompts, fix loops, outcome / store / knowledge records, telemetry and
+  trace are the ordinary step's; candidate `c` of beam step `s` is "rollout" `c`, step `s` in
+  every id and journal key (`r<c>s<s>c<n>`), so a killed run resumes through the existing journal.
+* All candidates of a step run concurrently under the existing LLM / GPU limits. Then
+  `select_beam` keeps the best `B` distinct (code hash) states, ranked by end-to-end time, among
+  the children that were kept (improved or neutral: regressions and failures are dropped) and the
+  previous members, so the best state is never lost.
+* A candidate is judged against its parent (the e2e gain is not min'ed with the confirm run
+  against the composite as in the independent mode); a gain of `--e2e-accept-pct` or more is still
+  confirmed against the composite and merged into it as before. If the beam's best member beats the
+  composite clearly (e.g. its win was not merged because a sibling merged first) it is measured
+  whole and adopted (`beam_s<s>_promote`). The result is the composite best, exactly as before;
+  `result.json` gets `search.beams` (one record per step) and each step's `context.beam`.
+* The journal records the beam; a journal made with another `--search` is refused like any other
+  configuration change. `--rollouts` only sizes step 0 in beam mode.
+* `--beam-refill on` (default off): when fewer than `B` members survive (e.g. a beam of one), the
+  step still makes `B*K` candidates (spread over the members, best first, still distinct techniques),
+  so the budget of a run is `max(B*K, rollouts) + (steps-1)*B*K` regardless of the beam's size. A
+  per-problem `mb_budget.rollouts` caps the candidates per step; `mb_budget.steps`, E7 patience, the
+  external stop and `--pause-spec` are honoured at step boundaries. `result.json` `search.beams[]`
+  also records `per_parent`, cumulative `llm_calls` and `steps_committed`.
+
 ## Agent loop
 
 Per step: sample a slot (time share × stall decay × exploration bonus) → classify its roofline

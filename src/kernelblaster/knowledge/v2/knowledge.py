@@ -261,6 +261,8 @@ class KnowledgeV2:
                                       op_kind=op_kind)
         nodes = stat_path(self.registry, target_key=target_key, op_class=op_class, chain=chain, dtype=dtype)
         self.n_selected += 1
+        if exclude:                               # beam search: not a hypothesis a sibling already tests
+            hyps = [h for h in hyps if h.id not in exclude]
         # exploration budget: hypotheses get ~explore_frac of the steps when one is testable here
         if hyps and (self.n_explore + 1) <= self.explore_frac * (self.n_selected + 1):
             h = hyps[0]

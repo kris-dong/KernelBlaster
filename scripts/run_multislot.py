@@ -4,6 +4,7 @@
         --model claude-code:sonnet [--reflect-model claude-code:haiku] \
         [--knowledge-dir DIR] [--arch 75] [--rollouts 4 --steps 6] \
         [--evaluator local|server|ssh|board ...] [--ncu off|best|all] \
+        [--search independent|beam --beam-width 4 --beam-expand 2] \
         [--parallel-problems N] [--gpus auto] [--ssh-host H1 --ssh-host H2 --cuda-visible-devices auto]
 
 PROBLEM_DIR_OR_ROOT: a directory with manifest.json, or a root searched for
@@ -13,6 +14,16 @@ share it across runs so later problems start from earlier winners and
 lessons. ``--model`` is any name ``generate_code`` routes: ``claude-code:<m>``
 (Claude Code CLI, no key), ``stub:<name>`` (registered by a ``--plugin``
 file), or an API model.
+
+Search (``--search``): ``independent`` (default) runs ``--rollouts`` independent rollouts of
+``--steps`` steps that share a composite best. ``beam`` runs a beam search instead: step 0
+generates max(B*K, ``--rollouts``) candidates from the baseline; at every later step each
+of the ``--beam-width`` (B) kept states -- a full per-slot source set with its end-to-end time --
+is expanded ``--beam-expand`` (K) ways with distinct techniques (the usual selector: v2
+knowledge / bandit), all B*K candidates run concurrently, and the best B non-regressing
+distinct states (neutral ones included, ranked by end-to-end time; the previous beam
+competes too) become the next beam. ``--rollouts`` then only sizes step 0 (``--beam-refill on``: a short beam still makes B*K candidates). The result is
+still the composite best (``best/slots``); result.json gets ``search.beams``.
 
 Model heterogeneity (``agents/model_router.py``): ``--model-simple`` /
 ``--model-hard`` / ``--fix-model`` (or MODEL_CODEGEN_SIMPLE / MODEL_CODEGEN_HARD /
@@ -160,7 +171,11 @@ def run_config(args, router) -> dict:
             "knowledge": args.knowledge, "ncu": args.ncu, "arch": args.arch,
             "knowledge_dir": str(Path(args.knowledge_dir).resolve()) if args.knowledge_dir else None,
             # E7 patience: only when on, so an out dir from before the rule (or with it off) keeps its config
-            **({"stop_patience": args.stop_patience} if args.stop_patience else {})}
+            **({"stop_patience": args.stop_patience} if args.stop_patience else {}),
+            # beam: only when on, so an out dir from before beam (or with --search independent) keeps its config
+            **({"search": args.search, "beam_width": args.beam_width, "beam_expand": args.beam_expand,
+                **({"beam_refill": True} if args.beam_refill == "on" else {})}
+               if args.search != "independent" else {})}
 
 
 # E7 efficiency rules (docs/multislot_optimization.md "Efficiency rules"; ModelBlaster pipeline/kb_efficiency.py):
@@ -467,7 +482,10 @@ async def _run_inner(args, run_span) -> int:
                                        rollouts=b_rollouts, steps=b_steps,
                                        max_fix_attempts=args.max_fix, seed=args.seed, logger=logger, ncu=args.ncu,
                                        knowledge_v2=kv, reward=args.reward, e2e_accept_pct=args.e2e_accept_pct,
-                                       stop_patience=b_patience, pause_at=pause_at)
+                                       stop_patience=b_patience, pause_at=pause_at,
+                                       search=args.search, beam_width=args.beam_width,
+                                       beam_expand=args.beam_expand, beam_refill=(args.beam_refill == 'on'),
+                                       beam_cap=(b_rollouts if (getattr(p, 'manifest', None) or {}).get('mb_budget', {}).get('rollouts') else None))
                 try:
                     res = await agent.run()
                 except J.RunPaused as e:                   # halfway sync: parked; the run exits EXIT_PAUSED below
@@ -677,6 +695,16 @@ def build_parser() -> argparse.ArgumentParser:
                     help="CUDA: SM number, e.g. 75 / 89 (default 75); OpenCL: device, e.g. adreno650 (default) / titanrtx")
     ap.add_argument("--rollouts", type=int, default=3)
     ap.add_argument("--steps", type=int, default=5)
+    ap.add_argument("--search", choices=["independent", "beam"], default="independent",
+                    help="independent: parallel rollouts sharing a composite best (default); beam: every step expands "
+                         "the best --beam-width states --beam-expand ways (see the module docstring)")
+    ap.add_argument("--beam-width", type=int, default=4, help="beam: states kept per step (B)")
+    ap.add_argument("--beam-expand", type=int, default=2,
+                    help="beam: candidates per kept state per step (K), each with a different technique")
+    ap.add_argument("--beam-refill", choices=["on", "off"], default="off",
+                    help="beam: when fewer than --beam-width states survive (e.g. a beam of one), expand each one "
+                         "beam-width*beam-expand/|beam| ways so a step still makes the budgeted number of "
+                         "candidates (default off)")
     ap.add_argument("--max-fix", type=int, default=2)
     ap.add_argument("--efficiency-rules", choices=sorted(EFFICIENCY_PATIENCE), default=None,
                     help="E7 cost-efficiency rules (docs/multislot_optimization.md): on (default for a new out dir: "
