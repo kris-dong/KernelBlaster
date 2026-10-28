@@ -54,6 +54,8 @@ def technique_tier(name: str, technique=None) -> str:
     tier = ((getattr(technique, "params", None) or {}).get("tier") if technique is not None else None)
     if tier in ("simple", "hard"):
         return tier
+    if name == "free_form_optimization":     # KB_EMPTY_SEED=1 free-form step: the model chooses the optimization -> hard tier
+        return "hard"
     low = (name or "").lower()
     return "hard" if any(p in low for p in HARD_PATTERNS) else "simple"
 

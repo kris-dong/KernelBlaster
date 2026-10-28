@@ -42,6 +42,14 @@ REPO_DATA_DIR = Path(__file__).resolve().parents[4] / "data" / "kernelblaster" /
 DATA_DIR = Path(os.environ.get("KB_KNOWLEDGE_SEED_DIR") or REPO_DATA_DIR)
 
 
+def empty_seed() -> bool:
+    """``KB_EMPTY_SEED=1`` (default off): no built-in knowledge at all. No curated techniques / states (whatever
+    ``DATA_DIR`` holds), no legacy technique DB / footer techniques, no recurrent-class seeds; only the hardware
+    description (``targets.json``) loads. ``KnowledgeV2.select`` then falls back to a free-form step when no
+    technique applies (instead of raising)."""
+    return os.environ.get("KB_EMPTY_SEED", "0").strip().lower() in ("1", "on", "true", "yes")
+
+
 def target_key(target: str, arch: Optional[str] = None) -> str:
     """``("cuda", "sm_75")`` / ``("cuda", "75")`` -> ``cuda:sm_75``; keys pass through."""
     if ":" in (target or ""):
