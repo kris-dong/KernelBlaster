@@ -1576,7 +1576,8 @@ class MultiSlotAgent:
         box: dict = {}
         loop = rl.RegionLoop(problem=self.p, sid=sid, backend=backend, llm=llm, model=model, sources=self._sources(), baseline_us=self.e2e_us,
                              cfg=cfg, out_dir=self.out / "region_loop" / sid, knowledge_text=ktext, examples=examples,
-                             on_event=lambda ev: self._region_event(sid, box["loop"], ev), logger=self.log, tag=f"rl_{self.run_id}")
+                             on_event=lambda ev: self._region_event(sid, box["loop"], ev), logger=self.log, tag=f"rl_{self.run_id}",
+                             should_stop=lambda: self.stopping)
         box["loop"] = loop
         self.log.info(f"[{self.p.name}] region loop on {sid}: {cfg.max_turns} turns / {cfg.max_tool_calls} tools / ${cfg.max_usd:.2f} / "
                       f"{cfg.max_wall_s / 60:.0f} min")
@@ -1613,6 +1614,9 @@ class MultiSlotAgent:
                 self.log.error(f"[{self.p.name}] region loop on {sid} failed: {e!r}")
                 self._region_done[sid] = {"sid": sid, "error": repr(e)[:300], "stop": "error", "ledger": {"turns": 0}, "commits": []}
                 continue
+            if res.get("stop") == "interrupted":                   # SIGTERM: whatever was committed is adopted; the slot's loop reruns on resume
+                self._checkpoint()
+                break
             self._region_done[sid] = {k: v for k, v in res.items() if k not in ("config",)}
             if (res.get("ledger") or {}).get("turns", 0) > 0:
                 self._region_handled.add(sid)                     # the loop ran: no generic rollouts on this slot
