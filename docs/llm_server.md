@@ -127,6 +127,16 @@ calls. Nothing in `run_multislot.py` or MB needs a flag.
 `generate_code_retry` re-raises the `RelayFatalError` subclasses immediately, so a run stops at once on a bad token or
 an exhausted budget.
 
+### No tool / function calling; output-token caps
+
+The request carries `messages` (`{role, content: str}`) and nothing else: there is no `tools` / `tool_choice` / `tool_calls` pass-through
+(not in the server, not in `generate_code_retry`, not in the Bedrock Converse / OpenAI / `stub:` / `claude-code:` providers). Agent loops
+over the relay therefore use a structured-text protocol on plain chat (one JSON action per turn, the harness's result as the next user
+message): see `agents/region_loop.py`. The reply length is capped on the SERVER process: `BEDROCK_MAX_TOKENS` / `ANTHROPIC_MAX_TOKENS`
+(default 8192) for Bedrock models and `OPENAI_MAX_TOKENS` (unset: the proxy's default, 4096 for Anthropic models behind an OpenAI-compatible
+proxy) for the OpenAI path; a reply cut at the cap shows in `usage.telemetry.stop_reasons` (`max_tokens` / `length`). Long generations (a
+megakernel) need these raised, e.g. 32000.
+
 ### Idempotency
 
 The client sends a fresh `request_id` per `generate_code` call and reuses it on its own retries. The server keeps
