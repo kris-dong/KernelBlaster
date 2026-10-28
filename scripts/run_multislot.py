@@ -188,8 +188,7 @@ def region_loop_config(args):
     on = getattr(args, "region_loop", None)
     if not rl.enabled(on):
         return None
-    b = rl.parse_budget(getattr(args, "region_loop_budget", None) or os.environ.get(rl.ENV_BUDGET))
-    return rl.LoopConfig(max_turns=int(b["turns"]), max_tool_calls=int(b["tools"]), max_usd=float(b["usd"]), max_wall_s=float(b["wall_s"]))
+    return rl.LoopConfig.from_env(os.environ, budget=getattr(args, "region_loop_budget", None))
 
 
 # E7 efficiency rules (docs/multislot_optimization.md "Efficiency rules"; ModelBlaster pipeline/kb_efficiency.py):

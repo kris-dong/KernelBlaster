@@ -205,6 +205,11 @@ def test_budget_parse_and_enable(monkeypatch):
     assert (c.max_turns, c.max_tool_calls, c.max_usd, c.max_wall_s) == (7, 9, 1.5, 60.0)
     s = c.scaled(0.5)
     assert (s.max_turns, s.max_usd, s.max_wall_s) == (6, 0.75, 30.0)      # the turn floor
+    assert (c.commit_gain, c.repeat_gain) == (0.15, 0.03)
+    c = rl.LoopConfig.from_env({rl.ENV_COMMIT: "-1,-1"}, budget="3,4,5,6")                     # the smoke-test override
+    assert (c.commit_gain, c.repeat_gain, c.max_turns, c.max_wall_s) == (-1.0, -1.0, 3, 6.0)
+    with pytest.raises(ValueError):
+        rl.LoopConfig.from_env({rl.ENV_COMMIT: "x"})
 
 
 def test_lint():
@@ -689,3 +694,22 @@ def test_clock_suspect_timing_is_not_evidence(tmp_path):
     res = run(loop)
     ev = [json.loads(l) for l in (tmp_path / "out" / "events.jsonl").read_text().splitlines() if '"kind": "tool"' in l]
     assert ev[1]["ok"] is False and "clock guard" in ev[1]["result"] and not res["commits"]
+
+
+def test_region_echo_plugin_drives_the_whole_path(tmp_path, monkeypatch):
+    """The smoke stub of the RUNBOOK (tests/fixtures/region_echo_plugin.py): show, profile, a no-op edit, verify, time, commit (the commit rule is
+    lowered to accept any timing), status, finish -- through the flow's LLM path (stub provider)."""
+    import runpy
+    runpy.run_path(str(Path(__file__).parent / "fixtures" / "region_echo_plugin.py"))
+    monkeypatch.setenv(rl.ENV_COMMIT, "-1,-1")
+    prob = make_problem(tmp_path / "prob")
+    be = FakeBackend()
+    loop = rl.RegionLoop(problem=prob, sid=SID, backend=be, llm=rl.default_llm("stub:region_echo"), model="stub:region_echo",
+                         sources=prob.seed_sources(), baseline_us=100.0, cfg=rl.LoopConfig.from_env(), out_dir=tmp_path / "o")
+    res = run(loop)
+    from kernelblaster.agents.utils import agentic_llm
+    agentic_llm.unregister_stub("region_echo")
+    assert res["stop"] == "finished" and len(res["commits"]) == 1 and res["changed"], res
+    assert "/* region_echo */" in loop.current[SID] and res["final_check"]["ok"]
+    assert [e for e in res["ledger"]["per_tool"]] == ["show", "profile", "edit", "verify", "time", "commit", "status", "finish"]
+    assert all(v["errors"] == 0 for v in res["ledger"]["per_tool"].values())

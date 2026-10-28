@@ -70,6 +70,7 @@ from typing import Any, Awaitable, Callable, Mapping, Optional
 
 ENV = "KERNELBLASTER_REGION_LOOP"
 ENV_BUDGET = "KERNELBLASTER_REGION_LOOP_BUDGET"          # "turns,tools,usd,wall_s"
+ENV_COMMIT = "KERNELBLASTER_REGION_LOOP_COMMIT"          # "commit_gain,repeat_gain" (fractions; default 0.15,0.03; a smoke test sets -1,-1)
 REGION_PREFIX = "region__"
 TOOLS = ("show", "profile", "scratch", "edit", "verify", "time", "commit", "revert", "status", "finish")
 CODE_TOOLS = ("verify", "time", "scratch")               # tools that take a code block (``edit`` takes SEARCH/REPLACE blocks)
@@ -124,8 +125,17 @@ class LoopConfig:
     role: str = "codegen_hard"
 
     @classmethod
-    def from_env(cls, env: Mapping = os.environ, **kw) -> "LoopConfig":
-        b = parse_budget(env.get(ENV_BUDGET))
+    def from_env(cls, env: Mapping = os.environ, budget: Optional[str] = None, **kw) -> "LoopConfig":
+        """Budget from ``budget`` (the flag) else ``$KERNELBLASTER_REGION_LOOP_BUDGET``; commit rule from ``$KERNELBLASTER_REGION_LOOP_COMMIT``."""
+        b = parse_budget(budget or env.get(ENV_BUDGET))
+        c = str(env.get(ENV_COMMIT, "") or "").strip()
+        if c:
+            try:
+                cg, rg = (float(x) for x in c.split(","))
+            except ValueError:
+                raise ValueError(f"{ENV_COMMIT}={c!r}: expected commit_gain,repeat_gain (fractions)") from None
+            kw.setdefault("commit_gain", cg)
+            kw.setdefault("repeat_gain", rg)
         return cls(max_turns=int(b["turns"]), max_tool_calls=int(b["tools"]), max_usd=float(b["usd"]),
                    max_wall_s=float(b["wall_s"]), **kw)
 
