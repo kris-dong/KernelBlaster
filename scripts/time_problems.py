@@ -15,6 +15,13 @@ KernelBlaster runs that optimised the components.
          --remote-dir DIR [--cuda-visible-devices auto|ids] [--ssh-key K]] \\
         [--runtime auto|host|process] [--gpu-model 'NVIDIA L40S'] [--devices 1] [--timeout 1800] \\
         [--driver-env MB_WALL=1 ...]
+    python scripts/time_problems.py JOBS.json --out OUT.json --arch adreno650 --evaluator board \\
+        --board-host root@rb5 --remote-dir /root/mb [--board-lock F] [--board-env NAME=value]   # OpenCL
+
+OpenCL problems (manifest ``target`` "opencl") run one process per run on one device: the board
+(``--evaluator board``: KernelBlaster's ``AdrenoEvaluator``, the board's lock held per build + run)
+or this host's OpenCL GPU (``local``); ``--arch`` is the device label and each run records the
+device (``MB_DEVICE``) as its ``gpu``; ``--gpu-model`` must match that name.
 
 ``JOBS.json``: ``{"jobs": [{"id", "problem": DIR, "sources": {slot: text} | null (the problem's
 own slot files), "incumbent": {slot: text} | null, "reps": N}], "order": "rounds" | "jobs"}``.
@@ -45,7 +52,8 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from kernelblaster import telemetry as tel  # noqa: E402
 from kernelblaster.knowledge import slots as _slots  # noqa: E402
-from kernelblaster.knowledge.slots import LocalEvaluator, SlotProblem, SSHEvaluator  # noqa: E402
+from kernelblaster.knowledge.slots import (AdrenoEvaluator, LocalEvaluator, OpenCLLocalEvaluator,  # noqa: E402
+                                           SlotProblem, SSHEvaluator, board_env)
 
 FORMAT = "kernelblaster.time_problems/v1"
 _DROP = ("log",)
@@ -59,7 +67,27 @@ def row(r) -> dict:
     return d
 
 
-def make_evaluator(a):
+def jobs_target(jobs: list[dict]) -> str:
+    """The jobs' one slot target (manifest ``target``): cuda | opencl."""
+    ts = {json.loads((Path(j["problem"]) / "manifest.json").read_text()).get("target", "cuda") for j in jobs}
+    if len(ts) > 1:
+        raise SystemExit(f"jobs mix slot targets {sorted(ts)}: time each target separately")
+    return ts.pop() if ts else "cuda"
+
+
+def make_evaluator(a, target: str = "cuda"):
+    if target == "opencl":
+        # OpenCL (Adreno): the board over ssh, or this host's OpenCL GPU; one device, no pool
+        if a.evaluator == "board":
+            return AdrenoEvaluator(a.board_host, remote_dir=a.remote_dir or "/tmp/kernelblaster_multislot",
+                                   ssh_key=a.ssh_key, timeout_s=a.timeout, work_root=Path(a.work),
+                                   lock=a.board_lock, env=board_env(a.board_env), arch=a.arch)
+        if a.evaluator == "local":
+            return OpenCLLocalEvaluator(work_root=Path(a.work), timeout_s=a.timeout, env=board_env(a.board_env),
+                                        arch=a.arch)
+        raise SystemExit(f"--evaluator {a.evaluator} does not run OpenCL problems (board|local)")
+    if a.evaluator == "board":
+        raise SystemExit("--evaluator board runs OpenCL problems only")
     kw = dict(work_root=Path(a.work), runtime=a.runtime, timeout_s=a.timeout, graph=True,
               gpu_model=a.gpu_model, max_devices=a.devices or None)
     if a.evaluator == "ssh":
@@ -119,7 +147,10 @@ async def main_async(a) -> int:
     spec = json.loads(Path(a.jobs).read_text())
     jobs = spec["jobs"]
     Path(a.work).mkdir(parents=True, exist_ok=True)
-    res = {"format": FORMAT, "evaluator": a.evaluator, "arch": f"sm_{a.arch}", "runtime": a.runtime,
+    target = jobs_target(jobs)
+    res = {"format": FORMAT, "evaluator": a.evaluator, "target": target,
+           "arch": f"sm_{a.arch}" if target == "cuda" else a.arch,
+           "runtime": a.runtime if target == "cuda" else "process",
            "gpu_model": a.gpu_model, "devices": a.devices, "jobs": {}, "error": None}
     t0 = time.time()
     for kv in a.driver_env or []:                # e.g. MB_WALL=1: added to every driver run
@@ -128,19 +159,30 @@ async def main_async(a) -> int:
             raise SystemExit(f"--driver-env {kv!r}: expected MB_<NAME>=<value>")
         _slots.EXTRA_DRIVER_ENV[k] = v
     tel.configure(Path(a.telemetry) if a.telemetry else None)
-    ev = make_evaluator(a)
+    ev = make_evaluator(a, target)
     with tel.span("kb.time_problems", collect=True, jobs=len(jobs), evaluator=a.evaluator) as sp:
         try:
-            pool = await ev.pool()
-            res["pool"] = [{"label": d.label(), "host": d.host, "ident": d.ident, "index": d.index, "name": d.name}
-                           for d in pool.devices]
-            res["models"] = pool.models
-            res["jobs"] = await time_jobs(ev, jobs, spec.get("order", "rounds"))
-            res["pool_stats"] = pool.stats()
+            if target == "opencl":              # one device (the board): it is what the runs record
+                res["jobs"] = await time_jobs(ev, jobs, spec.get("order", "rounds"))
+                names = sorted({g["name"] for o in res["jobs"].values() for g in [o.get("gpu") or {}]
+                                if g.get("name")})
+                res["models"] = names
+                res["pool"] = [{"label": getattr(ev, "host", None) or "local", "host": getattr(ev, "host", None),
+                                "ident": None, "index": None, "name": n} for n in names]
+                from kernelblaster.servers.utils.resources import gpu_model_key
+                if a.gpu_model and names and not any(gpu_model_key(n) == gpu_model_key(a.gpu_model) for n in names):
+                    raise RuntimeError(f"NoDevice: the runs used {names}, not {a.gpu_model}")
+            else:
+                pool = await ev.pool()
+                res["pool"] = [{"label": d.label(), "host": d.host, "ident": d.ident, "index": d.index, "name": d.name}
+                               for d in pool.devices]
+                res["models"] = pool.models
+                res["jobs"] = await time_jobs(ev, jobs, spec.get("order", "rounds"))
+                res["pool_stats"] = pool.stats()
         except Exception as e:  # noqa: BLE001 -- reported to the caller (e.g. no GPU of the model)
             res["error"] = f"{type(e).__name__}: {e}"
         finally:
-            res["host_stats"] = ev.host_stats()
+            res["host_stats"] = ev.host_stats() if hasattr(ev, "host_stats") else {}
             await ev.close()
     res["seconds"] = round(time.time() - t0, 2)
     summ = tel.full_summary(sp)
@@ -158,7 +200,14 @@ def main():
     ap.add_argument("jobs")
     ap.add_argument("--out", required=True)
     ap.add_argument("--arch", default="75")
-    ap.add_argument("--evaluator", choices=["local", "ssh"], default="local")
+    ap.add_argument("--evaluator", choices=["local", "ssh", "board"], default="local",
+                    help="local: this host's GPUs (OpenCL problems: its OpenCL GPU); ssh: remote CUDA GPUs; "
+                         "board: build + run OpenCL problems on the board over ssh (--board-host)")
+    ap.add_argument("--board-host", default=None, help="user@board for --evaluator board "
+                    "(default $KERNELBLASTER_ADRENO_BOARD_HOST)")
+    ap.add_argument("--board-lock", default=None, help="flock file on the board held per build + run "
+                    "(default $KERNELBLASTER_BOARD_LOCK, else ~/mb_board.lock; off: none)")
+    ap.add_argument("--board-env", action="append", default=[], help="NAME=value for every OpenCL run")
     ap.add_argument("--gpus", default="auto")
     ap.add_argument("--ssh-host", action="append", default=[])
     ap.add_argument("--ssh-key", default=None)
