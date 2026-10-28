@@ -2078,14 +2078,18 @@ class AdrenoEvaluator(Evaluator):
     clean up): one main.cpp per candidate is copied into a per-candidate
     directory, compiled with the board's g++ against its libOpenCL, run, and
     the directory is removed. data.bin is copied once per problem into
-    ``remote_dir``; ``close()`` removes ``remote_dir``."""
+    ``remote_dir``; ``close()`` removes ``remote_dir``. With ``lock`` (a file
+    on the board, default $KERNELBLASTER_ADRENO_BOARD_LOCK) each build + run
+    holds ``flock <lock>`` on the board, so runs of other users of a shared
+    board never overlap ours (and timings stay clean)."""
 
     def __init__(self, host: Optional[str] = None, *, remote_dir: str = "/tmp/kernelblaster_multislot",
                  ssh_key: Optional[str] = None, cxx: str = "g++", timeout_s: int = 1800,
-                 work_root: Optional[Path] = None, keep: bool = False):
+                 work_root: Optional[Path] = None, keep: bool = False, lock: Optional[str] = None):
         from ..backends.opencl import default_board_host
 
         self.host = host or default_board_host()
+        self.lock = lock if lock is not None else os.environ.get("KERNELBLASTER_ADRENO_BOARD_LOCK") or None
         self.remote_dir, self.key, self.cxx = remote_dir.rstrip("/"), ssh_key, cxx
         self.timeout_s, self.keep = timeout_s, keep
         self.work_root = Path(work_root) if work_root else None
@@ -2135,10 +2139,13 @@ class AdrenoEvaluator(Evaluator):
         local.mkdir(parents=True, exist_ok=True)
         (local / "main.cpp").write_text(opencl_main(problem, sources))
         envs = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env.items())
-        script = (f"cd {shlex.quote(d)} || exit 1; "
-                  f"if {self.cxx} {OPENCL_CXXFLAGS} -o main main.cpp {OPENCL_LDFLAGS} > build.log 2>&1; then "
-                  f"env {envs} ./main {shlex.quote(data)}; else echo MB_BUILD_FAILED; tail -c 6000 build.log; fi; "
-                  f"cd / && rm -rf {shlex.quote(d)}")
+        # the board-side timeout ends the run (and frees the lock) if our ssh is cut off
+        work = (f"if {self.cxx} {OPENCL_CXXFLAGS} -o main main.cpp {OPENCL_LDFLAGS} > build.log 2>&1; then "
+                f"timeout -k 10 {int(self.timeout_s)} env {envs} ./main {shlex.quote(data)}; "
+                f"else echo MB_BUILD_FAILED; tail -c 6000 build.log; fi")
+        if self.lock:
+            work = f"flock {shlex.quote(self.lock)} sh -c {shlex.quote(work)}"
+        script = f"cd {shlex.quote(d)} || exit 1; {work}; cd / && rm -rf {shlex.quote(d)}"
         try:
             async with self._board:
                 rc, out = await self._ssh(f"mkdir -p {shlex.quote(d)}", timeout=60)

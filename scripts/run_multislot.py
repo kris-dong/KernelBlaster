@@ -332,7 +332,7 @@ async def _run_inner(args, run_span) -> int:
         elif target == "opencl":
             if args.evaluator == "board":
                 ev = AdrenoEvaluator(args.board_host, remote_dir=args.remote_dir or "/tmp/kernelblaster_multislot",
-                                     ssh_key=args.ssh_key, work_root=out / "work")
+                                     ssh_key=args.ssh_key, work_root=out / "work", lock=args.board_lock)
             elif args.evaluator == "server":
                 from kernelblaster.config import GPUType
                 ev = OpenCLServerEvaluator(GPUType(args.gpu), out / "work")
@@ -742,6 +742,8 @@ def build_parser() -> argparse.ArgumentParser:
                          "build + run on the Adreno board over ssh (OpenCL)")
     ap.add_argument("--board-host", default=None, help="user@board for --evaluator board "
                     "(default $KERNELBLASTER_ADRENO_BOARD_HOST)")
+    ap.add_argument("--board-lock", default=None, help="lock file on the board: every build + run holds "
+                    "flock on it (shared boards; default $KERNELBLASTER_ADRENO_BOARD_LOCK, none if unset)")
     ap.add_argument("--gpu", default="titanrtx", help="GPUType for --evaluator server")
     ap.add_argument("--ssh-host", action="append", default=[],
                     help="user@host with GPUs (--evaluator ssh); repeatable, runs spread over every host's GPUs")
