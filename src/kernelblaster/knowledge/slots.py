@@ -2008,9 +2008,10 @@ def _opencl_gpu(r: EvalResult, host: Optional[str], arch: Optional[str]) -> Eval
 
 def board_lock_path(lock: Optional[str] = None) -> Optional[str]:
     """The board's exclusive lock (an flock file on the board) every build + run holds:
-    ``lock``, else ``$KERNELBLASTER_BOARD_LOCK``, else ``~/mb_board.lock`` (``/root/mb_board.lock``
-    for root); ``off`` / ``0`` / empty disables it."""
-    v = lock if lock is not None else os.getenv("KERNELBLASTER_BOARD_LOCK", "~/mb_board.lock")
+    ``lock``, else ``$KERNELBLASTER_BOARD_LOCK`` (or ``$KERNELBLASTER_ADRENO_BOARD_LOCK``), else
+    ``~/mb_board.lock`` (``/root/mb_board.lock`` for root); ``off`` / ``0`` / empty disables it."""
+    v = lock if lock is not None else (os.getenv("KERNELBLASTER_BOARD_LOCK")
+                                       or os.getenv("KERNELBLASTER_ADRENO_BOARD_LOCK") or "~/mb_board.lock")
     return None if str(v).strip().lower() in ("", "0", "off", "none", "no") else str(v)
 
 
@@ -2185,7 +2186,9 @@ class AdrenoEvaluator(Evaluator):
         (local / "main.cpp").write_text(opencl_main(problem, sources))
         envs = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in {**self.env, **env}.items())
         body = (f"if {self.cxx} {OPENCL_CXXFLAGS} -o main main.cpp {OPENCL_LDFLAGS} > build.log 2>&1; then "
-                f"env {envs} ./main {shlex.quote(data)}; else echo MB_BUILD_FAILED; tail -c 6000 build.log; fi")
+                f"timeout -k 10 {int(self.timeout_s)} env {envs} ./main {shlex.quote(data)}; "
+                f"else echo MB_BUILD_FAILED; tail -c 6000 build.log; fi")
+        # the board-side timeout ends the run (and frees the lock) if our ssh is cut off
         if self.lock:                           # the build and the run in one hold of the board's lock
             body = f"flock {_remote_path(self.lock)} sh -c {shlex.quote(body)}"
         script = f"cd {shlex.quote(d)} || exit 1; {body}; cd / && rm -rf {shlex.quote(d)}"
