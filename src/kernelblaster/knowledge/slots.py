@@ -728,7 +728,7 @@ class LocalEvaluator(Evaluator):
         return work
 
     def _flags(self) -> list[str]:
-        return ["-O3", f"-arch={_arch_flag(self.arch)}", "-std=c++17", "-lineinfo",
+        return ["-O3", _arch_opt(self.arch), "-std=c++17", "-lineinfo",
                 *(["--default-stream", "per-thread"] if getattr(self, "graph", False) else [])]
 
     def _driver_flags(self) -> list[str]:
@@ -816,10 +816,10 @@ class LocalEvaluator(Evaluator):
         objs = await asyncio.gather(*jobs, return_exceptions=True)
         if any(isinstance(o, BaseException) for o in objs):
             return False
-        link_key = cache_key("nvcc-link", tool, f"-arch={_arch_flag(self.arch)}", *[k for k, _ in objs])
+        link_key = cache_key("nvcc-link", tool, _arch_opt(self.arch), *[k for k, _ in objs])
 
         async def link(tmp: Path):
-            rc, _ = await self._nvcc([f"-arch={_arch_flag(self.arch)}", *[str(p) for _, p in objs], "-o", str(tmp)])
+            rc, _ = await self._nvcc([_arch_opt(self.arch), *[str(p) for _, p in objs], "-o", str(tmp)])
             if rc != 0:
                 raise _Failed("link")
         try:
@@ -1004,7 +1004,7 @@ class LocalEvaluator(Evaluator):
 
     def _so_flags(self) -> list[str]:
         """The candidate's shared object: always the per-thread default stream (graph capture)."""
-        return ["-O3", f"-arch={_arch_flag(self.arch)}", "-std=c++17", "-lineinfo", "--default-stream", "per-thread",
+        return ["-O3", _arch_opt(self.arch), "-std=c++17", "-lineinfo", "--default-stream", "per-thread",
                 "-Xcompiler", "-fPIC"]
 
     async def _build_so(self, problem, sources, work: Path) -> tuple[Optional[Path], Optional[EvalResult]]:
@@ -1033,11 +1033,11 @@ class LocalEvaluator(Evaluator):
                 jobs.append(obj(work / name, text))
             objs = await asyncio.gather(*jobs, return_exceptions=True)
             if not any(isinstance(o, BaseException) for o in objs):
-                link_key = cache_key("nvcc-so", tool, f"-arch={_arch_flag(self.arch)}", *[k for k, _ in objs])
+                link_key = cache_key("nvcc-so", tool, _arch_opt(self.arch), *[k for k, _ in objs])
 
                 async def link(tmp: Path):
                     async with self._sem:
-                        rc, _ = await self._nvcc(["-shared", f"-arch={_arch_flag(self.arch)}", *[str(p) for _, p in objs],
+                        rc, _ = await self._nvcc(["-shared", _arch_opt(self.arch), *[str(p) for _, p in objs],
                                                   "-o", str(tmp)])
                     if rc != 0:
                         raise _Failed("link")
@@ -1071,7 +1071,7 @@ class LocalEvaluator(Evaluator):
 
         drv = problem.driver_path
         text = drv.read_text()
-        flags = ["-O3", f"-arch={_arch_flag(self.arch)}", "-std=c++17", "-DMB_HOST", *self._driver_flags()]
+        flags = ["-O3", _arch_opt(self.arch), "-std=c++17", "-DMB_HOST", *self._driver_flags()]
         key = cache_key("nvcc-host", self._tool_key(), *flags, text, *self._ext(text))
         log = {}
 
@@ -1940,6 +1940,13 @@ def _arch_flag(arch) -> str:
     """nvcc -arch: sm_90a / sm_100a on Hopper / Blackwell (wgmma, tcgen05 need the arch-specific target)."""
     a = str(arch).removeprefix("sm_").rstrip("af")
     return f"sm_{a}a" if a in ("90", "100") else f"sm_{a}"
+
+
+def _arch_opt(arch) -> str:
+    """The one nvcc argument selecting the target: ``-gencode=arch=compute_100a,code=sm_100a`` on Blackwell (nvcc 13.3 drops the suffix of
+    ``-arch=sm_100a`` and ptxas then rejects tcgen05 PTX), else ``-arch=<_arch_flag>``."""
+    a = str(arch).removeprefix("sm_").rstrip("af")
+    return "-gencode=arch=compute_100a,code=sm_100a" if a == "100" else f"-arch={_arch_flag(arch)}"
 
 
 def cupti_flags(nvcc: str = "nvcc") -> list[str]:
