@@ -1997,6 +1997,39 @@ def opencl_source_errors(problem: SlotProblem, sources: Mapping[str, str]) -> Op
     return EvalResult(ok=False, stage="compile", errors=bad) if bad else None
 
 
+def _opencl_gpu(r: EvalResult, host: Optional[str], arch: Optional[str]) -> EvalResult:
+    """The OpenCL device a run used as the result's ``gpu`` record (host, label, name =
+    the driver's ``MB_DEVICE`` line, arch label), as the CUDA pool evaluators record theirs."""
+    if r.device:
+        r.gpu = {"host": host, "label": host or "local", "index": None, "uuid": None, "name": r.device,
+                 "arch": arch}
+    return r
+
+
+def board_lock_path(lock: Optional[str] = None) -> Optional[str]:
+    """The board's exclusive lock (an flock file on the board) every build + run holds:
+    ``lock``, else ``$KERNELBLASTER_BOARD_LOCK``, else ``~/mb_board.lock`` (``/root/mb_board.lock``
+    for root); ``off`` / ``0`` / empty disables it."""
+    v = lock if lock is not None else os.getenv("KERNELBLASTER_BOARD_LOCK", "~/mb_board.lock")
+    return None if str(v).strip().lower() in ("", "0", "off", "none", "no") else str(v)
+
+
+def board_env(pairs) -> dict:
+    """``NAME=value`` strings (``--board-env``) -> {NAME: value}."""
+    out = {}
+    for kv in pairs or []:
+        k, sep, v = str(kv).partition("=")
+        if not sep or not re.fullmatch(r"[A-Za-z_]\w*", k):
+            raise ValueError(f"--board-env {kv!r}: expected NAME=value")
+        out[k] = v
+    return out
+
+
+def _remote_path(p: str) -> str:
+    """A path for a remote shell: quoted, a leading ``~/`` as ``"$HOME"/``."""
+    return '"$HOME"/' + shlex.quote(p[2:]) if p.startswith("~/") else shlex.quote(p)
+
+
 def _instances(problem: SlotProblem) -> dict:
     return {sid: len(s.instances) for sid, s in problem.slots.items()}
 
@@ -2017,9 +2050,10 @@ class OpenCLLocalEvaluator(LocalEvaluator):
     OpenCL 2.0 device with coarse-grained SVM; its times are not Adreno's)."""
 
     def __init__(self, work_root: Optional[Path] = None, cxx: str = "g++", max_parallel: Optional[int] = None,
-                 timeout_s: int = 900, keep: bool = False, env: Optional[dict] = None):
+                 timeout_s: int = 900, keep: bool = False, env: Optional[dict] = None,
+                 arch: Optional[str] = None):
         super().__init__("opencl", work_root=work_root, max_parallel=max_parallel, timeout_s=timeout_s, keep=keep)
-        self.cxx, self.env = cxx, dict(env or {})
+        self.cxx, self.env, self.device_arch = cxx, dict(env or {}), arch
 
     async def _devices(self) -> list:
         # the OpenCL platform picks the device; one run at a time on it
@@ -2058,12 +2092,12 @@ class OpenCLLocalEvaluator(LocalEvaluator):
                 shutil.rmtree(work, ignore_errors=True)
 
     async def evaluate(self, problem, sources, tag, *, only_slots=None, screen=False, incumbent=None):  # full run (OpenCL driver)
-        bad, text = await self._exec(problem, sources, tag, {})
+        bad, text = await self._exec(problem, sources, tag, dict(EXTRA_DRIVER_ENV))
         if bad is not None:
             return bad
         if text is None:
             return EvalResult(ok=False, stage="run", errors=[f"timeout after {self.timeout_s}s"])
-        return parse_driver_output(text)
+        return _opencl_gpu(parse_driver_output(text), None, self.device_arch)
 
     async def profile(self, problem, sources, tag, slots=None):    # one run profiles every slot
         bad, text = await self._exec(problem, sources, tag + "_prof", {"MB_MODE": "profile"})
@@ -2077,18 +2111,33 @@ class AdrenoEvaluator(Evaluator):
     does (servers/compile_opencl.py: scp sources, compile on the board, run,
     clean up): one main.cpp per candidate is copied into a per-candidate
     directory, compiled with the board's g++ against its libOpenCL, run, and
-    the directory is removed. data.bin is copied once per problem into
-    ``remote_dir``; ``close()`` removes ``remote_dir``."""
+    the directory is removed. data.bin is copied once per problem into this
+    evaluator's own subdirectory of ``remote_dir`` (``kb_<pid>_<id>``: several
+    processes -- a KernelBlaster run and ModelBlaster's timings -- share one
+    ``remote_dir``); ``close()`` removes that subdirectory, and ``remote_dir``
+    when it is then empty.
+
+    The board is shared: every build + run holds an exclusive flock on the
+    board (``lock``, :func:`board_lock_path`: ``$KERNELBLASTER_BOARD_LOCK``,
+    default ``~/mb_board.lock``), one candidate per hold, so runs of other
+    processes and users wait instead of timing at the same time. ``env``
+    is added to every run (e.g. ``CUDA_VISIBLE_DEVICES`` of an NVIDIA
+    OpenCL stand-in), and so is ``EXTRA_DRIVER_ENV``. Results carry the
+    device as ``gpu`` (name = the driver's ``MB_DEVICE``, ``arch``)."""
 
     def __init__(self, host: Optional[str] = None, *, remote_dir: str = "/tmp/kernelblaster_multislot",
                  ssh_key: Optional[str] = None, cxx: str = "g++", timeout_s: int = 1800,
-                 work_root: Optional[Path] = None, keep: bool = False):
+                 work_root: Optional[Path] = None, keep: bool = False, lock: Optional[str] = None,
+                 env: Optional[dict] = None, arch: Optional[str] = None):
         from ..backends.opencl import default_board_host
 
         self.host = host or default_board_host()
-        self.remote_dir, self.key, self.cxx = remote_dir.rstrip("/"), ssh_key, cxx
+        self.base_dir = remote_dir.rstrip("/")
+        self.remote_dir = f"{self.base_dir}/kb_{os.getpid()}_{uuid.uuid4().hex[:6]}"
+        self.key, self.cxx = ssh_key, cxx
         self.timeout_s, self.keep = timeout_s, keep
         self.work_root = Path(work_root) if work_root else None
+        self.lock, self.env, self.arch = board_lock_path(lock), dict(env or {}), arch
         self._board = asyncio.Lock()            # one compile+run on the board at a time
         self._data: dict[str, str] = {}         # data_sha1 -> remote data.bin
 
@@ -2134,11 +2183,12 @@ class AdrenoEvaluator(Evaluator):
         local = (self.work_root or problem.root / "kb_work") / name
         local.mkdir(parents=True, exist_ok=True)
         (local / "main.cpp").write_text(opencl_main(problem, sources))
-        envs = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env.items())
-        script = (f"cd {shlex.quote(d)} || exit 1; "
-                  f"if {self.cxx} {OPENCL_CXXFLAGS} -o main main.cpp {OPENCL_LDFLAGS} > build.log 2>&1; then "
-                  f"env {envs} ./main {shlex.quote(data)}; else echo MB_BUILD_FAILED; tail -c 6000 build.log; fi; "
-                  f"cd / && rm -rf {shlex.quote(d)}")
+        envs = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in {**self.env, **env}.items())
+        body = (f"if {self.cxx} {OPENCL_CXXFLAGS} -o main main.cpp {OPENCL_LDFLAGS} > build.log 2>&1; then "
+                f"env {envs} ./main {shlex.quote(data)}; else echo MB_BUILD_FAILED; tail -c 6000 build.log; fi")
+        if self.lock:                           # the build and the run in one hold of the board's lock
+            body = f"flock {_remote_path(self.lock)} sh -c {shlex.quote(body)}"
+        script = f"cd {shlex.quote(d)} || exit 1; {body}; cd / && rm -rf {shlex.quote(d)}"
         try:
             async with self._board:
                 rc, out = await self._ssh(f"mkdir -p {shlex.quote(d)}", timeout=60)
@@ -2160,12 +2210,12 @@ class AdrenoEvaluator(Evaluator):
         return None, out
 
     async def evaluate(self, problem, sources, tag, *, only_slots=None, screen=False, incumbent=None):  # full run (OpenCL driver)
-        bad, text = await self._exec(problem, sources, tag, {})
+        bad, text = await self._exec(problem, sources, tag, dict(EXTRA_DRIVER_ENV))
         if bad is not None:
             return bad
         if text is None:
             return EvalResult(ok=False, stage="run", errors=[f"timeout after {self.timeout_s}s"])
-        return parse_driver_output(text)
+        return _opencl_gpu(parse_driver_output(text), self.host, self.arch)
 
     async def profile(self, problem, sources, tag, slots=None):    # one run profiles every slot
         bad, text = await self._exec(problem, sources, tag + "_prof", {"MB_MODE": "profile"})
@@ -2174,7 +2224,8 @@ class AdrenoEvaluator(Evaluator):
         return _opencl_profile_result(problem, text)
 
     async def close(self):
-        await self._ssh(f"rm -rf {shlex.quote(self.remote_dir)}", timeout=120)
+        await self._ssh(f"rm -rf {shlex.quote(self.remote_dir)}; rmdir {shlex.quote(self.base_dir)} 2>/dev/null; true",
+                        timeout=120)
         self._data.clear()
 
 
