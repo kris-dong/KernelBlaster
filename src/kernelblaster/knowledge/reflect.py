@@ -457,7 +457,9 @@ class SemanticUpdater:
         self.max_prompt_claims = max_prompt_claims
         self.consolidate_every = consolidate_every
         self.known_techniques = set(known_techniques) if known_techniques else None
-        self.known_states = set(known_states) if known_states else None
+        # an EMPTY set stays a set (a truly empty seed has no states): None means 'unconstrained', and
+        # reflect_v2 computes `self.known_states | set(...)`, which raised for None and rejected every edit as malformed
+        self.known_states = set(known_states) if known_states is not None else None
         self.trace_dir = Path(trace_dir) if trace_dir else None
         self.max_retries = max_retries
         self.last_rejected: list[dict] = []
