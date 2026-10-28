@@ -61,6 +61,7 @@ _DEFAULT_PRICING: Dict[str, Tuple[float, float]] = {
     # Anthropic — current generation
     "claude-sonnet-5-5":     (3.00, 15.00),   # estimate; override with COST_PRICE_* env vars
     "claude-haiku-5-5":      (1.00, 5.00),    # estimate
+    "claude-opus-5-5":       (5.00, 25.00),   # estimate (Opus-class list price); without a row the relay priced every Opus call at $0 and its --budget-usd never counted Opus spend
     "claude-opus-4-7":       (5.00, 25.00),
     "claude-opus-4-6":       (5.00, 25.00),
     "claude-opus-4-5":       (5.00, 25.00),
@@ -107,6 +108,7 @@ _DEFAULT_BATCH_PRICING: Dict[str, Tuple[float, float]] = {
 # aggregate ``input_tokens`` / ``output_tokens`` — wiring through the cache
 # fields requires patching ``generate_code_anthropic`` to forward them.
 _DEFAULT_CACHE_PRICING: Dict[str, Tuple[float, Optional[float], float]] = {
+    "claude-opus-5-5":       (6.25, 10.00, 0.50),   # estimate, same cache rates as the other Opus rows
     "claude-opus-4-7":       (6.25, 10.00, 0.50),
     "claude-opus-4-6":       (6.25, 10.00, 0.50),
     "claude-opus-4-5":       (6.25, 10.00, 0.50),
