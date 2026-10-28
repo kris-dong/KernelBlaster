@@ -53,6 +53,12 @@ def info(arch: str) -> Optional[dict]:
     return HW.get(sm) or (HW[max(k for k in HW if k <= sm)] if sm >= 80 else None)
 
 
+def arch_opt(arch: str) -> str:
+    """The nvcc argument that selects the target (see knowledge.slots._arch_opt): -gencode=arch=compute_100a,code=sm_100a on Blackwell."""
+    sm = _sm(arch)
+    return "-gencode=arch=compute_100a,code=sm_100a" if sm == 100 else f"-arch={arch_flag(arch)}"
+
+
 def arch_flag(arch: str) -> str:
     """nvcc -arch value. Hopper/Blackwell tensor-core instructions (wgmma, tcgen05) only assemble for the
     architecture-specific targets sm_90a / sm_100a."""
@@ -75,7 +81,7 @@ def hardware_text(arch: str, dtype: str = "fp32") -> str:
     if h is None:
         return ""
     lines = [f"Target GPU: {h['name']} ({h['family']}, compute capability {sm // 10}.{sm % 10}, built with "
-             f"-arch={arch_flag(arch)}), {h['sms']} SMs, up to {h['smem_kb']} KB shared memory per SM, "
+             f"{arch_opt(arch)}), {h['sms']} SMs, up to {h['smem_kb']} KB shared memory per SM, "
              f"{h['l2_mb']} MB L2, {h['dram_gbs'] / 1000:.2f} TB/s DRAM; fp32 CUDA-core peak "
              f"{h['fp32_gflops'] / 1000:.0f} TFLOP/s" +
              (f", fp16 tensor-core peak {h['fp16_tc_gflops'] / 1000:.0f} TFLOP/s (dense, fp32 accumulate)."

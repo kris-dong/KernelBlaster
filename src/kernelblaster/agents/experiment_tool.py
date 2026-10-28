@@ -149,7 +149,7 @@ class ExperimentTool:
         (d / "exp.cu").write_text(code)
         t0 = time.time()
         arch = self.arch.removeprefix("sm_")
-        flag = f"-arch=sm_{arch}" + ("a" if arch in ("90", "100") else "")
+        flag = "-gencode=arch=compute_100a,code=sm_100a" if arch == "100" else f"-arch=sm_{arch}" + ("a" if arch in ("90", "100") else "")
         cmd = [self.nvcc, "-O3", "-std=c++17", flag, "-lineinfo", "-o", str(d / "exp"), str(d / "exp.cu")]
         cp = await _proc(cmd, cwd=d, timeout=min(COMPILE_CAP_S, max(5.0, seconds_left)), env=None)
         nv = await self._nvcc_info(cmd[1:]) if self._recording() else None
