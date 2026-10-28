@@ -527,13 +527,20 @@ cl_event timing). What is target-specific on this side:
 |---|---|
 | `opt_multislot.TargetProfile` | system prompt (`agents/multislot_opencl.py`: slot format, runtime API, OpenCL C 1.2 / no fp64 rules, Adreno guidance), ```` ```cpp ```` fence, technique catalogue (vectorised 128-bit I/O, `__local` tiling, cooperative reductions, register tiling, work-group size, compile-time constants, mad/native math -- what the Adreno RL flow found), roofline peaks per device (`adreno650` ...; `titanrtx` for the local stand-in), arch label = device name, profiler |
 | records | `ImplStore`, `OutcomeRecord` and claims keyed by `(target, arch)`: CUDA and OpenCL winners and lessons never mix |
-| evaluators (`knowledge/slots.py`) | `OpenCLLocalEvaluator` (g++ + this host's OpenCL GPU), `AdrenoEvaluator` (scp one `main.cpp`, build with the board's g++, run, `rm -rf`; data.bin copied once per problem, `close()` removes the remote dir), `OpenCLServerEvaluator` (OpenCL compile server -- `compile_opencl.py` now builds `.cpp` mains with g++ -- and Adreno exec server, data.bin as a kernel file). Slots that call `clEnqueue*`/`clFinish` directly are rejected (all work must go through the timed `mb_launch`) |
+| evaluators (`knowledge/slots.py`) | `OpenCLLocalEvaluator` (g++ + this host's OpenCL GPU), `AdrenoEvaluator` (scp one `main.cpp`, build with the board's g++, run, `rm -rf`; data.bin copied once per problem into the evaluator's own `kb_<pid>_<id>` subdir of `--remote-dir`, which `close()` removes; the board's flock per build + run; the device (`MB_DEVICE`) recorded as the result's `gpu`), `OpenCLServerEvaluator` (OpenCL compile server -- `compile_opencl.py` now builds `.cpp` mains with g++ -- and Adreno exec server, data.bin as a kernel file). Slots that call `clEnqueue*`/`clFinish` directly are rejected (all work must go through the timed `mb_launch`) |
 | profile (`knowledge/opencl_profile.py`) | `--ncu best|all` runs the driver's `MB_MODE=profile` and parses per-kernel cl_event times and launch counts, `CL_KERNEL_WORK_GROUP_SIZE` (falls with register pressure on Adreno), private/local memory; hints and `latency_bound` (many short launches) go into prompts and outcome records (same interface as `knowledge/ncu.py`) |
 
 ```bash
 # on the board (RB5 over ssh; default host $KERNELBLASTER_ADRENO_BOARD_HOST)
 python scripts/run_multislot.py OUT --out runs/cl --evaluator board --board-host root@rb5 --arch adreno650 \
-    --model us.anthropic.claude-haiku-5-5 --ncu best
+    --remote-dir /root/kb_work --board-lock /root/board.lock --model us.anthropic.claude-haiku-5-5 --ncu best
+# --remote-dir on persistent storage (the RB5's /tmp is a 3.8 GB tmpfs); --board-lock (or
+# $KERNELBLASTER_BOARD_LOCK / $KERNELBLASTER_ADRENO_BOARD_LOCK; default ~/mb_board.lock, `off` for none):
+# every build + run holds `flock` on that file on a shared board, with a board-side timeout;
+# --board-env NAME=value is added to every run (e.g. CUDA_VISIBLE_DEVICES of an NVIDIA OpenCL stand-in)
+# ModelBlaster's own timings of OpenCL problems (kb_graph_opt --target opencl):
+python scripts/time_problems.py JOBS.json --out OUT.json --arch adreno650 --evaluator board \
+    --board-host root@rb5 --remote-dir /root/kb_work
 # functional stand-in: any local OpenCL 2.0 GPU with coarse-grained SVM (times are not Adreno's)
 python scripts/run_multislot.py OUT --out runs/cl --evaluator local --arch titanrtx ...
 ```
