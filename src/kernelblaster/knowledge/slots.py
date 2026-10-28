@@ -215,6 +215,9 @@ class EvalResult:
     op_us: dict = field(default_factory=dict)          # op name -> us (driver MB_OP_US)
     slot_checks: dict = field(default_factory=dict)    # sid -> {"rel_err", "ok"}
     outputs: dict = field(default_factory=dict)
+    # SOL-ExecBench's rule on the graph outputs (driver MB_SOL lines, only for a gated export): {buffer: {"sol"|"golden":
+    # {"matched_ratio", "required_ratio", "max_abs_err", "ok", ...}, "gate": which one decides}}; {} when not gated
+    sol: dict = field(default_factory=dict)
     errors: list = field(default_factory=list)
     log: str = ""
     kernel_us: dict = field(default_factory=dict)      # "slot/kernel" -> us (OpenCL driver MB_KERNEL_US)
@@ -277,7 +280,18 @@ class EvalResult:
                 f"{s} (rel_err={self.slot_checks[s]['rel_err']:.3g})" for s in bad))
         for o, c in self.outputs.items():
             if not c.get("ok"):
-                bits.append(f"output {o}: max_abs_err={c['max_abs_err']:.3g} > bound={c['bound']:.3g}")
+                g = (self.sol.get(o) or {})
+                v = g.get(g.get("gate")) if g else None
+                if v is not None and not v.get("ok") and c["max_abs_err"] <= c["bound"]:
+                    # the flow's whole-tensor bound passed; SOL-ExecBench's per-element rule did not
+                    bits.append(f"output {o}: fails SOL-ExecBench's tolerance: only {v['matched_ratio']:.5f} of the "
+                                f"elements within atol={v['atol']:.3g} + rtol={v['rtol']:.3g}*|ref| (need "
+                                f"{v['required_ratio']:.5f}), max_abs_err={v['max_abs_err']:.3g}"
+                                + (" [non-finite output]" if v.get("nonfinite_output") else "")
+                                + " -- a candidate this inexact (e.g. single-pass TF32) is not accepted; keep fp32 "
+                                  "accuracy (fp32 FMA, or 3xTF32 / split-TF32 passes)")
+                else:
+                    bits.append(f"output {o}: max_abs_err={c['max_abs_err']:.3g} > bound={c['bound']:.3g}")
         txt = "\n".join(bits) or self.log
         return txt[-limit:]
 
@@ -298,6 +312,16 @@ def parse_driver_output(text: str) -> EvalResult:
                                  "ok": m.group(4) == "1"}
     for m in re.finditer(r"^MB_SLOT_CHECK (\S+) rel_err=(\S+) ok=(\d)", text, re.M):
         r.slot_checks[m.group(1)] = {"rel_err": float(m.group(2)), "ok": m.group(3) == "1"}
+    for m in re.finditer(r"^MB_SOL (\S+) ref=(\w+) matched=(\S+) required=(\S+) max_abs_err=(\S+) max_rel_err=(\S+) "
+                         r"max_excess=\S+ nonfinite=(\d) allzero=\d cap_exceeded=\d n=\d+ atol=(\S+) rtol=(\S+) "
+                         r"ok=(\d) gate=(\d)", text, re.M):
+        d = r.sol.setdefault(m.group(1), {})
+        d[m.group(2)] = {"matched_ratio": float(m.group(3)), "required_ratio": float(m.group(4)),
+                         "max_abs_err": float(m.group(5)), "max_rel_err": float(m.group(6)),
+                         "nonfinite_output": m.group(7) == "1", "atol": float(m.group(8)), "rtol": float(m.group(9)),
+                         "ok": m.group(10) == "1" and not (d.get(m.group(2)) or {}).get("ok") is False}
+        if m.group(11) == "1":
+            d["gate"] = m.group(2)
     for m in re.finditer(r"^MB_SLOT_US (\S+) (\S+)", text, re.M):
         r.slot_us[m.group(1)] = float(m.group(2))
     for m in re.finditer(r"^MB_OP_US (\S+) (\S+)", text, re.M):
