@@ -292,3 +292,90 @@ def test_server_evaluator_plumbing(tmp_path, monkeypatch):
     assert err is None and "linear" in prof and seen["runs"][1][1] == "data.bin profile"
     bad = asyncio.run(ev.evaluate(p, {**p.seed_sources(), "relu": "void f() { clFinish(q); }"}, "srv"))
     assert not bad.ok and bad.stage == "compile"
+
+
+# ---------------------------------------------------------------- ModelBlaster graph-optimiser flow
+
+def test_board_lock_path(monkeypatch):
+    from kernelblaster.knowledge.slots import board_lock_path
+
+    monkeypatch.delenv("KERNELBLASTER_BOARD_LOCK", raising=False)
+    monkeypatch.delenv("KERNELBLASTER_ADRENO_BOARD_LOCK", raising=False)
+    assert board_lock_path() == "~/mb_board.lock"
+    assert board_lock_path("/x.lock") == "/x.lock" and board_lock_path("off") is None
+    monkeypatch.setenv("KERNELBLASTER_ADRENO_BOARD_LOCK", "/a.lock")
+    assert board_lock_path() == "/a.lock"
+    monkeypatch.setenv("KERNELBLASTER_BOARD_LOCK", "0")
+    assert board_lock_path() is None
+
+
+def test_board_env():
+    from kernelblaster.knowledge.slots import board_env
+
+    assert board_env(["CUDA_VISIBLE_DEVICES=2", "A=x=y"]) == {"CUDA_VISIBLE_DEVICES": "2", "A": "x=y"}
+    with pytest.raises(ValueError):
+        board_env(["nope"])
+
+
+def test_board_evaluator_shared_dir_env_and_device(tmp_path, monkeypatch):
+    """Per-process remote subdir (close() removes only it), the default lock under $HOME, run env and
+    EXTRA_DRIVER_ENV on the board command line, the device recorded as the result's gpu."""
+    from kernelblaster.knowledge import slots as sl
+
+    monkeypatch.delenv("KERNELBLASTER_BOARD_LOCK", raising=False)
+    monkeypatch.delenv("KERNELBLASTER_ADRENO_BOARD_LOCK", raising=False)
+    monkeypatch.setattr(sl, "EXTRA_DRIVER_ENV", {"MB_E2E_MS": "50"})
+    p = SlotProblem(FIX)
+    ev = AdrenoEvaluator("u@board", remote_dir="/r/mb/", work_root=tmp_path / "work", env={"CUDA_VISIBLE_DEVICES": "2"},
+                         arch="adreno650")
+    ev2 = AdrenoEvaluator("u@board", remote_dir="/r/mb", work_root=tmp_path / "work2")
+    assert ev.remote_dir.startswith("/r/mb/kb_") and ev.remote_dir != ev2.remote_dir
+    calls = []
+
+    async def fake_cmd(*argv, timeout=None, stdin=None):
+        calls.append(argv)
+        return 0, DRIVER_OUT if argv[0] == "ssh" and "flock" in argv[-1] else ""
+
+    ev._cmd = fake_cmd
+    r = asyncio.run(ev.evaluate(p, p.seed_sources(), "t"))
+    run = [a[-1] for a in calls if a[0] == "ssh" and "main.cpp" in a[-1]][0]
+    assert 'flock "$HOME"/mb_board.lock sh -c' in run
+    assert "CUDA_VISIBLE_DEVICES=2" in run and "MB_E2E_MS=50" in run
+    assert any(a[0] == "scp" and a[-1].startswith(f"u@board:{ev.remote_dir}/data_") for a in calls)
+    assert r.ok and r.gpu == {"host": "u@board", "label": "u@board", "index": None, "uuid": None,
+                              "name": "QUALCOMM Adreno(TM) 650 | OpenCL 2.0 Adreno(TM) 650", "arch": "adreno650"}
+    calls.clear()
+    asyncio.run(ev.close())
+    assert calls[-1][-1].startswith(f"rm -rf {ev.remote_dir}; rmdir /r/mb ")
+
+
+def test_time_problems_opencl_evaluators(tmp_path):
+    import argparse
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("time_problems", Path(__file__).parents[1] / "scripts" / "time_problems.py")
+    tp = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tp)
+    assert tp.jobs_target([{"problem": str(FIX)}]) == "opencl"
+    a = argparse.Namespace(evaluator="board", board_host="u@b", remote_dir="/r", ssh_key=None, timeout=60,
+                           work=str(tmp_path), board_lock="/l", board_env=["A=1"], arch="adreno650")
+    ev = tp.make_evaluator(a, "opencl")
+    assert isinstance(ev, AdrenoEvaluator) and ev.lock == "/l" and ev.env == {"A": "1"} and ev.arch == "adreno650"
+    a.evaluator = "local"
+    assert isinstance(tp.make_evaluator(a, "opencl"), OpenCLLocalEvaluator)
+    a.evaluator = "ssh"
+    with pytest.raises(SystemExit):
+        tp.make_evaluator(a, "opencl")
+    a.evaluator = "board"
+    with pytest.raises(SystemExit):
+        tp.make_evaluator(a, "cuda")
+
+
+def test_hints_target_key():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("run_multislot", Path(__file__).parents[1] / "scripts" / "run_multislot.py")
+    rm = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rm)
+    assert (rm.hints_target_key(None), rm.hints_target_key("89"), rm.hints_target_key("adreno650")) == \
+        ("cuda:sm_75", "cuda:sm_89", "opencl:adreno650")
