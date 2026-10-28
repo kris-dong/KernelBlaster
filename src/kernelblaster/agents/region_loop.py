@@ -497,7 +497,8 @@ class RegionLoop:
     def __init__(self, *, problem, sid: str, backend: Backend, llm: Callable[..., Awaitable], model: str, sources: Mapping[str, str],
                  baseline_us: Optional[float], cfg: Optional[LoopConfig] = None, out_dir: Optional[Path] = None,
                  system: Optional[str] = None, knowledge_text: str = "", examples: Optional[list] = None,
-                 on_event: Optional[Callable[[dict], None]] = None, logger=None, tag: str = "rl"):
+                 on_event: Optional[Callable[[dict], None]] = None, logger=None, tag: str = "rl",
+                 should_stop: Optional[Callable[[], bool]] = None):
         self.p, self.sid, self.be, self.llm, self.model = problem, sid, backend, llm, model
         self.cfg = cfg or LoopConfig()
         self.slot = problem.slots[sid]
@@ -511,6 +512,7 @@ class RegionLoop:
         self.knowledge_text = knowledge_text
         self.examples = list(examples or [])
         self.on_event = on_event or (lambda ev: None)
+        self.should_stop = should_stop or (lambda: False)          # SIGTERM / SIGINT of the run: no new turn (the agent's ``stopping``)
         self.log = logger
         self.tag = tag
         self.led = Ledger()
@@ -920,6 +922,9 @@ class RegionLoop:
             why = self.led.exhausted(cfg)
             if why:
                 self.stop = why
+                break
+            if self.should_stop():
+                self.stop = "interrupted"
                 break
             got = await self._ask()
             if got is None:

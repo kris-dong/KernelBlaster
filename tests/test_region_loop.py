@@ -713,3 +713,18 @@ def test_region_echo_plugin_drives_the_whole_path(tmp_path, monkeypatch):
     assert "/* region_echo */" in loop.current[SID] and res["final_check"]["ok"]
     assert [e for e in res["ledger"]["per_tool"]] == ["show", "profile", "edit", "verify", "time", "commit", "status", "finish"]
     assert all(v["errors"] == 0 for v in res["ledger"]["per_tool"].values())
+
+
+def test_stop_request_ends_the_loop_between_turns(tmp_path):
+    flag = {"stop": False}
+
+    class Stopper(Script):
+        async def __call__(self, messages, role):
+            r = await super().__call__(messages, role)
+            flag["stop"] = len(self.seen) >= 2              # SIGTERM arrives during turn 2
+            return r
+    prob = make_problem(tmp_path / "prob")
+    loop = rl.RegionLoop(problem=prob, sid=SID, backend=FakeBackend(), llm=Stopper([act("status")] * 9), model="m", sources=prob.seed_sources(),
+                         baseline_us=100.0, cfg=rl.LoopConfig(), should_stop=lambda: flag["stop"])
+    res = run(loop)
+    assert res["stop"] == "interrupted" and res["ledger"]["turns"] == 2
