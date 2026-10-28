@@ -22,6 +22,11 @@ Parallel rollouts share a *composite best*: the fastest verified source per
 slot. Slots are separate kernels, so wins on different slots compose; the
 composite is re-verified as a whole before it is reported.
 
+``search="beam"`` replaces the independent rollouts by a beam search: every step each
+member of the beam (a full per-slot source set + its end-to-end time) is expanded
+``beam_expand`` ways with distinct techniques, all candidates run concurrently, and the
+best ``beam_width`` non-regressing states form the next beam (see ``select_beam``).
+
 The slot *state* is a roofline classification from the manifest (bytes moved
 and FLOPs per op) and the measured slot time -- no NCU counters needed.
 """
@@ -612,6 +617,7 @@ def diff_summary(a: str, b: str) -> str:
 # ---------------------------------------------------------------- end-to-end reward
 
 REWARDS = ("e2e", "slot")
+SEARCHES = ("independent", "beam")
 LAUNCH_BOUND_FRAC = 0.15        # eager partition time not spent in kernels
 TINY_KERNEL_US = 5.0
 
@@ -697,6 +703,52 @@ def runtime_text(res: Optional[EvalResult], sid: str, problem: SlotProblem) -> s
         lines.append("Keep the slot capturable in a CUDA graph (no host sync, allocation or host copy per call): a "
                      "slot that breaks capture makes the whole partition fall back to eager launches.")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- beam selection
+
+def beam_key(cur: dict) -> str:
+    """Identity of a beam member: a hash of its full per-slot source set."""
+    import hashlib
+    h = hashlib.sha1()
+    for sid in sorted(cur):
+        h.update(sid.encode() + b"\0" + cur[sid].encode() + b"\0")
+    return h.hexdigest()
+
+
+def beam_score(member: dict) -> float:
+    """End-to-end time of a member (lower is better); the sum of its slot times without one."""
+    return member["meta"].get("e2e") or sum(member["cur_us"].values())
+
+
+def beam_plan(step: int, n_members: int, width: int, expand: int, rollouts: int, refill: bool = False,
+              cap: Optional[int] = None) -> list[int]:
+    """Parent index of each candidate of a beam step. Step 0: ``max(width * expand, rollouts)`` candidates from the
+    baseline. Later: ``expand`` per member (``n_members * expand``); with ``refill`` a beam shorter than ``width``
+    is expanded ``width * expand`` ways in all (spread over the members, best first). ``cap`` (a per-problem
+    rollouts budget) limits the candidates per step; the worst members' children are dropped first."""
+    cap = cap or 10 ** 9
+    if step == 0:
+        return [0] * min(max(width * expand, rollouts), cap)
+    n = n_members
+    if refill and n < width:
+        tot = width * expand
+        return [i for i in range(n) for _ in range(tot // n + (1 if i < tot % n else 0))][:cap]
+    return [c // expand for c in range(n * expand)][:cap]
+
+
+def select_beam(prev: list, children: list, width: int) -> list:
+    """Next beam: the ``width`` fastest of the children and the previous members, deduplicated by
+    code hash (the first of equals wins, children before parents). Children are only the candidates
+    that were kept (improved or neutral); regressed / failed ones never get here. Previous members
+    compete too, so the best state found is never lost."""
+    seen, pool = set(), []
+    for m in [*children, *prev]:
+        k = beam_key(m["cur"])
+        if k not in seen:
+            seen.add(k)
+            pool.append(m)
+    return sorted(pool, key=beam_score)[:width]          # stable: ties keep children first
 
 
 # ---------------------------------------------------------------- agent
@@ -824,8 +876,21 @@ class MultiSlotAgent:
                  knowledge_v2: Any = None, router: Optional[ModelRouter] = None, reward: Optional[str] = None,
                  e2e_accept_pct: Optional[float] = None, journal: Any = None,
                  stop_event: Optional[asyncio.Event] = None, on_checkpoint: Any = None,
-                 stop_patience: int = 0, pause_at: Optional[int] = None):
+                 stop_patience: int = 0, pause_at: Optional[int] = None,
+                 search: str = "independent", beam_width: int = 4, beam_expand: int = 2, beam_refill: bool = False,
+                 beam_cap: Optional[int] = None):
         self.p, self.ev, self.model = problem, evaluator, model
+        if search not in SEARCHES:
+            raise ValueError(f"search must be one of {SEARCHES}, not {search!r}")
+        if beam_width < 1 or beam_expand < 1:
+            raise ValueError("beam_width and beam_expand must be >= 1")
+        self.search, self.beam_width, self.beam_expand = search, beam_width, beam_expand
+        self.beam_refill = bool(beam_refill)            # beam: a short beam is expanded wider (default off)
+        # beam: at most this many candidates per step (a per-problem rollouts budget, mb_budget); None = no cap
+        self.beam_cap = int(beam_cap) if beam_cap else None
+        self._beam: Optional[dict] = None               # beam: {"step": next step, "members": [member, ...]}
+        self.beam_log: list = []                        # beam: one record per finished step
+        self._exclude: dict[str, set] = {}              # "c,s" -> techniques already taken by the same parent's candidates
         # halfway sync (run_multislot --pause-spec): no rollout starts step ``pause_at`` or later; when every rollout
         # has completed that many steps the problem raises RunPaused (journal flushed; a rerun without it continues
         # from each rollout's own state). None = off (unchanged).
@@ -1485,7 +1550,8 @@ class MultiSlotAgent:
                 cls = self.kv.classify(vec_before, target_key=self._tkey, op_class=slot.op_class,
                                        dtype=sdt)
                 choice = self.kv.select(target_key=self._tkey, op_class=slot.op_class, dtype=sdt, cls=cls,
-                                        vec=vec_before, rng=self.rng, op_kind=slot.op)
+                                        vec=vec_before, rng=self.rng, op_kind=slot.op,
+                                        **({"exclude": tuple(self._exclude[skey])} if self._exclude.get(skey) else {}))
                 tech, desc, state = choice.item_id, choice.desc, cls.label()
                 nums = {**nums, **cls.decided_by}
             else:
@@ -1496,7 +1562,10 @@ class MultiSlotAgent:
                 # differently); fp32 keys keep their names, and the cross-key prior
                 # still seeds an untried fp16 arm from its fp32 record (per slot dtype: mixed problems)
                 key = bandit_key(slot.op_class, state, sdt)
-                tech = self.bandit.select(key, [t for t, _ in techs], self.rng)
+                names = [t for t, _ in techs]
+                taken = self._exclude.get(skey)         # beam: siblings of one parent differ in technique
+                tech = self.bandit.select(key, ([t for t in names if t not in taken] or names) if taken else names,
+                                          self.rng)
                 desc = dict(techs)[tech]
             # no await since the pick: a checkpoint never sees the tries / draws without the plan
             from .journal import rng_state
@@ -1504,6 +1573,8 @@ class MultiSlotAgent:
                                     "key": key, "rng": rng_state(self.rng),
                                     **({"choice": asdict(choice), "cls": asdict(cls), "vec": vec_before}
                                        if self.kv is not None else {})}
+        if skey in self._exclude:                 # beam: the sibling set (shared) learns this pick
+            self._exclude[skey].add(tech)
         jkey = f"r{ridx}s{step}"                  # LLM journal keys: <jkey>c0 codegen, c1.. fixes
         tel.lap("knowledge.lookup", slot=sid)
         r = self._retrieve(sid)
@@ -1732,6 +1803,8 @@ class MultiSlotAgent:
             ctx["graph_capture"] = {"defects": capture_defects, "final_skip": res.graph_skip if res else None}
         if d is not None:
             ctx["e2e"] = d["ctx"]
+        if "beam" in meta:
+            ctx["beam"] = meta["beam"]
         if v2 is not None:
             ctx.update(kind=choice.kind, est=round(choice.est, 4), evidence=choice.evidence,
                        explore=choice.explore, mechanism=v2["mechanism"]["label"], chain=cls.chain)
@@ -1745,6 +1818,13 @@ class MultiSlotAgent:
         self._check_patience()
         self._step_done(ridx, step, cur, cur_us, meta)
 
+    def _planned_steps(self) -> int:
+        """Candidate steps the run plans (an upper bound for beam: every step expands a full beam)."""
+        if self.search == "beam":
+            cap, wk = self.beam_cap or 10 ** 9, self.beam_width * self.beam_expand
+            return min(max(wk, self.rollouts), cap) + max(self.steps - 1, 0) * min(wk, cap)
+        return self.rollouts * self.steps
+
     def _check_patience(self, announce: bool = True) -> None:
         """E7 patience: once ``stop_patience`` consecutive committed steps set no new slot best, no rollout
         starts another step (in-flight ones finish and commit). Sticky; recomputed from the steps log on resume."""
@@ -1753,7 +1833,7 @@ class MultiSlotAgent:
         trig = patience_trigger(self.steps_log, self.stop_patience)
         if trig is None:
             return
-        planned = self.rollouts * self.steps
+        planned = self._planned_steps()
         inflight = max(len(self._inflight) - 1, 0)       # the committing step is still in _inflight here
         self.patience_stop = {**trig, "patience": self.stop_patience, "steps_planned": planned,
                               "inflight_at_trigger": inflight}
@@ -1786,7 +1866,7 @@ class MultiSlotAgent:
 
     def efficiency_info(self) -> dict:
         """result.json ``efficiency``: the rule and, if it stopped the problem, where (E7-style attribution)."""
-        planned = self.rollouts * self.steps
+        planned = self._planned_steps()
         n = len(self.steps_log)
         out = {"stop_patience": self.stop_patience, "stopped": None, "steps_planned": planned,
                "steps_committed": n, "steps_not_run": max(planned - n, 0)}
@@ -1843,7 +1923,8 @@ class MultiSlotAgent:
             if res2.ok:
                 gain_c, _ = e2e_gain(res2, self.e2e_us)
                 if gain_c is not None:
-                    g = min(g, gain_c)
+                    if self.search != "beam":         # beam: the state is judged against its parent; the
+                        g = min(g, gain_c)            # composite confirm only gates the merge (below)
                     after = max(after or 0.0, self._slot_us(res2, sid) or 0.0) or after
             ctx.update(confirm_ok=res2.ok, confirm_gain=None if gain_c is None else round(gain_c, 5),
                        confirm_us=res2.deployed_us if res2.ok else None)
@@ -1962,6 +2043,127 @@ class MultiSlotAgent:
                       f"{self.e2e_us:.1f} us after a non-improving step)")
         tel.emit({"t": "rollout_resync", "ts": time.time(), "problem": self.problem_id, **ev})
 
+    # ---- beam search
+    @staticmethod
+    def _member(cur: dict, cur_us: dict, meta: dict) -> dict:
+        return {"cur": dict(cur), "cur_us": dict(cur_us),
+                "meta": copy.deepcopy({k: v for k, v in meta.items() if k != "beam"})}
+
+    def _beam_plan(self, step: int, members: list) -> list[int]:
+        """Parent (index into ``members``) of each candidate of ``step``. Candidate ``c`` is rollout
+        index ``c`` in every id (journal key ``r<c>s<step>``, outcome / impl ids, trace)."""
+        return beam_plan(step, len(members), self.beam_width, self.beam_expand, self.rollouts,
+                         self.beam_refill, self.beam_cap)
+
+    async def _beam_search(self) -> None:
+        async with self._lock:
+            if self._beam is None:                 # the baseline composite is the first beam
+                self._beam = {"step": 0, "members": [self._member(
+                    {s: b.source for s, b in self.best.items()}, {s: b.slot_us for s, b in self.best.items()},
+                    {"e2e": self.e2e_us, "ev": {s: b.event_us for s, b in self.best.items()}})]}
+        while self._beam["step"] < self.steps:
+            if self.stopping:
+                return
+            if self.patience_stop is not None or self._external_stop():   # E7 patience / graph search: no new steps
+                return
+            if self.pause_at is not None and self._beam["step"] >= self.pause_at:   # halfway sync: park here
+                return
+            step, members = self._beam["step"], self._beam["members"]
+            parents = self._beam_plan(step, members)
+            # techniques taken so far by each parent's candidates (rebuilt after a kill from the
+            # finished steps and the picks that were in flight)
+            taken: dict[int, set] = {p: set() for p in set(parents)}
+            for c, p in enumerate(parents):
+                self._exclude[f"{c},{step}"] = taken[p]
+                plan = self._replay.get(f"{c},{step}")
+                if plan:
+                    taken[p].add(plan["tech"])
+            for sl in self.steps_log:
+                if sl.step == step and sl.rollout < len(parents):
+                    taken[parents[sl.rollout]].add(sl.technique)
+            await asyncio.gather(*[self._beam_candidate(c, step, members[p], p) for c, p in enumerate(parents)])
+            for c in range(len(parents)):
+                self._exclude.pop(f"{c},{step}", None)
+            if self.stopping:                      # unfinished step: redone from its journal on resume
+                return
+            # ---- select (no await): children = candidates that changed their parent and were kept
+            children = []
+            for c, p in enumerate(parents):
+                st = self._rstate[c]
+                if st["cur"] != members[p]["cur"]:
+                    children.append(self._member(st["cur"], st["cur_us"], st["meta"]))
+            nxt = select_beam(members, children, self.beam_width)
+            pkeys = {beam_key(m["cur"]) for m in members}
+            ckeys = [beam_key(m["cur"]) for m in children]
+            promote = await self._beam_promote(step, nxt[0])
+            self.beam_log = [x for x in self.beam_log if x.get("step") != step]     # (a replayed step logs once)
+            self.beam_log.append({"step": step, "parents": len(members), "candidates": len(parents),
+                                  "per_parent": [parents.count(i) for i in range(len(members))],
+                                  "llm_calls": self.llm_calls, "steps_committed": len(self.steps_log),
+                                  "kept": len(children), "beam_e2e": [round(beam_score(m), 3) for m in nxt],
+                                  # telemetry: duplicates dropped (children equal to a sibling or a parent),
+                                  # new members (children that entered the beam), the promote outcome
+                                  "dups": len(ckeys) - len(set(ckeys) - pkeys),
+                                  "new_members": sum(beam_key(m["cur"]) not in pkeys for m in nxt),
+                                  "promote": promote, "composite_e2e": self.e2e_us})
+            self._beam = {"step": step + 1, "members": nxt}
+            self.log.info(f"[{self.p.name}] beam step {step}: {len(children)}/{len(parents)} kept; beam "
+                          + ", ".join(f"{beam_score(m):.1f}" for m in nxt))
+            self._checkpoint()
+
+    async def _beam_candidate(self, c: int, step: int, parent: dict, pidx: int) -> None:
+        st = self._rstate.get(c)
+        if st is not None and st["next_step"] > step:      # finished before a kill
+            return
+        cur, cur_us = dict(parent["cur"]), dict(parent["cur_us"])
+        meta = copy.deepcopy(parent["meta"])
+        meta["beam"] = {"parent": pidx, "parent_e2e": beam_score(parent)}
+        try:
+            await self._step(c, step, cur, cur_us, meta)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.log.error(f"[{self.p.name}] beam candidate {c} step {step} failed: {e!r}")
+            if self._rstate.get(c, {"next_step": 0})["next_step"] <= step:
+                self._step_done(c, step, cur, cur_us, meta)
+        if self.stopping:
+            return
+        if self.semantic is not None:
+            try:
+                await self.semantic.maybe_reflect()
+            except Exception as e:
+                self.log.warning(f"semantic update failed: {e!r}")
+        elif self.kv is not None:
+            try:
+                await self.kv.maybe_upkeep()
+            except Exception as e:
+                self.log.warning(f"knowledge-v2 upkeep failed: {e!r}")
+
+    async def _beam_promote(self, step: int, top: dict) -> str:
+        """The composite best only learns single-slot wins that were confirmed against it. If the
+        beam's best member is clearly faster than the composite (e.g. its win was not merged because
+        a sibling merged first), measure it whole and adopt it, so no found state is lost."""
+        if self.reward != "e2e" or not top["meta"].get("e2e") or not self.e2e_us:
+            return "n/a"
+        comp = self._sources()
+        acc = self.e2e_accept_pct / 100.0
+        if top["cur"] == comp:
+            return "same"
+        if top["meta"]["e2e"] >= self.e2e_us * (1.0 - acc):
+            return "not_better"
+        res = await self.ev.evaluate(self.p, top["cur"], f"beam_s{step}_promote", **self._eval_kw(comp))
+        gain, _ = e2e_gain(res, self.e2e_us)
+        if not (res.ok and gain is not None and gain >= acc):
+            return "rejected"
+        for sid, code in top["cur"].items():               # no await from here
+            if code != comp[sid]:
+                self.best[sid] = SlotBest(code, self._slot_us(res, sid) or top["cur_us"][sid], None,
+                                          self.best[sid].techniques + ["beam_member"], event_us=res.slot_us.get(sid))
+        self._set_composite(res)
+        self.log.info(f"[{self.p.name}] beam step {step}: best member adopted as composite "
+                      f"({res.deployed_us:.1f} us, -{100 * gain:.1f}%)")
+        return "adopted"
+
     # ---- resume (agents/journal.py)
     @property
     def stopping(self) -> bool:
@@ -2048,6 +2250,11 @@ class MultiSlotAgent:
             "kv_counters": ({"n_selected": getattr(self.kv, "n_selected", 0), "n_explore": getattr(self.kv, "n_explore", 0)}
                             if self.kv is not None else None),
             "code": code,
+            **({"search": self.search, "beam_width": self.beam_width, "beam_expand": self.beam_expand,
+                "beam": None if self._beam is None else {
+                    "step": self._beam["step"],
+                    "members": [{**m, "cur": {s: ref(c) for s, c in m["cur"].items()}} for m in self._beam["members"]]},
+                "beam_log": self.beam_log} if self.search == "beam" else {}),
         }
 
     def _restore(self, st: dict) -> None:
@@ -2081,6 +2288,16 @@ class MultiSlotAgent:
                                  "cur_us": x["cur_us"], "meta": x["meta"]}
                         for r, x in st.get("rollout_state", {}).items()}
         self._replay = dict(st.get("inflight", {}))
+        if self.search == "beam":
+            if st.get("beam"):
+                self._beam = {"step": st["beam"]["step"],
+                              "members": [{**m, "cur": {s: code[h] for s, h in m["cur"].items()}}
+                                          for m in st["beam"]["members"]]}
+                self.beam_log = list(st.get("beam_log", []))
+            elif self._rstate or self._replay:       # a journal of an independent run: its rollouts are not beam candidates
+                self.log.warning(f"[{self.p.name}] resume: journal has rollout states but no beam; "
+                                 f"they are dropped (beam restarts from the composite)")
+                self._rstate, self._replay = {}, {}
         # the patience the problem was started with wins (a resume never changes it silently); a journal from
         # before the rule (no key) keeps whatever the run resolved (run_multislot.py: off for a legacy out dir)
         if "stop_patience" in st and int(st.get("stop_patience") or 0) != self.stop_patience:
@@ -2120,7 +2337,10 @@ class MultiSlotAgent:
         """Re-measure the restored composite best and rollout states once (the GPU or
         host may differ from the killed segment's): a state that no longer verifies
         falls back (slots to their seeds; a rollout to the composite)."""
-        if not any(st["next_step"] < self.steps for st in self._rstate.values()) and \
+        if self.search == "beam":
+            if self._beam is not None and self._beam["step"] >= self.steps:
+                return
+        elif not any(st["next_step"] < self.steps for st in self._rstate.values()) and \
                 len(self._rstate) >= self.rollouts:
             return
         seeds = self.p.seed_sources()
@@ -2140,7 +2360,8 @@ class MultiSlotAgent:
         for sid, b in self.best.items():
             b.slot_us = self._slot_us(res, sid) or b.slot_us
             b.event_us = res.slot_us.get(sid, b.event_us)
-        for ridx, st in sorted(self._rstate.items()):
+        # (beam: the members were verified when they were produced; only the composite is re-measured)
+        for ridx, st in ([] if self.search == "beam" else sorted(self._rstate.items())):
             if st["next_step"] >= self.steps:
                 continue
             r2 = res if st["cur"] == comp else \
@@ -2171,6 +2392,8 @@ class MultiSlotAgent:
         if self.pause_at is None or self.pause_at >= self.steps or self.patience_stop is not None \
                 or getattr(self, "external_stop", None) is not None:
             return False
+        if self.search == "beam":
+            return self._beam is not None and self._beam["step"] >= self.pause_at
         return len(self._rstate) >= self.rollouts and all(
             st["next_step"] >= self.pause_at for st in self._rstate.values())
 
@@ -2218,7 +2441,10 @@ class MultiSlotAgent:
             else:
                 await self._verify_restored()
         if self.phase == "rollouts":
-            await asyncio.gather(*[self._rollout(i) for i in range(self.rollouts)])
+            if self.search == "beam":
+                await self._beam_search()
+            else:
+                await asyncio.gather(*[self._rollout(i) for i in range(self.rollouts)])
             if self.stopping:
                 self._checkpoint()
                 raise RunInterrupted(f"{self.p.name}: stopped after {len(self.steps_log)} step(s)")
@@ -2320,6 +2546,9 @@ class MultiSlotAgent:
             "steps": [asdict(s) for s in self.steps_log],
             # E7 rules (efficiency_rules.md): patience and, if it fired, at which commit
             "efficiency": self.efficiency_info(),
+            **({"search": {"mode": "beam", "beam_width": self.beam_width, "beam_expand": self.beam_expand,
+                           "beam_refill": self.beam_refill, "beams": self.beam_log}}
+               if self.search == "beam" else {}),
             # rollout acceptance / lineage (search fixes item 4): mode, resync factor, resync events
             "rollout_accept": {"mode": rollout_mode(), "resync": rollout_resync_factor(),
                                "resyncs": getattr(self, "resyncs", [])},
