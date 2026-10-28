@@ -175,7 +175,20 @@ def run_config(args, router) -> dict:
             # beam: only when on, so an out dir from before beam (or with --search independent) keeps its config
             **({"search": args.search, "beam_width": args.beam_width, "beam_expand": args.beam_expand,
                 **({"beam_refill": True} if args.beam_refill == "on" else {})}
-               if args.search != "independent" else {})}
+               if args.search != "independent" else {}),
+            # region loop (agents/region_loop.py): only when on, so an out dir from before it keeps its config
+            **({"region_loop": region_loop_config(args).describe()} if region_loop_config(args) is not None else {})}
+
+
+def region_loop_config(args):
+    """The region loop's LoopConfig (``--region-loop on`` / ``$KERNELBLASTER_REGION_LOOP``; budget ``--region-loop-budget``
+    "turns,tools,usd,wall_s" / ``$KERNELBLASTER_REGION_LOOP_BUDGET``), or None when it is off (the default): nothing is then
+    passed to the agent and no key is written anywhere."""
+    from kernelblaster.agents import region_loop as rl
+    on = getattr(args, "region_loop", None)
+    if not rl.enabled(on):
+        return None
+    return rl.LoopConfig.from_env(os.environ, budget=getattr(args, "region_loop_budget", None))
 
 
 # E7 efficiency rules (docs/multislot_optimization.md "Efficiency rules"; ModelBlaster pipeline/kb_efficiency.py):
@@ -485,6 +498,7 @@ async def _run_inner(args, run_span) -> int:
                                        stop_patience=b_patience, pause_at=pause_at,
                                        search=args.search, beam_width=args.beam_width,
                                        beam_expand=args.beam_expand, beam_refill=(args.beam_refill == 'on'),
+                                       region_loop=region_loop_config(args),
                                        beam_cap=(b_rollouts if (getattr(p, 'manifest', None) or {}).get('mb_budget', {}).get('rollouts') else None))
                 try:
                     res = await agent.run()
@@ -705,6 +719,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="beam: when fewer than --beam-width states survive (e.g. a beam of one), expand each one "
                          "beam-width*beam-expand/|beam| ways so a step still makes the budgeted number of "
                          "candidates (default off)")
+    ap.add_argument("--region-loop", choices=["on", "off"], default=None,
+                    help="on: a bounded tool-using loop (show / profile / scratch / verify / time / commit / revert) on each REGION slot "
+                         "before the rollouts, over the same LLM path (agents/region_loop.py); default off ($KERNELBLASTER_REGION_LOOP)")
+    ap.add_argument("--region-loop-budget", default=None,
+                    help='the region loop\'s budget per problem "turns,tools,usd,wall_s" (default 40,120,8,3600; '
+                         '$KERNELBLASTER_REGION_LOOP_BUDGET); shared by the problem\'s region slots by time share')
     ap.add_argument("--max-fix", type=int, default=2)
     ap.add_argument("--efficiency-rules", choices=sorted(EFFICIENCY_PATIENCE), default=None,
                     help="E7 cost-efficiency rules (docs/multislot_optimization.md): on (default for a new out dir: "
