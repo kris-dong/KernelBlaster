@@ -112,6 +112,7 @@ _DEFAULT_CACHE_PRICING: Dict[str, Tuple[float, Optional[float], float]] = {
     "claude-opus-4-7":       (6.25, 10.00, 0.50),
     "claude-opus-4-6":       (6.25, 10.00, 0.50),
     "claude-opus-4-5":       (6.25, 10.00, 0.50),
+    "claude-sonnet-5-5":     (3.75, 6.00, 0.30),   # estimate, same cache rates as the other Sonnet rows
     "claude-sonnet-4-6":     (3.75, 6.00, 0.30),
     "claude-sonnet-4-5":     (3.75, 6.00, 0.30),
     "claude-sonnet-4":       (3.75, None, 0.30),
