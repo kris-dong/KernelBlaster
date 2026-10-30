@@ -1,0 +1,363 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import argparse
+import asyncio
+from contextlib import asynccontextmanager
+import os
+from pathlib import Path
+from pydantic import BaseModel
+import logging
+import shutil
+import tempfile
+import uuid
+import re
+import sysconfig
+import time
+from torch.utils import cmake_prefix_path
+
+from . import cuda_fast
+from .utils.queue_server import queue_worker_loop
+from .utils.subprocess import run_subprocess_shell
+from ..agents.utils import find_kernel_launch_header
+
+logger = logging.getLogger("uvicorn")
+
+# Fix the cmake_prefix_path format to properly use quotes for paths that may contain spaces
+CMAKE_PREFIX_PATH = f'"{cmake_prefix_path};{sysconfig.get_path("include")}"'
+QUEUE = asyncio.Queue()
+CUDA_ENV_PATH = Path(__file__).parent / "cuda_env"
+ENV_VARS = os.environ.copy()
+# Module-level state set at server startup. Since Phase E, the setter
+# lives in ``compile_server.py::main`` (was ``compile.py::main`` in the
+# legacy layout). ``ENV_DIR`` is the scratch root under which per-worker
+# CMake env clones live; ``_ARTIFACTS_DIR`` mirrors the CLI arg.
+ENV_DIR: Path | None = None
+_ARTIFACTS_DIR: Path | None = None
+
+
+def set_cuda_env_root(env_dir: Path) -> None:
+    """Set the module-level ``ENV_DIR`` used by ``get_cuda_env_root`` +
+    ``free_cuda_envs``. Called by the unified compile server at startup.
+    """
+    global ENV_DIR
+    ENV_DIR = env_dir
+
+
+def get_cmake_prefix_path() -> str:
+    """Get the CMAKE_PREFIX_PATH for compilation"""
+    return f'"{cmake_prefix_path};{sysconfig.get_path("include")}"'
+
+
+def get_cuda_env_template_path() -> Path:
+    """Get the path to the cuda_env template directory"""
+    return Path(__file__).parent / "cuda_env"
+
+
+def extract_arch_version(sm_version: str) -> str:
+    """Extract architecture version from SM version string"""
+    assert "sm" in sm_version, f"Invalid sm version format: {sm_version}"
+    arch_version = sm_version.split("sm_")[1]
+    assert int(arch_version) >= 50, f"Invalid sm version: {sm_version}"
+    return arch_version
+
+
+def write_compilation_files(
+    work_dir: Path, main_file_path: str, cuda_file_path: str | None
+) -> tuple[Path, Path, Path]:
+    """
+    Split and write compilation files to the work directory.
+
+    Returns:
+        Tuple of (main_fp_out, header_fp_out, cuda_fp_out) paths
+    """
+    main_fp_out = work_dir / "main.cpp"
+    header_fp_out = work_dir / "cuda_model.cuh"
+    cuda_fp_out = work_dir / "cuda_model.cu"
+
+    main_file_text, header_file_text, cuda_file_text = split_files_for_compilation(
+        main_file_path, cuda_file_path
+    )
+
+    main_fp_out.write_text(main_file_text)
+    header_fp_out.write_text(header_file_text)
+    cuda_fp_out.write_text(cuda_file_text)
+
+    logger.info(
+        "Prepared compilation units: main.cpp lines=%d chars=%d | cuda_model.cuh lines=%d chars=%d | cuda_model.cu lines=%d chars=%d",
+        len(main_file_text.splitlines()),
+        len(main_file_text),
+        len(header_file_text.splitlines()),
+        len(header_file_text),
+        len(cuda_file_text.splitlines()),
+        len(cuda_file_text),
+    )
+
+    return main_fp_out, header_fp_out, cuda_fp_out
+
+
+def build_cmake_command(
+    sm_build_dir: Path,
+    arch_version: str,
+    build_type: str = "Release",
+) -> str:
+    """Build the cmake configuration command"""
+    return (
+        f"mkdir -p {sm_build_dir} && cd {sm_build_dir} && "
+        f"cmake -DCMAKE_PREFIX_PATH={get_cmake_prefix_path()} "
+        f"-DCMAKE_BUILD_TYPE={build_type} "
+        f'-DGPU_ARCH_VERSION="{arch_version}" '
+        ".."
+    )
+
+
+# Lifespan defined at module import time; reads `args` lazily on startup
+# (after __main__ has parsed them).
+
+
+def get_cuda_env_root(thread_id: int) -> Path:
+    path = ENV_DIR / f"cuda_eval_{thread_id}"
+    if not path.exists():
+        setup_cuda_envs(path)
+    assert path.exists()
+    return path
+
+
+def get_persistent_root(unique_name: str) -> Path:
+    # Create a unique directory based on the output filename. This directory's artifacts will not be overwritten by subsequent compilations.
+    persistent_artifacts_dir = ENV_DIR / "persistent" / unique_name
+    assert (
+        not persistent_artifacts_dir.exists()
+    ), f"Persistent artifacts directory {persistent_artifacts_dir} already exists"
+    setup_cuda_envs(persistent_artifacts_dir)
+    return persistent_artifacts_dir
+
+
+def setup_cuda_envs(directory: Path):
+    shutil.copytree(CUDA_ENV_PATH, directory)
+    logger.info(f"Set up CUDA environment at {directory}")
+
+
+def free_cuda_envs():
+    if ENV_DIR.exists():
+        shutil.rmtree(ENV_DIR)
+    logger.info("Cleaned up CUDA environment")
+
+
+def get_all_includes(main_file_text: str) -> list[str]:
+    # get includes that are surrounded by angle brackets
+    system_includes = re.findall(r"(#include\s+<[^>]+>)", main_file_text)
+    # get includes that are surrounded by quotes
+    user_includes = re.findall(r'(#include\s+"[^"]+")', main_file_text)
+    return system_includes + user_includes
+
+
+def split_files_for_compilation(
+    main_file_path: str, cuda_file_path: str | None, driver_torch: bool = True
+) -> tuple[str, str, str]:
+    """
+    This method parses the driver file and cuda file and separates it into two compilable units.
+
+    ``driver_torch=False`` (fast path, torch-free drivers only) leaves
+    torch/torch.h out of the host TU as well.
+    """
+    main_file_text = Path(main_file_path).read_text()
+    header_file_text = ""
+    cuda_file_text = ""
+
+    if cuda_file_path:
+        cuda_file_text = Path(cuda_file_path).read_text()
+        # If we are compiling a cuda kernel, we must construct a separate compilable unit
+        # parse the header from the test file and move to a header file
+        try:
+            header_decl = find_kernel_launch_header(main_file_text)
+        except Exception as e:
+            logger.error(
+                f"Failed to find kernel launch header in {main_file_path}: {e}"
+            )
+            raise CompilationError(
+                f"Failed to find kernel launch header in {main_file_path}: {e}"
+            )
+        main_file_text = main_file_text.replace(header_decl, "")
+
+        # Add cstdint in case fixed-width integer types are used like int64_t.
+        # torch/torch.h is only needed when the launch signature or the kernel
+        # itself uses torch::/c10::/at:: types. Pulling it into the CUDA
+        # translation unit costs ~40s per compile (nvcc parses all of LibTorch),
+        # and the hot RL loop recompiles the kernel ~120x per problem, so the
+        # include is guarded to the host TU unless it is genuinely required.
+        needs_torch = bool(
+            re.search(r"\b(torch|c10|at)::", cuda_file_text)
+            or re.search(r"\b(torch|c10|at)::", header_decl)
+        )
+        if needs_torch:
+            torch_include = "#include <torch/torch.h>\n"
+        elif not driver_torch:
+            torch_include = ""
+        else:
+            # __CUDACC__ is defined for the nvcc-compiled kernel TU and not for
+            # the host-compiled driver TU, so the driver still sees LibTorch.
+            torch_include = (
+                "#ifndef __CUDACC__\n#include <torch/torch.h>\n#endif\n"
+            )
+        header_file_text = "#include <cstdint>\n" + torch_include + header_decl + "\n"
+
+        # Add the header include to both main file and CUDA file
+        main_file_text = f'#include "cuda_model.cuh"\n{main_file_text}'
+        cuda_file_text = f'#include "cuda_model.cuh"\n{cuda_file_text}'
+
+        # Remove "inline" and 'extern "C"' because the linker will fail
+        cuda_file_text = cuda_file_text.replace(
+            "inline void launch_gpu_implementation", "void launch_gpu_implementation"
+        ).replace('extern "C"', "")
+
+    return main_file_text, header_file_text, cuda_file_text
+
+
+class CompilationRequest(BaseModel):
+    job_name: str
+    main_file: str
+    cuda_file: str
+    sm_version: str
+
+    # This flag allows the compilation server to save the CUDA source artifacts in a unique directory
+    # that's only modified on shutdown.
+    # This is useful when later commands need to reference the original CUDA source code e.g. NCU annotation.
+    # Also, boolean flags are not supported in the REST API.
+    persistent_artifacts: int = 0
+
+
+class CompilationResult(BaseModel):
+    job_name: str
+    main_file: str
+    cuda_file: str
+    success: bool = False
+    message: str = None
+    output_path: str = None
+    persistent_artifacts_dir: str = None
+
+
+class CompilationError(Exception):
+    def __init__(self, message: str):
+        self.message = message
+        super().__init__(self.message)
+
+async def exec_compilation(
+    job_name: str,
+    main_file: str,
+    cuda_file: str,
+    sm_version: str,
+    worker_id: int,
+    output_path: Path,
+    persistent_artifacts: bool,
+    debug=False,
+    timeout: int | None = None,
+):
+    """
+    This function is used to compile a CUDA program.
+    It will separate and move the GPU code declaration from the test file into its own header file.
+    It will remove the header from the cuda file and instead add an includes statement to the header file.
+
+    The structure is as follows:
+    - main.cpp (copied from from <main_file> but with the kernel launch header removed)
+    - cuda_model.cuh (solely the extracted kernel launch header)
+    - cuda_model.cu (copied from <cuda_file> and with an additional #include "cuda_model.cuh" at the top)
+    """
+    assert not debug, "Debug compilation is not supported"
+
+    if persistent_artifacts:
+        work_dir = get_persistent_root(output_path.name)
+    else:
+        # Use the standard worker environment
+        work_dir = get_cuda_env_root(worker_id)
+
+    if timeout is None:
+        # Phase E: ``args`` global went away with the legacy ``__main__``
+        # block; read the CLI-tunable through the env var it was
+        # originally sourced from.
+        timeout = int(os.getenv("KERNELBLASTER_COMPILE_TIMEOUT_S", "360"))
+
+    if cuda_fast.enabled():
+        builder = cuda_fast.get_builder(ENV_DIR, ENV_VARS)
+        try:
+            return await builder.build_driver_kernel(
+                work_dir, main_file, cuda_file, sm_version, timeout, CompilationError
+            )
+        except cuda_fast.ToolchainError as e:
+            logger.warning(f"fast compile unavailable ({e}); using CMake")
+        # the legacy build below must not write through a cached hard link
+        stale = work_dir / f"build_{sm_version}" / "main"
+        if stale.exists():
+            stale.unlink()
+    return await _exec_compilation_cmake(
+        main_file, cuda_file, sm_version, work_dir, timeout
+    )
+
+
+async def _exec_compilation_cmake(
+    main_file: str,
+    cuda_file: str,
+    sm_version: str,
+    work_dir: Path,
+    timeout: int,
+):
+    """The legacy build: split files into ``work_dir``, CMake configure (once
+    per directory and SM version), ``make``."""
+    main_fp_out, header_fp_out, cuda_fp_out = write_compilation_files(
+        work_dir, main_file, cuda_file
+    )
+
+    arch_version = extract_arch_version(sm_version)
+
+    # this call is expensive, so only regenerate if the sm version is different
+    # (a build dir the fast path made has no Makefile yet)
+    sm_build_dir = work_dir / f"build_{sm_version}"
+    if not (sm_build_dir / "Makefile").exists():
+        build_type = "Release"
+        cmd = build_cmake_command(
+            sm_build_dir,
+            arch_version,
+            build_type,
+        )
+        # Note: use central runner to capture stderr/stdout and handle timeouts.
+        # CMake can hang when CUDA/toolchain discovery misbehaves.
+        await run_subprocess_shell(
+            stage=f"cmake_config:{sm_version}",
+            cmd=cmd,
+            cwd=work_dir,
+            timeout_s=timeout,
+            env=ENV_VARS,
+            error_factory=CompilationError,
+            logger=logger,
+        )
+
+    # Build step (make). Use central runner to ensure timeouts are debuggable.
+    await run_subprocess_shell(
+        stage=f"make:{sm_version}",
+        cmd="make -j8",
+        cwd=sm_build_dir,
+        timeout_s=timeout,
+        env=ENV_VARS,
+        error_factory=CompilationError,
+        logger=logger,
+    )
+
+    return sm_build_dir / "main"
+
+
+# _cuda_compile_job removed in Phase E — was the legacy queue handler
+# for the /compile endpoint. Callers now hit compile_server.py which
+# invokes CUDACompileStrategy directly.
+
+

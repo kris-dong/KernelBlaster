@@ -1,0 +1,104 @@
+{
+ "_doc": "Recurrent / scan op class (A2 capabilities item 2). Offered only for slots of class `recurrent`, which ModelBlaster emits for gru_seq / lstm_seq / lstm when `--recurrent-class on` ($MB_RECURRENT_CLASS=1); with the flag off these ops are class `gemm` and none of these entries applies. Evidence: l3_farm/analysis/cuda_vs_flow.md (41_GRUBidirectional): the fast kernels are latency-bound per timestep (about 1,650 cycles per step: ~640 waiting on L2 for other blocks' h, ~215 mma + barrier, ~600 gate math + publish); GEMM-tiling labels (memory_coalescing, split_k) did not fit.",
+ "techniques": [
+  {
+   "id": "persistent_recurrence_state_on_chip",
+   "level": "universal",
+   "aliases": ["persistent_rnn_recurrence", "weights_stationary_recurrence"],
+   "mechanism": "one persistent launch runs all T timesteps; each block owns a slice of hidden units and keeps its W_hh slice resident (registers as mma fragments, or shared memory) and its h / c slice on chip across steps; only the h exchange between blocks goes through L2",
+   "predicts": {"launch_frac": "down", "compute_util": "up_or_flat"},
+   "risks": ["all blocks must be co-resident (grid <= resident capacity; size the grid with mb_sm_budget() when present, never with all SMs blindly)", "register pressure from resident W_hh fragments (check ptxas spills)"],
+   "states": [],
+   "op_classes": ["recurrent"],
+   "slot": true,
+   "prior": {"mean": 0.2, "n": 1.0},
+   "realizations": [
+    {"scope": "node:simt_gpu", "how": "grid = hidden slices (e.g. 16-64 blocks per direction); per step: read h_{t-1} (all blocks' slices), gates = W_hh_slice h + G_t (precomputed input projection), apply sigmoid/tanh in fp32, write the block's h_t slice, signal readiness; loop."},
+    {"scope": "target:cuda:sm_80+", "how": "W_hh slice as mma.sync.m16n8k16 A-fragments loaded once into registers; h_{t-1} as B-fragments built from the exchange buffer; fp32 accumulators; gates computed directly on the accumulator fragments."}
+   ],
+   "preconditions": null
+  },
+  {
+   "id": "recurrence_input_projection_hoisting",
+   "level": "universal",
+   "aliases": ["hoist_input_gemm", "precomputed_input_gates"],
+   "mechanism": "the input projections X W_ih^T + b of all timesteps do not depend on the recurrence: compute them as one large GEMM (tensor cores, full GPU) before or overlapped with the recurrence, so each serial step only does the small h W_hh^T product",
+   "predicts": {"compute_util": "up", "launch_frac": "down_or_flat"},
+   "risks": ["needs scratch for T x B x G*H gate pre-activations (slot-owned, lazily allocated, instance-safe)", "if computed inside the same launch, GEMM blocks must not starve the recurrence blocks of SMs"],
+   "states": [],
+   "op_classes": ["recurrent"],
+   "slot": true,
+   "prior": {"mean": 0.15, "n": 1.0},
+   "realizations": [
+    {"scope": "node:simt_gpu", "how": "Phase 1: G = X W_ih^T + b_ih (+ b_hh for r/z) for all T as a tiled GEMM; phase 2: the T-step recurrence reads G_t. Or run GEMM-worker blocks in the same persistent launch that publish per-time-tile ready flags the recurrence waits on."},
+    {"scope": "target:cuda:sm_80+", "how": "Phase-1 GEMM with mma.sync + cp.async multi-stage tiles; fold b_ih + b_hh for the r/z gates into it, keep b_hn separate (it sits inside r * (W_hn h + b_hn))."}
+   ],
+   "preconditions": null
+  },
+  {
+   "id": "step_sync_minimization",
+   "level": "universal",
+   "aliases": ["flag_based_step_exchange", "tagged_word_exchange", "no_grid_sync"],
+   "mechanism": "replace grid-wide barriers between timesteps by point-to-point readiness: each block publishes its h_t slice together with the step number (a tagged 64-bit word or a per-slice flag) and readers poll only the words they need; replicate the exchange buffer so reader warps get coalesced loads",
+   "predicts": {"compute_util": "up_or_flat", "parallel_fill": "flat"},
+   "risks": ["memory ordering: publish with st.release.gpu (or __threadfence before a volatile flag store), poll with ld.acquire.gpu / ld.relaxed.gpu + fence; a missing fence gives rare wrong results", "spin loops deadlock if a producer block is not resident", "full-mask __shfl_sync in a partial warp hangs"],
+   "states": [],
+   "op_classes": ["recurrent"],
+   "slot": true,
+   "prior": {"mean": 0.15, "n": 1.0},
+   "realizations": [
+    {"scope": "node:simt_gpu", "how": "Exchange buffer word = {h pair (2 x fp16), step}: the writer stores one 64-bit word per pair, readers spin until the step field equals t. No counters to reset, no grid.sync()."},
+    {"scope": "target:cuda:sm_70+", "how": "st.release.gpu.b64 / ld.acquire.gpu.b64 (or ld.relaxed.gpu + fence.acq_rel.gpu); keep the spin tight (no __nanosleep on the critical path; measured: back-off polling was slower)."}
+   ],
+   "preconditions": null
+  },
+  {
+   "id": "layer_wavefront_pipeline",
+   "level": "universal",
+   "aliases": ["wavefront_rnn", "layer_pipelining", "direction_concurrency"],
+   "mechanism": "independent recurrences run at the same time: the forward and reverse direction of a layer concurrently (two block groups in one launch, or two concurrent instances), and in unidirectional stacks layer l+1 step t once layer l has produced step t (a diagonal wavefront)",
+   "predicts": {"parallel_fill": "up", "compute_util": "up"},
+   "risks": ["co-residency of all concurrently spinning blocks", "the slot sees only its own op: within one op only the batch / gate / direction dimensions are available; cross-op wavefronts need a region slot"],
+   "states": [],
+   "op_classes": ["recurrent"],
+   "slot": true,
+   "prior": {"mean": 0.1, "n": 1.0},
+   "realizations": [
+    {"scope": "node:simt_gpu", "how": "Use few blocks per recurrence (16-32) so a concurrent sibling (the other direction, another layer) fits beside it; read mb_sm_budget() when the harness provides it and size the grid to it."}
+   ],
+   "preconditions": null
+  },
+  {
+   "id": "recurrent_gate_fast_math",
+   "level": "universal",
+   "aliases": ["fast_gates", "tanh_approx_gates"],
+   "mechanism": "the per-step gate math (sigmoid, tanh, the r * (.) and (1-z) h + z n blends) is on the serial critical path: use __expf / tanh.approx.f32 / fused multiply-adds, one (batch, unit) per thread, and pack outputs with shuffles",
+   "predicts": {"compute_util": "up_or_flat"},
+   "risks": ["approximate tanh / exp error accumulates over T steps: check the slot tolerance on the longest sequence"],
+   "states": [],
+   "op_classes": ["recurrent"],
+   "slot": true,
+   "prior": {"mean": 0.1, "n": 1.0},
+   "realizations": [
+    {"scope": "node:simt_gpu", "how": "sigmoid(x) = 1 / (1 + __expf(-x)); tanh via tanh.approx.f32 inline PTX on sm_75+; keep accumulation in fp32."}
+   ],
+   "preconditions": null
+  },
+  {
+   "id": "per_step_latency_probe",
+   "level": "universal",
+   "aliases": ["clock64_phase_counters", "step_breakdown"],
+   "mechanism": "measure where a timestep's cycles go before restructuring: clock64() deltas per phase (wait for h, mma, gate math, publish) accumulated per block and reported once; then attack the largest phase",
+   "predicts": {"compute_util": "up_or_flat"},
+   "risks": ["probe code must be removed (or compiled out) in the final kernel; it changes timing slightly"],
+   "states": [],
+   "op_classes": ["recurrent"],
+   "slot": true,
+   "prior": {"mean": 0.05, "n": 1.0},
+   "realizations": [
+    {"scope": "node:simt_gpu", "how": "Guard the probe with a macro; read the counters only in an experiment run (multi-turn experiment tool), never in the submitted slot."}
+   ],
+   "preconditions": null
+  }
+ ]
+}

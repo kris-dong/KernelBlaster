@@ -1,0 +1,286 @@
+{
+ "_doc": "Curated technique seeds (knowledge_architecture.md section 5), one file per area. Fields: id, level + scope (a scope node or universal), aliases (v1 / technique-DB / footer names folded in), mechanism, preconditions (predicate DSL), predicts (canonical metric -> up|down|flat|up_or_flat|down_or_flat), risks (pitfalls), states / op_classes / op_kinds gates (empty = any), slot (offered by the multi-slot agent), prior {mean, n}: a seed prior with a low pseudo-count that evidence overrides, realizations by scope (target:<key> | target:<backend>:sm_NN+ | target:<backend> | node:<id> | universal). Loaded by Ontology.seed(); scripts/seed_knowledge.py builds a knowledge.db from these files.",
+ "techniques": [
+  {
+   "id": "tensor_core_mma",
+   "level": "node",
+   "scope": "nvidia_gpu",
+   "aliases": [
+    "tensor_core_utilization",
+    "specialized_instruction_usage",
+    "wmma"
+   ],
+   "mechanism": "matrix units execute a whole 16x16xK multiply-accumulate per instruction, far above the scalar FMA ceiling",
+   "preconditions": {
+    "op_class": "in",
+    "v": [
+     "gemm",
+     "conv",
+     "attention"
+    ]
+   },
+   "predicts": {
+    "compute_util": "down_or_flat",
+    "reg_pressure": "up_or_flat"
+   },
+   "risks": [
+    "fp16/tf32 inputs exceed fp32 tolerances (1e-3 relative with K >= 1024 often fails)",
+    "bf16 tensor cores need sm_80+; on sm_75 a bf16 slot computes in fp32 (bf16 -> fp16 is exact only inside fp16's range)",
+    "fragment layout mistakes",
+    "M/N/K not multiples of 16: pad tiles in on-chip memory"
+   ],
+   "states": [
+    "compute_bound",
+    "matrix_compute",
+    "tensor_core_eligible",
+    "balanced_bound"
+   ],
+   "op_classes": [
+    "gemm",
+    "conv",
+    "attention"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.1,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:cuda",
+     "how": "nvcuda::wmma 16x16x16 fragments with fp16 inputs and fp32 accumulators (sm_75: fp16 only; for fp32 problems only if the tolerance allows rounding inputs to fp16 -- usually it does not for K >= 1024; bf16 problems: no bf16 tensor cores on sm_75, compute in fp32)."
+    },
+    {
+     "scope": "target:cuda:sm_80+",
+     "how": "wmma::precision::tf32 (m16n16k8) or mma.sync bf16/tf32 with fp32 accumulators; tf32 keeps 10 mantissa bits, check the tolerance. bf16 problems: wmma 16x16x16 / mma.sync m16n8k16 on __nv_bfloat16 inputs with fp32 accumulators -- the products of bf16 inputs are exact, so only the fp32 accumulation order differs from the reference."
+    },
+    {
+     "scope": "target:cuda:sm_90+",
+     "how": "wgmma (warpgroup MMA, asynchronous) fed by TMA; see tma_wgmma_pipeline."
+    }
+   ]
+  },
+  {
+   "id": "ldmatrix_fragment_loads",
+   "level": "node",
+   "scope": "nvidia_gpu",
+   "aliases": [],
+   "mechanism": "ldmatrix loads tensor-core fragments from shared memory in the layout mma expects, one instruction per 8x8 sub-matrix set",
+   "predicts": {
+    "compute_util": "up_or_flat",
+    "bank_conflicts": "down_or_flat"
+   },
+   "risks": [],
+   "relations": {
+    "stacks_after": [
+     "tensor_core_mma"
+    ]
+   },
+   "states": [
+    "matrix_compute",
+    "tensor_core_eligible"
+   ],
+   "op_classes": [
+    "gemm",
+    "conv",
+    "attention"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.03,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:cuda",
+     "how": "ldmatrix.sync.aligned.m8n8.x4 from a swizzled shared tile into mma.sync operands (sm_75+)."
+    }
+   ]
+  },
+  {
+   "id": "cp_async_multistage_pipeline",
+   "level": "node",
+   "scope": "nvidia_gpu",
+   "aliases": [
+    "cp_async",
+    "memcpy_async_pipeline"
+   ],
+   "mechanism": "asynchronous global->shared copies (no register staging) in a 3-4 stage ring buffer keep the tensor / FMA units fed",
+   "predicts": {
+    "compute_util": "up",
+    "reg_pressure": "down_or_flat"
+   },
+   "risks": [
+    "wrong wait_group counts read stale stages",
+    "on-chip memory per stage limits occupancy"
+   ],
+   "relations": {
+    "stacks_after": [
+     "shared_memory_tiling"
+    ]
+   },
+   "states": [],
+   "op_classes": [
+    "gemm",
+    "conv",
+    "attention"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.06,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:cuda:sm_80+",
+     "how": "cp.async.cg.shared.global 16-byte copies per stage, cp.async.commit_group / wait_group<stages-2>, __syncthreads between stages; Ampere / Ada only (no realization on sm_75).",
+     "params_prior": {
+      "stages": 3
+     }
+    }
+   ]
+  },
+  {
+   "id": "tma_wgmma_pipeline",
+   "level": "node",
+   "scope": "hopper",
+   "aliases": [
+    "tma",
+    "wgmma"
+   ],
+   "mechanism": "Hopper: TMA bulk tensor copies with mbarrier synchronisation feed asynchronous warpgroup MMAs",
+   "predicts": {
+    "compute_util": "up",
+    "reg_pressure": "down_or_flat"
+   },
+   "risks": [
+    "descriptor setup (cuTensorMapEncodeTiled) is host-side; needs sm_90a"
+   ],
+   "states": [],
+   "op_classes": [
+    "gemm",
+    "conv",
+    "attention"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.08,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:cuda:sm_90+",
+     "how": "cp.async.bulk.tensor (TMA) into swizzled shared tiles, mbarrier arrive/wait per stage, wgmma.mma_async with a warpgroup of 128 threads."
+    }
+   ]
+  },
+  {
+   "id": "bank_conflict_padding",
+   "level": "node",
+   "scope": "simt_gpu",
+   "aliases": [
+    "access_pattern_swizzling",
+    "memory_layout_permutation",
+    "shared_memory_padding",
+    "padding_between_rows"
+   ],
+   "mechanism": "pad or swizzle shared-memory rows so a warp's accesses hit distinct banks instead of serialising",
+   "predicts": {
+    "bank_conflicts": "down",
+    "mem_util": "down_or_flat",
+    "compute_util": "up_or_flat"
+   },
+   "risks": [],
+   "states": [
+    "on_chip_memory_bound",
+    "smem_bank_conflicted",
+    "underutilized_memory",
+    "cache_thrashing"
+   ],
+   "op_classes": [
+    "gemm",
+    "conv",
+    "attention",
+    "data_movement",
+    "reduction"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.03,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "node:simt_gpu",
+     "how": "Pad on-chip tiles by one element per row (e.g. [32][33]) or XOR-swizzle the column index so lanes hit distinct banks."
+    }
+   ]
+  },
+  {
+   "id": "shared_memory_optimization",
+   "level": "node",
+   "scope": "simt_gpu",
+   "aliases": [
+    "dynamic_shared_memory",
+    "shared_memory_reuse",
+    "local_memory_reuse"
+   ],
+   "mechanism": "less on-chip memory per block (reuse buffers, right-sized dynamic allocation) so more blocks are resident",
+   "predicts": {
+    "occupancy": "up"
+   },
+   "risks": [],
+   "states": [
+    "stalled_low_occupancy",
+    "register_limited_occupancy"
+   ],
+   "op_classes": [],
+   "slot": true,
+   "prior": {
+    "mean": 0.03,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:cuda",
+     "how": "extern __shared__ sized per launch; reuse one buffer across phases; smaller tiles when occupancy is the limit; >48 KB needs cudaFuncSetAttribute(MaxDynamicSharedMemorySize)."
+    }
+   ]
+  },
+  {
+   "id": "warp_specialization",
+   "level": "node",
+   "scope": "nvidia_gpu",
+   "aliases": [],
+   "mechanism": "split a block into producer warps (loads) and consumer warps (math) synchronised by barriers, so memory and compute overlap without register staging",
+   "predicts": {
+    "compute_util": "up"
+   },
+   "risks": [
+    "complex synchronisation; only worth it on large tiled GEMM / attention"
+   ],
+   "relations": {
+    "stacks_after": [
+     "cp_async_multistage_pipeline"
+    ]
+   },
+   "states": [],
+   "op_classes": [
+    "gemm",
+    "conv",
+    "attention"
+   ],
+   "slot": false,
+   "prior": {
+    "mean": 0.02,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:cuda:sm_80+",
+     "how": "Producer warps issue cp.async / TMA into a stage ring, consumer warps wait on named barriers (bar.sync id) or mbarriers and run the MMAs."
+    }
+   ]
+  }
+ ]
+}

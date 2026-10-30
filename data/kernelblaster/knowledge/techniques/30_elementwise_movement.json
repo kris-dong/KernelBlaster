@@ -1,0 +1,225 @@
+{
+ "_doc": "Curated technique seeds (knowledge_architecture.md section 5), one file per area. Fields: id, level + scope (a scope node or universal), aliases (v1 / technique-DB / footer names folded in), mechanism, preconditions (predicate DSL), predicts (canonical metric -> up|down|flat|up_or_flat|down_or_flat), risks (pitfalls), states / op_classes / op_kinds gates (empty = any), slot (offered by the multi-slot agent), prior {mean, n}: a seed prior with a low pseudo-count that evidence overrides, realizations by scope (target:<key> | target:<backend>:sm_NN+ | target:<backend> | node:<id> | universal). Loaded by Ontology.seed(); scripts/seed_knowledge.py builds a knowledge.db from these files.",
+ "techniques": [
+  {
+   "id": "grid_stride_vectorized",
+   "level": "node",
+   "scope": "simt_gpu",
+   "aliases": [
+    "grid_stride_loop"
+   ],
+   "mechanism": "a grid sized to the machine, each thread looping over wide elements: full bandwidth with minimal index math and launch cost",
+   "predicts": {
+    "bw_util": "up"
+   },
+   "risks": [],
+   "states": [],
+   "op_classes": [
+    "elementwise"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.08,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:cuda",
+     "how": "Grid-stride loop with float4 accesses (half2 / __nv_bfloat162 x4 for fp16 / bf16); grid = a few waves of the SM count; minimal integer math per element."
+    },
+    {
+     "scope": "target:opencl",
+     "how": "Global size = a few waves per SP, each work-item loops over vload4 elements."
+    }
+   ]
+  },
+  {
+   "id": "broadcast_operand_caching",
+   "level": "universal",
+   "aliases": [
+    "broadcast_optimization"
+   ],
+   "mechanism": "an operand broadcast along some dimensions (bias, per-channel scale) is loaded once per thread / block and reused, not re-read per element",
+   "predicts": {
+    "bw_util": "down_or_flat"
+   },
+   "risks": [],
+   "states": [],
+   "op_classes": [
+    "elementwise",
+    "reduction"
+   ],
+   "op_kinds": [
+    "add",
+    "mul",
+    "ewise2",
+    "batchnorm2d"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.04,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "node:simt_gpu",
+     "how": "Order the mapping so a thread works within one channel / row and keeps the broadcast value in a register (or the block stages the per-channel vector in on-chip memory)."
+    }
+   ]
+  },
+  {
+   "id": "transpose_via_shared_tile",
+   "level": "universal",
+   "aliases": [
+    "tiled_transpose",
+    "memory_layout_transform",
+    "blocked_layout_transform"
+   ],
+   "mechanism": "transpose / permute through a padded on-chip tile so both the read and the write are coalesced",
+   "predicts": {
+    "bw_util": "up",
+    "uncoalesced": "down"
+   },
+   "risks": [
+    "bank conflicts without padding ([32][33])"
+   ],
+   "states": [],
+   "op_classes": [
+    "data_movement"
+   ],
+   "op_kinds": [
+    "strided_copy",
+    "strided_scatter"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.1,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "node:simt_gpu",
+     "how": "32x32 tiles in on-chip memory padded to 33 columns: read rows coalesced, sync, write columns coalesced."
+    },
+    {
+     "scope": "node:rvv",
+     "how": "Segment loads/stores (vlseg/vsseg) or strided vlse into registers, then unit-stride stores."
+    }
+   ]
+  },
+  {
+   "id": "gather_contiguous_inner",
+   "level": "universal",
+   "aliases": [
+    "indexed_copy",
+    "1.3_reduce_indirect_loads",
+    "batch_gather_transform"
+   ],
+   "mechanism": "gathers / index_select / scatter: threads over the contiguous inner dimension of each gathered row, the index read once per row",
+   "predicts": {
+    "bw_util": "up",
+    "uncoalesced": "down"
+   },
+   "risks": [
+    "scatter with duplicate indices needs atomics or a deterministic order"
+   ],
+   "states": [],
+   "op_classes": [
+    "data_movement"
+   ],
+   "op_kinds": [
+    "gather",
+    "gather_dim",
+    "index_select",
+    "scatter_dim"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.08,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "node:simt_gpu",
+     "how": "A block (or warp) per gathered row: read the index once, copy the row with vectorised coalesced loads; for scatter, atomics only when indices can repeat."
+    },
+    {
+     "scope": "node:rvv",
+     "how": "Indexed loads (vluxei32) only when rows are short; otherwise unit-stride copy per gathered row."
+    }
+   ]
+  },
+  {
+   "id": "concat_single_pass",
+   "level": "universal",
+   "aliases": [
+    "fused_concat"
+   ],
+   "mechanism": "concatenation writes every input in one launch through an offset table, with vectorised copies",
+   "predicts": {
+    "launch_frac": "down_or_flat",
+    "bw_util": "up"
+   },
+   "risks": [],
+   "states": [],
+   "op_classes": [
+    "data_movement"
+   ],
+   "op_kinds": [
+    "cat2_c1",
+    "cat3_c1",
+    "cat4_c1",
+    "catn"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.06,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "node:simt_gpu",
+     "how": "One kernel over the output: each thread finds its source tensor from a small offset table (binary search or per-block assignment) and copies float4 runs."
+    }
+   ]
+  },
+  {
+   "id": "streaming_stores",
+   "level": "universal",
+   "aliases": [
+    "5.1_streaming_stores",
+    "cache_streaming_stores"
+   ],
+   "mechanism": "outputs that are never re-read bypass the caches, so they do not evict reused inputs",
+   "predicts": {
+    "l2_hit": "up_or_flat",
+    "bw_util": "up_or_flat"
+   },
+   "risks": [],
+   "states": [
+    "memory_bound",
+    "dram_streaming",
+    "streaming_low_reuse"
+   ],
+   "op_classes": [
+    "elementwise",
+    "data_movement"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.02,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:cuda",
+     "how": "__stcs() / st.global.cs for write-once outputs (and __ldcs for read-once inputs)."
+    },
+    {
+     "scope": "node:vector_cpu",
+     "how": "Write full cache lines in order so no read-for-ownership is needed; avoid partial-line tails."
+    }
+   ]
+  }
+ ]
+}

@@ -1,0 +1,349 @@
+{
+ "techniques": [
+  {
+   "id": "tcgen05_mma_tmem",
+   "level": "node",
+   "scope": "nvidia_gpu",
+   "aliases": [
+    "tcgen05",
+    "tmem_mma"
+   ],
+   "mechanism": "Blackwell 5th-gen tensor cores: one thread issues a whole-tile MMA, accumulating in Tensor Memory instead of registers, at several times the mma.sync / wgmma throughput",
+   "predicts": {
+    "compute_util": "up",
+    "reg_pressure": "down"
+   },
+   "risks": [
+    "descriptor / swizzle-mode mistakes give silent wrong results",
+    "TMEM alloc/dealloc must be balanced per CTA",
+    "needs TMA or cp.async.bulk for feeding"
+   ],
+   "relations": {
+    "stacks_after": [
+     "tma_wgmma_pipeline"
+    ]
+   },
+   "states": [
+    "matrix_compute",
+    "tensor_core_eligible",
+    "compute_bound"
+   ],
+   "op_classes": [
+    "gemm",
+    "conv",
+    "attention"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.15,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:cuda:sm_100+",
+     "how": "tcgen05.mma.cta_group::1 with A/B from shared-memory descriptors (swizzled 128B layout), accumulator in TMEM allocated with tcgen05.alloc, completion via tcgen05.commit -> mbarrier; epilogue reads TMEM with tcgen05.ld into registers. Needs -arch=sm_100a (already the build flag). Keep the mma.sync kernel as the fallback for shapes that miss alignment."
+    }
+   ]
+  },
+  {
+   "id": "cta_pair_2sm_mma",
+   "level": "node",
+   "scope": "nvidia_gpu",
+   "aliases": [],
+   "mechanism": "two CTAs of a cluster issue one MMA over a doubled tile (e.g. 256xN), halving B-operand traffic per FLOP",
+   "predicts": {
+    "compute_util": "up"
+   },
+   "risks": [
+    "cluster launch attributes required (cudaLaunchKernelEx)"
+   ],
+   "relations": {
+    "stacks_after": [
+     "tcgen05_mma_tmem"
+    ]
+   },
+   "states": [],
+   "op_classes": [
+    "gemm",
+    "conv",
+    "attention"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.05,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:cuda:sm_100+",
+     "how": "cluster of 2 CTAs, tcgen05.mma.cta_group::2, leader CTA issues, each CTA loads its half of A and shares B via multicast TMA."
+    }
+   ]
+  },
+  {
+   "id": "cluster_multicast",
+   "level": "node",
+   "scope": "nvidia_gpu",
+   "aliases": [],
+   "mechanism": "TMA-multicast one tile to several CTAs of a cluster so L2 is read once",
+   "predicts": {
+    "compute_util": "up_or_flat"
+   },
+   "risks": [
+    "cluster scheduling can lower occupancy"
+   ],
+   "relations": {
+    "stacks_after": [
+     "tma_wgmma_pipeline"
+    ]
+   },
+   "states": [],
+   "op_classes": [
+    "gemm",
+    "conv",
+    "attention"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.03,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:cuda:sm_90+",
+     "how": "launch with a cluster dim (cudaLaunchKernelEx + cudaLaunchAttributeClusterDimension), cp.async.bulk.tensor ... .multicast::cluster with a CTA mask; mbarrier expect_tx covers all receivers."
+    }
+   ]
+  },
+  {
+   "id": "persistent_tile_scheduler",
+   "level": "node",
+   "scope": "nvidia_gpu",
+   "aliases": [],
+   "mechanism": "one CTA per SM loops over output tiles so the epilogue of one tile overlaps the loads of the next and tail waves vanish",
+   "predicts": {
+    "compute_util": "up"
+   },
+   "risks": [
+    "more complex pipelines"
+   ],
+   "relations": {
+    "stacks_after": [
+     "warp_specialization"
+    ]
+   },
+   "states": [],
+   "op_classes": [
+    "gemm",
+    "conv",
+    "attention"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.04,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:cuda:sm_90+",
+     "how": "grid = #SMs; each CTA walks tile ids tile += gridDim.x (or a stream-K / grouped order); double-buffer the accumulator (two TMEM or register sets) so the epilogue overlaps the next mainloop."
+    }
+   ]
+  },
+  {
+   "id": "smem_swizzle_conflict_free",
+   "level": "node",
+   "scope": "nvidia_gpu",
+   "aliases": [],
+   "mechanism": "XOR-swizzle the shared-memory tile address instead of padding so ldmatrix / cp.async / TMA accesses are bank-conflict free and tiles stay 16B-aligned",
+   "predicts": {
+    "bank_conflicts": "down",
+    "compute_util": "up_or_flat"
+   },
+   "risks": [
+    "write and read swizzles must match"
+   ],
+   "relations": {
+    "stacks_after": [
+     "ldmatrix_fragment_loads"
+    ]
+   },
+   "states": [],
+   "op_classes": [
+    "gemm",
+    "conv",
+    "attention"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.04,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:cuda:sm_80+",
+     "how": "address = row*BK + ((chunk ^ (row & mask)) << 3) for 16-byte chunks, applied identically on the cp.async write and the ldmatrix read; on sm_90+ use the TMA 32/64/128B swizzle modes."
+    }
+   ]
+  },
+  {
+   "id": "tile_shape_retune",
+   "level": "node",
+   "scope": "nvidia_gpu",
+   "aliases": [],
+   "mechanism": "retune the CTA tile (BMxBNxBK) and warp tile to the SM's shared-memory / register budget: larger tiles raise arithmetic intensity until occupancy or spills bite",
+   "predicts": {
+    "compute_util": "up",
+    "reg_pressure": "up"
+   },
+   "risks": [
+    "register spills",
+    "fewer resident CTAs"
+   ],
+   "states": [
+    "matrix_compute",
+    "tensor_core_eligible",
+    "compute_bound"
+   ],
+   "op_classes": [
+    "gemm",
+    "conv",
+    "attention"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.05,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:cuda:sm_80+",
+     "how": "try 128x256x32 (warp 64x64), 256x128x32, BK=64, 4-5 stages; check registers (<=255), shared memory (<= the per-SM budget in the hardware block) and that M/N divisibility still holds (keep a fallback)."
+    }
+   ]
+  },
+  {
+   "id": "l2_block_rasterization",
+   "level": "node",
+   "scope": "nvidia_gpu",
+   "aliases": [],
+   "mechanism": "remap CTA ids (grouped / swizzled rasterization) so CTAs running at the same time share A and B tiles in L2",
+   "predicts": {
+    "mem_util": "down_or_flat",
+    "compute_util": "up_or_flat"
+   },
+   "risks": [],
+   "states": [],
+   "op_classes": [
+    "gemm",
+    "conv",
+    "attention"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.03,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:cuda",
+     "how": "pid -> (group of GROUP_M=8 row-tiles, column-major inside the group) as in grouped GEMM; costs a few integer ops per CTA."
+    }
+   ]
+  },
+  {
+   "id": "smem_staged_epilogue",
+   "level": "node",
+   "scope": "nvidia_gpu",
+   "aliases": [],
+   "mechanism": "write the accumulator tile to shared memory and store 16-byte rows (coalesced), fusing bias / activation there",
+   "predicts": {
+    "mem_util": "down_or_flat"
+   },
+   "risks": [],
+   "states": [],
+   "op_classes": [
+    "gemm",
+    "conv",
+    "attention"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.03,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:cuda",
+     "how": "after the mainloop reuse the pipeline smem as a padded C tile, __syncthreads, then each thread copies uint4 rows to global; on sm_90+ use a TMA store."
+    }
+   ]
+  },
+  {
+   "id": "register_fragment_double_buffering",
+   "level": "node",
+   "scope": "nvidia_gpu",
+   "aliases": [],
+   "mechanism": "load the next k-slice's operand fragments (ldmatrix) while the current slice's MMAs issue, hiding shared-memory latency",
+   "predicts": {
+    "compute_util": "up",
+    "reg_pressure": "up"
+   },
+   "risks": [
+    "register pressure"
+   ],
+   "relations": {
+    "stacks_after": [
+     "ldmatrix_fragment_loads"
+    ]
+   },
+   "states": [],
+   "op_classes": [
+    "gemm",
+    "conv",
+    "attention"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.04,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:cuda:sm_80+",
+     "how": "keep two register fragment sets; at slice kk issue ldmatrix for kk+1 (and the next tile's kk=0 after the stage wait) before the mma loop for kk."
+    }
+   ]
+  },
+  {
+   "id": "split_k_or_stream_k",
+   "level": "node",
+   "scope": "nvidia_gpu",
+   "aliases": [],
+   "mechanism": "when output tiles do not fill all SMs, split K across CTAs (split-K / stream-K) and reduce the partials",
+   "predicts": {
+    "compute_util": "up"
+   },
+   "risks": [
+    "extra workspace; reduction cost"
+   ],
+   "states": [],
+   "op_classes": [
+    "gemm",
+    "conv",
+    "attention"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.02,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:cuda",
+     "how": "assign each CTA a K-range of a tile, accumulate in fp32 workspace (or atomics / a second kernel) and convert to fp16 once; stream-K balances the tail."
+    }
+   ]
+  }
+ ]
+}

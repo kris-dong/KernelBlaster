@@ -1,0 +1,322 @@
+{
+ "_doc": "Seed state hierarchy (knowledge_architecture.md section 4). Roots and siblings are tried in list order; the first whose predicate is true wins. Thresholds are percent of peak unless noted (parallel_fill, launch_frac are fractions). States over bank_conflicts / uncoalesced need a profiler that reports them; elsewhere classification stays at the parent.",
+ "states": [
+  {
+   "id": "latency_bound",
+   "parent": null,
+   "level": "universal",
+   "predicate": {
+    "any": [
+     {
+      "parallel_fill": "<",
+      "v": 0.3
+     },
+     {
+      "launch_frac": ">=",
+      "v": 0.5
+     }
+    ]
+   },
+   "mechanism": "time is set by fixed latencies (launch/sync, or too little parallel work to hide memory latency), not by any throughput"
+  },
+  {
+   "id": "launch_overhead",
+   "parent": "latency_bound",
+   "level": "universal",
+   "predicate": {
+    "launch_frac": ">=",
+    "v": 0.5
+   },
+   "mechanism": "most of the slot time is launch and synchronisation; fewer launches (batching instances, fusion, persistent kernels) is the lever"
+  },
+  {
+   "id": "low_parallelism",
+   "parent": "latency_bound",
+   "level": "universal",
+   "predicate": {
+    "parallel_fill": "<",
+    "v": 0.3
+   },
+   "mechanism": "fewer work items than lanes: the machine idles; split the reduction/K dimension or give the grid more, smaller pieces of work"
+  },
+  {
+   "id": "balanced_bound",
+   "parent": null,
+   "level": "universal",
+   "predicate": {
+    "all": [
+     {
+      "mem_util": ">=",
+      "v": 50
+     },
+     {
+      "compute_util": ">=",
+      "v": 50
+     }
+    ]
+   },
+   "mechanism": "both memory and compute are near peak; only doing less work (fewer bytes and fewer operations) helps"
+  },
+  {
+   "id": "memory_bound",
+   "parent": null,
+   "level": "universal",
+   "predicate": {
+    "all": [
+     {
+      "mem_util": ">=",
+      "v": 50
+     },
+     {
+      "compute_util": "<",
+      "ref": "mem_util"
+     }
+    ]
+   },
+   "mechanism": "time is set by bytes moved; fewer or cheaper bytes is the lever"
+  },
+  {
+   "id": "uncoalesced_memory_bound",
+   "parent": "memory_bound",
+   "level": "universal",
+   "predicate": {
+    "uncoalesced": ">=",
+    "v": 25
+   },
+   "mechanism": "the memory system moves many more sectors than the kernel uses: fix the access pattern before anything else"
+  },
+  {
+   "id": "cache_thrashing",
+   "parent": "memory_bound",
+   "level": "universal",
+   "predicate": {
+    "all": [
+     {
+      "l1_hit": "<",
+      "v": 40
+     },
+     {
+      "arith_intensity": ">=",
+      "v": 4
+     }
+    ]
+   },
+   "mechanism": "the op has reuse but the cache loses it; stage reused blocks explicitly in fast memory"
+  },
+  {
+   "id": "dram_streaming",
+   "parent": "memory_bound",
+   "level": "universal",
+   "predicate": {
+    "all": [
+     {
+      "bw_util": ">=",
+      "v": 50
+     },
+     {
+      "l2_hit": "<",
+      "v": 50
+     }
+    ]
+   },
+   "mechanism": "streaming from DRAM near peak; only fewer bytes (fusion, lower precision, no redundant reads) helps"
+  },
+  {
+   "id": "on_chip_memory_bound",
+   "parent": "memory_bound",
+   "level": "universal",
+   "predicate": {
+    "bw_util": "<",
+    "v": 40
+   },
+   "mechanism": "the busiest memory unit is on-chip (L1/shared/L2), not DRAM: bank conflicts, uncoalesced or redundant on-chip traffic"
+  },
+  {
+   "id": "smem_bank_conflicted",
+   "parent": "on_chip_memory_bound",
+   "level": "universal",
+   "predicate": {
+    "bank_conflicts": ">=",
+    "v": 25
+   },
+   "mechanism": "shared-memory accesses of a warp hit the same banks and serialise; pad or swizzle the tile"
+  },
+  {
+   "id": "streaming_low_reuse",
+   "parent": "memory_bound",
+   "level": "universal",
+   "predicate": {
+    "arith_intensity": "<",
+    "v": 1
+   },
+   "mechanism": "each byte is used about once (elementwise-like); only fewer bytes -- fusion, narrower types, no redundant passes -- helps"
+  },
+  {
+   "id": "compute_bound",
+   "parent": null,
+   "level": "universal",
+   "predicate": {
+    "all": [
+     {
+      "compute_util": ">=",
+      "v": 50
+     },
+     {
+      "compute_util": ">=",
+      "ref": "mem_util"
+     }
+    ]
+   },
+   "mechanism": "time is set by arithmetic issue; fewer or cheaper instructions, or faster units, is the lever"
+  },
+  {
+   "id": "register_limited",
+   "parent": "compute_bound",
+   "level": "universal",
+   "predicate": {
+    "all": [
+     {
+      "reg_pressure": ">=",
+      "v": 50
+     },
+     {
+      "occupancy": "<",
+      "v": 40
+     }
+    ]
+   },
+   "mechanism": "register use caps resident warps, so issue slots go unused while warps wait"
+  },
+  {
+   "id": "matrix_compute",
+   "parent": "compute_bound",
+   "level": "universal",
+   "predicate": {
+    "op_class": "in",
+    "v": [
+     "gemm",
+     "conv",
+     "attention"
+    ]
+   },
+   "mechanism": "dense multiply-accumulate at peak scalar issue; matrix units / register blocking change the ceiling"
+  },
+  {
+   "id": "underutilized",
+   "parent": null,
+   "level": "universal",
+   "predicate": {
+    "all": [
+     {
+      "mem_util": "<",
+      "v": 50
+     },
+     {
+      "compute_util": "<",
+      "v": 50
+     }
+    ]
+   },
+   "mechanism": "enough work but neither unit near peak: the kernel wastes issue slots or bandwidth (poor access pattern, low ILP, redundant work)"
+  },
+  {
+   "id": "underutilized_memory",
+   "parent": "underutilized",
+   "level": "universal",
+   "predicate": {
+    "compute_util": "<",
+    "ref": "mem_util"
+   },
+   "mechanism": "memory-side work dominates but bandwidth is unused: uncoalesced or narrow accesses, poor locality, too few bytes in flight"
+  },
+  {
+   "id": "uncoalesced_access",
+   "parent": "underutilized_memory",
+   "level": "universal",
+   "predicate": {
+    "uncoalesced": ">=",
+    "v": 25
+   },
+   "mechanism": "bandwidth is wasted on partially used sectors: remap threads to contiguous addresses"
+  },
+  {
+   "id": "underutilized_compute",
+   "parent": "underutilized",
+   "level": "universal",
+   "predicate": {
+    "compute_util": ">=",
+    "ref": "mem_util"
+   },
+   "mechanism": "compute-side work dominates but issue is slow: dependency chains, low ILP, index math, no data reuse in registers"
+  },
+  {
+   "id": "stalled_low_occupancy",
+   "parent": "underutilized_compute",
+   "level": "universal",
+   "predicate": {
+    "occupancy": "<",
+    "v": 30
+   },
+   "mechanism": "too few resident warps to hide latency (registers, shared memory or block shape limit residency)"
+  },
+  {
+   "id": "register_limited_occupancy",
+   "parent": "stalled_low_occupancy",
+   "level": "universal",
+   "predicate": {
+    "reg_pressure": ">=",
+    "v": 50
+   },
+   "mechanism": "registers per thread cap resident warps; cut live values or bound registers"
+  },
+  {
+   "id": "tensor_core_eligible",
+   "parent": "underutilized_compute",
+   "level": "universal",
+   "predicate": {
+    "all": [
+     {
+      "op_class": "in",
+      "v": [
+       "gemm",
+       "conv",
+       "attention"
+      ]
+     },
+     {
+      "arith_intensity": ">=",
+      "v": 16
+     }
+    ]
+   },
+   "mechanism": "a dense multiply-accumulate with enough reuse that runs far below peak: blocking for matrix units (or register blocking) changes the ceiling"
+  }
+ ],
+ "legacy_map": {
+  "_doc": "v1 technique-DB / roofline state names -> seed state ids (single-file flows, seeding, offline import)",
+  "high_level_inefficiency": "underutilized",
+  "memory_bandwidth_saturated": "dram_streaming",
+  "memory_latency_bound": "underutilized_memory",
+  "memory_bank_conflicts": "smem_bank_conflicted",
+  "cache_inefficient": "cache_thrashing",
+  "compute_throughput_saturated": "compute_bound",
+  "instruction_mix_suboptimal": "underutilized_compute",
+  "thread_divergence_high": "underutilized_compute",
+  "low_occupancy_register_pressure": "register_limited",
+  "low_occupancy_shared_memory": "stalled_low_occupancy",
+  "insufficient_parallelism": "low_parallelism",
+  "hybrid_bound": "balanced_bound",
+  "memory_compute_balanced": "balanced_bound",
+  "latency_memory_bound": "latency_bound",
+  "api_overhead_dominant": "launch_overhead",
+  "transfer_bandwidth_limited": "launch_overhead",
+  "memory_bandwidth_limited": "memory_bound",
+  "compute_throughput_limited": "compute_bound",
+  "latency_occupancy_limited": "latency_bound",
+  "memory_bound": "memory_bound",
+  "compute_bound": "compute_bound",
+  "latency_bound": "latency_bound",
+  "underutilized_memory": "underutilized_memory",
+  "underutilized_compute": "underutilized_compute"
+ }
+}

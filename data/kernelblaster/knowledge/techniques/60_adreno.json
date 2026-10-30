@@ -1,0 +1,390 @@
+{
+ "_doc": "Curated technique seeds (knowledge_architecture.md section 5), one file per area. Fields: id, level + scope (a scope node or universal), aliases (v1 / technique-DB / footer names folded in), mechanism, preconditions (predicate DSL), predicts (canonical metric -> up|down|flat|up_or_flat|down_or_flat), risks (pitfalls), states / op_classes / op_kinds gates (empty = any), slot (offered by the multi-slot agent), prior {mean, n}: a seed prior with a low pseudo-count that evidence overrides, realizations by scope (target:<key> | target:<backend>:sm_NN+ | target:<backend> | node:<id> | universal). Loaded by Ontology.seed(); scripts/seed_knowledge.py builds a knowledge.db from these files.",
+ "techniques": [
+  {
+   "id": "image2d_texture_reads",
+   "level": "node",
+   "scope": "adreno",
+   "aliases": [
+    "image_vs_buffer",
+    "texture_path"
+   ],
+   "mechanism": "read-heavy 2D operands through image2d_t: the texture path has its own L1 and handles 2D locality and boundary clamping",
+   "predicts": {
+    "l1_hit": "up",
+    "bw_util": "up_or_flat"
+   },
+   "risks": [
+    "image formats (CL_RGBA, CL_FLOAT / CL_HALF_FLOAT) pack 4 channels per texel; width limits (16384)",
+    "the driver must create the image; slots that only get buffers can use cl_khr_image2d_from_buffer"
+   ],
+   "states": [],
+   "op_classes": [
+    "conv",
+    "gemm",
+    "elementwise"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.06,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:opencl",
+     "how": "Weights / activations as image2d_t (RGBA: 4 channels per texel) read with read_imagef(img, sampler, (int2)(x, y)); outputs stay buffers."
+    }
+   ]
+  },
+  {
+   "id": "register_tiling_over_local_memory",
+   "level": "node",
+   "scope": "adreno",
+   "aliases": [
+    "adreno_local_memory_cost"
+   ],
+   "mechanism": "on Adreno __local is not much faster than the L1/texture path and costs barriers: block in registers first and use local memory only for real cross-work-item reuse",
+   "predicts": {
+    "compute_util": "up",
+    "reg_pressure": "up"
+   },
+   "risks": [
+    "register pressure lowers the kernel's max work-group size"
+   ],
+   "states": [],
+   "op_classes": [
+    "gemm",
+    "conv"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.06,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:opencl",
+     "how": "Each work-item computes a 4x4 (float4 x 4) output block from vload4 rows read directly from global / image memory; add __local tiling only if profiling shows repeated global reads."
+    }
+   ]
+  },
+  {
+   "id": "adreno_subgroup_size",
+   "level": "node",
+   "scope": "adreno",
+   "aliases": [
+    "qcom_reqd_sub_group_size"
+   ],
+   "mechanism": "pin the subgroup to a full (or half) 64-wide wave so subgroup reductions and broadcasts map to one wave",
+   "predicts": {
+    "compute_util": "up_or_flat"
+   },
+   "risks": [],
+   "states": [],
+   "op_classes": [
+    "reduction",
+    "attention"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.02,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:opencl",
+     "how": "__attribute__((qcom_reqd_sub_group_size(\"full\"))) with cl_qcom_reqd_sub_group_size, then sub_group_reduce_* / sub_group_broadcast."
+    }
+   ]
+  },
+  {
+   "id": "adreno_half_compute",
+   "level": "node",
+   "scope": "adreno",
+   "aliases": [
+    "half_precision_adreno"
+   ],
+   "mechanism": "Adreno ALUs run half at twice the float rate: elementwise and activation math in half / half4 where the tolerance allows",
+   "predicts": {
+    "compute_util": "down"
+   },
+   "risks": [
+    "fp32 problems: half intermediate rounding (~1e-3) can exceed the bound; accumulate reductions in float"
+   ],
+   "states": [],
+   "op_classes": [
+    "elementwise",
+    "conv",
+    "gemm"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.03,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:opencl",
+     "how": "#pragma OPENCL EXTENSION cl_khr_fp16 : enable; vload_half4 / convert_half4 for the math, float accumulators for sums."
+    }
+   ]
+  },
+  {
+   "id": "mad_fma_usage",
+   "level": "node",
+   "scope": "simt_gpu",
+   "aliases": [
+    "fma_contraction"
+   ],
+   "mechanism": "fused multiply-add instructions instead of separate multiply and add",
+   "predicts": {
+    "compute_util": "down_or_flat"
+   },
+   "risks": [],
+   "states": [],
+   "op_classes": [],
+   "slot": true,
+   "prior": {
+    "mean": 0.01,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:opencl",
+     "how": "mad() / fma() (or -cl-mad-enable) in inner products."
+    },
+    {
+     "scope": "target:cuda",
+     "how": "fmaf / __fmaf_rn in inner products (nvcc contracts by default unless --fmad=false)."
+    }
+   ]
+  },
+  {
+   "id": "adreno_half8_vector_io",
+   "level": "node",
+   "scope": "adreno",
+   "aliases": [
+    "half_vector_loads"
+   ],
+   "mechanism": "read / write fp16 data as half4 / half8 vectors straight through the half pointer (one 64 / 128-bit transaction per work-item), 8 elements per work-item",
+   "predicts": {
+    "bw_util": "up"
+   },
+   "risks": [
+    "alignment of vload8 is per element, but a scalar tail is needed for n % 8",
+    "fewer work-items: keep the grid large enough to fill the GPU"
+   ],
+   "states": [],
+   "op_classes": [
+    "elementwise",
+    "conv",
+    "gemm",
+    "reduction"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.08,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:opencl",
+     "how": "vload8(0, x + i) / vstore8(v, 0, y + i) on __global half * with #pragma OPENCL EXTENSION cl_khr_fp16 : enable (the runtime prepends it); not vload_half."
+    }
+   ]
+  },
+  {
+   "id": "fp32_accumulate_fp16_operands",
+   "level": "node",
+   "scope": "adreno",
+   "aliases": [
+    "hybrid_precision",
+    "fp16_data_fp32_acc"
+   ],
+   "mechanism": "keep the data and the multiplies in fp16 but accumulate dot products in float (QNN's HYBRID mode): exact products, no accumulation drift",
+   "predicts": {
+    "compute_util": "up_or_flat"
+   },
+   "risks": [
+    "convert_float8 on every weight vector costs ALU; hoist conversions out of inner loops"
+   ],
+   "states": [],
+   "op_classes": [
+    "conv",
+    "gemm",
+    "reduction"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.06,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:opencl",
+     "how": "acc = mad((float8)((float)x), convert_float8(vload8(0, w)), acc) per tap; one convert_half8 on store."
+    }
+   ]
+  },
+  {
+   "id": "fp16_accumulate_with_flush",
+   "level": "node",
+   "scope": "adreno",
+   "aliases": [
+    "fp16_accumulator",
+    "qnn_fp16_mode"
+   ],
+   "mechanism": "accumulate in half8 (2x ALU rate, no conversions) and flush the partial sums into float accumulators every 16-32 terms, bounding the fp16 summation error",
+   "predicts": {
+    "compute_util": "up_or_flat"
+   },
+   "risks": [
+    "the per-slot bound (about two fp16 ulps) can fail on long dot products: rel_err 1.5e-3 against 2e-3 on a 576-term conv (flush 16), 2.4e-3 over 9 terms in one session",
+    "measured equal or slower than fp32 accumulation in all four sessions plus the seed (71 vs 65 ms; 5.2 vs 2.9 ms); a half fma() is emulated and ~80x slower than an fp32 mad"
+   ],
+   "states": [],
+   "op_classes": [
+    "conv",
+    "gemm"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.02,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:opencl",
+     "how": "half8 h = mad((half8)(x), w8, h); every MB_ACC_FLUSH-th tap: acc += convert_float8(h); h = 0 (mb_opencl_kernels_f16_math.cpp, -DMB_ACC_HALF=1)."
+    }
+   ]
+  },
+  {
+   "id": "oc_ow_register_tile_half8",
+   "level": "node",
+   "scope": "adreno",
+   "aliases": [
+    "register_tile_conv_half"
+   ],
+   "mechanism": "one work-item computes 4 output pixels x 8 output channels in float8 accumulators with weights re-laid out [tap][OC] once per call and read as half8: input and weight loads are amortised over 32 mads",
+   "predicts": {
+    "compute_util": "up",
+    "reg_pressure": "up"
+   },
+   "risks": [
+    "registers lower the kernel's max work-group size (see MB_KINFO wg_max)",
+    "needs a weight re-layout kernel per call or a cached copy"
+   ],
+   "states": [],
+   "op_classes": [
+    "conv"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.1,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:opencl",
+     "how": "k_wpack: wt[(ic*KH*KW + kh*KW + kw)*OCp + oc] (OC padded to the tile); k_conv over (ow/4, oh, n*OCp/OT). A 3x3 conv went from 3.7 GFLOP/s (seed) / 5-32 (flow finals) to ~50-70 GFLOP/s this way (QNN: 330-900); OT = 4 was 1.8x faster at IC = 8, OT = 8 1.6x faster at IC = 64 (cc_runs REPORTs)."
+    }
+   ]
+  },
+  {
+   "id": "image2d_from_buffer_reads",
+   "level": "node",
+   "scope": "adreno",
+   "aliases": [
+    "image_from_buffer",
+    "texture_weight_reads"
+   ],
+   "mechanism": "pack weights / a staged input into a slot-owned buffer and read it through an image2d view (cl_khr_image2d_from_buffer): texture-path cache and cl_qcom_accelerated / vector image ops",
+   "predicts": {
+    "l1_hit": "up",
+    "bw_util": "up_or_flat"
+   },
+   "risks": [
+    "rows are padded to the device pitch alignment (mb_image.pitch_bytes)",
+    "an extra pack kernel per call"
+   ],
+   "states": [],
+   "op_classes": [
+    "conv",
+    "gemm"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.05,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:opencl",
+     "how": "mb_image im = MB_SCRATCH_IMAGE(cl_x, 0, w, h, CL_RGBA, CL_HALF_FLOAT); pack kernel writes im.buf as __global half *, the compute kernel takes im.img as image2d_t and calls read_imageh(img, smp, (int2)(x, y))."
+    }
+   ]
+  },
+  {
+   "id": "fast_math_build_options",
+   "level": "node",
+   "scope": "adreno",
+   "aliases": [
+    "cl_fast_relaxed_math"
+   ],
+   "mechanism": "relaxed math build options let the compiler reassociate, fuse and flush denormals",
+   "predicts": {
+    "compute_util": "up_or_flat"
+   },
+   "risks": [
+    "reassociates the compensated mb_kadd sums and breaks NaN / inf handling",
+    "may exceed the per-slot bound"
+   ],
+   "states": [],
+   "op_classes": [],
+   "slot": true,
+   "prior": {
+    "mean": 0.02,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:opencl",
+     "how": "MB_CL_OPTS(\"-cl-fast-relaxed-math\", src), or -cl-unsafe-math-optimizations / -cl-finite-math-only / -cl-denorms-are-zero one at a time."
+    }
+   ]
+  },
+  {
+   "id": "fuse_epilogue_into_conv",
+   "level": "node",
+   "scope": "adreno",
+   "aliases": [
+    "conv_bn_relu_add_fusion"
+   ],
+   "mechanism": "fold BatchNorm scale/shift, bias, ReLU and the residual add into the convolution's store epilogue (what QNN does): fewer launches and DRAM round trips",
+   "predicts": {
+    "bw_util": "up"
+   },
+   "risks": [
+    "only where the graph optimiser accepted a fusion hint for the chain",
+    "keep the unfused stages' semantics bit-compatible"
+   ],
+   "states": [],
+   "op_classes": [
+    "conv",
+    "elementwise"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.05,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:opencl",
+     "how": "apply scale[c] * acc + shift[c] and max(.,0) / += residual on the float accumulators before convert_half and vstore."
+    }
+   ]
+  }
+ ]
+}

@@ -1,0 +1,198 @@
+{
+ "_doc": "Curated technique seeds (knowledge_architecture.md section 5), one file per area. Fields: id, level + scope (a scope node or universal), aliases (v1 / technique-DB / footer names folded in), mechanism, preconditions (predicate DSL), predicts (canonical metric -> up|down|flat|up_or_flat|down_or_flat), risks (pitfalls), states / op_classes / op_kinds gates (empty = any), slot (offered by the multi-slot agent), prior {mean, n}: a seed prior with a low pseudo-count that evidence overrides, realizations by scope (target:<key> | target:<backend>:sm_NN+ | target:<backend> | node:<id> | universal). Loaded by Ontology.seed(); scripts/seed_knowledge.py builds a knowledge.db from these files.",
+ "techniques": [
+  {
+   "id": "flash_style_tiling",
+   "level": "universal",
+   "aliases": [
+    "online_softmax_tiling",
+    "flash_attention",
+    "fused_attention_block"
+   ],
+   "mechanism": "tile Q/K/V through fast memory with an online softmax so the score matrix never round-trips through DRAM; a composite seed (copies + bmm + softmax + bmm with a workspace) is replaced by one kernel that reads q/k/v in place through their strides and writes O in its consumer layout",
+   "predicts": {
+    "bw_util": "down",
+    "l1_hit": "up"
+   },
+   "risks": [
+    "online-softmax rescaling bugs",
+    "causal-mask edge tiles"
+   ],
+   "states": [],
+   "op_classes": [
+    "attention"
+   ],
+   "op_kinds": [
+    "sdpa",
+    "attention",
+    "attention_f16"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.15,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "node:simt_gpu",
+     "how": "Per (batch*head, Q tile): loop over K/V tiles in on-chip memory, S = Q K^T in registers, online softmax (m, l) update, O += P V; normalise once at the end."
+    },
+    {
+     "scope": "target:cuda:sm_80+",
+     "how": "As above with cp.async double-buffered K/V tiles and mma.sync for both products."
+    },
+    {
+     "scope": "target:cuda:sm_89",
+     "how": "FA2 on Ada: per CTA 64-128 query rows (4 warps, 16 rows each); Q tile in registers as mma A-fragments (ldmatrix), K/V tiles of 64 keys through cp.async double-buffered, swizzled smem; S = Q K^T with mma.sync.m16n8k16 (fp32 accum), row max / sum via 2 quad shuffles on the accumulator fragments, rescale O by exp(m_old - m_new), P converted to fp16 A-fragments in registers (no smem round trip), O += P V with ldmatrix.trans on V; causal: stop the key loop at the diagonal tile and mask only it; relu variant (act=1): no running max/sum, P = max(S,0); normalise once and store O through o_* strides."
+    }
+   ],
+   "preconditions": null
+  },
+  {
+   "id": "blocked_scan",
+   "level": "universal",
+   "aliases": [
+    "parallel_prefix_sum",
+    "segmented_scan"
+   ],
+   "mechanism": "prefix sums in blocks: an in-block scan (warp scans + a scan of warp totals), then block carries added in a second phase (or decoupled look-back)",
+   "predicts": {
+    "parallel_fill": "up",
+    "compute_util": "up_or_flat"
+   },
+   "risks": [
+    "fp32 cumulative sums reorder additions vs the reference; keep per-row sequential order when the tolerance is tight"
+   ],
+   "states": [],
+   "op_classes": [
+    "scan"
+   ],
+   "op_kinds": [
+    "cumsum",
+    "cumprod"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.1,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "target:cuda",
+     "how": "Rows are independent: one warp / block per row; within a row __shfl_up_sync warp scans, a shared array of warp totals, then add the carry; long rows: chunked with a running carry."
+    },
+    {
+     "scope": "target:opencl",
+     "how": "sub_group_scan_inclusive_add per subgroup, carries through __local."
+    },
+    {
+     "scope": "node:rvv",
+     "how": "Per row, vector chunks with an in-register log-step scan (vslideup + vfadd), carry the last element between chunks."
+    }
+   ]
+  },
+  {
+   "id": "rnn_input_projection_hoisting",
+   "level": "universal",
+   "aliases": [
+    "rnn_precompute_inputs"
+   ],
+   "mechanism": "the input projections of all timesteps do not depend on the recurrence: compute them as one big GEMM, keep only the hidden-state GEMM per step",
+   "predicts": {
+    "compute_util": "up",
+    "launch_frac": "down_or_flat"
+   },
+   "risks": [],
+   "states": [],
+   "op_classes": [
+    "gemm"
+   ],
+   "op_kinds": [
+    "lstm_seq",
+    "gru_seq"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.12,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "node:simt_gpu",
+     "how": "X W_ih^T for all T at once (a tiled GEMM), then the T sequential steps only do h W_hh^T + gates."
+    }
+   ]
+  },
+  {
+   "id": "persistent_rnn_cell",
+   "level": "universal",
+   "aliases": [
+    "fused_rnn_cell",
+    "fused_lstm_gates"
+   ],
+   "mechanism": "one persistent kernel runs all timesteps, with the gate math fused and the recurrent weights / hidden state kept on chip",
+   "predicts": {
+    "launch_frac": "down",
+    "bw_util": "down_or_flat"
+   },
+   "risks": [
+    "grid-wide sync between steps (cooperative launch or one block per sequence)",
+    "on-chip capacity for W_hh"
+   ],
+   "states": [],
+   "op_classes": [
+    "gemm"
+   ],
+   "op_kinds": [
+    "lstm_seq",
+    "gru_seq"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.1,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "node:simt_gpu",
+     "how": "Loop over timesteps inside one kernel; each block owns a slice of hidden units, computes its gate pre-activations, applies sigmoid / tanh and the cell update in registers, then synchronises before the next step."
+    }
+   ]
+  },
+  {
+   "id": "persistent_kernel",
+   "level": "node",
+   "scope": "simt_gpu",
+   "aliases": [
+    "persistent_threads",
+    "persistent_dynamic_tile_queue"
+   ],
+   "mechanism": "one resident block per SM loops over work tiles from a queue: no tail wave, no per-tile launch",
+   "predicts": {
+    "parallel_fill": "up_or_flat",
+    "launch_frac": "down_or_flat"
+   },
+   "risks": [
+    "load imbalance without a dynamic queue (atomic counter)"
+   ],
+   "states": [
+    "low_parallelism",
+    "latency_bound",
+    "launch_overhead",
+    "underutilized"
+   ],
+   "op_classes": [],
+   "slot": true,
+   "prior": {
+    "mean": 0.04,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "node:simt_gpu",
+     "how": "Launch (number of SMs x blocks per SM) blocks; each loops: tile = atomicAdd(counter) (or a static stride) until done."
+    }
+   ]
+  }
+ ]
+}

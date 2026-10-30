@@ -1,0 +1,295 @@
+{
+ "_doc": "Curated technique seeds (knowledge_architecture.md section 5), one file per area. Fields: id, level + scope (a scope node or universal), aliases (v1 / technique-DB / footer names folded in), mechanism, preconditions (predicate DSL), predicts (canonical metric -> up|down|flat|up_or_flat|down_or_flat), risks (pitfalls), states / op_classes / op_kinds gates (empty = any), slot (offered by the multi-slot agent), prior {mean, n}: a seed prior with a low pseudo-count that evidence overrides, realizations by scope (target:<key> | target:<backend>:sm_NN+ | target:<backend> | node:<id> | universal). Loaded by Ontology.seed(); scripts/seed_knowledge.py builds a knowledge.db from these files.",
+ "techniques": [
+  {
+   "id": "depthwise_conv_spatial_tiling",
+   "level": "universal",
+   "aliases": [
+    "depthwise_tiling"
+   ],
+   "mechanism": "depthwise convs have no cross-channel reuse: tile H x W per channel with a halo in on-chip memory and compute several outputs per thread",
+   "predicts": {
+    "bw_util": "up",
+    "l1_hit": "up_or_flat"
+   },
+   "risks": [
+    "implicit GEMM is the wrong lever here (K = KH*KW is tiny)"
+   ],
+   "states": [],
+   "op_classes": [
+    "conv"
+   ],
+   "op_kinds": [
+    "conv2d_dw"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.1,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "node:simt_gpu",
+     "how": "One block per (n, c, spatial tile): load the input tile + (KH-1, KW-1) halo once into on-chip memory, each thread computes a strip of outputs along W, filter taps in registers."
+    },
+    {
+     "scope": "node:vector_cpu",
+     "how": "Vectorise along W with the KHxKW taps unrolled as vfmacc.vf on shifted loads."
+    }
+   ]
+  },
+  {
+   "id": "transposed_conv_output_gather",
+   "level": "universal",
+   "aliases": [
+    "conv_transpose_gather",
+    "subpixel_conv"
+   ],
+   "mechanism": "compute a transposed conv as a gather over the input taps that hit each output, not as a scatter with atomics",
+   "predicts": {
+    "compute_util": "up_or_flat"
+   },
+   "risks": [
+    "stride / padding / output_padding off-by-one",
+    "zero taps when stride > 1 (skip them by parity)"
+   ],
+   "states": [],
+   "op_classes": [
+    "conv"
+   ],
+   "op_kinds": [
+    "conv_transpose2d",
+    "conv_transpose3d"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.1,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "node:simt_gpu",
+     "how": "One thread per output element: loop only over the kernel taps with (o + pad - k) % stride == 0 (split by output parity into stride^2 dense sub-convolutions); no atomics."
+    }
+   ]
+  },
+  {
+   "id": "conv3d_slab_tiling",
+   "level": "universal",
+   "aliases": [
+    "volumetric_tiling"
+   ],
+   "mechanism": "tile D x H x W output blocks and stage the input slab (+halo) once, then reuse it across output channels",
+   "preconditions": {
+    "arith_intensity": ">=",
+    "v": 2
+   },
+   "predicts": {
+    "bw_util": "down",
+    "l1_hit": "up"
+   },
+   "risks": [
+    "on-chip memory for a 3D halo grows fast; keep D-tiles shallow"
+   ],
+   "states": [],
+   "op_classes": [
+    "conv"
+   ],
+   "op_kinds": [
+    "conv3d",
+    "convnd",
+    "conv_transpose3d"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.1,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "node:simt_gpu",
+     "how": "Block over (oc tile, d tile, h tile, w tile): stage the input slab with its halo in on-chip memory, loop over IC; or implicit GEMM with K = IC*KD*KH*KW."
+    }
+   ]
+  },
+  {
+   "id": "winograd_small_filter",
+   "level": "universal",
+   "aliases": [
+    "winograd"
+   ],
+   "mechanism": "for 3x3 stride-1 convs, F(2x2,3x3) Winograd cuts multiplies 2.25x",
+   "preconditions": {
+    "op_class": "in",
+    "v": [
+     "conv"
+    ]
+   },
+   "predicts": {
+    "compute_util": "down"
+   },
+   "risks": [
+    "numerical error grows with tile size (F(4x4,3x3) often fails 1e-3)",
+    "only 3x3 stride 1"
+   ],
+   "states": [
+    "compute_bound",
+    "matrix_compute",
+    "balanced_bound"
+   ],
+   "op_classes": [
+    "conv"
+   ],
+   "op_kinds": [
+    "conv2d"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.02,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "node:simt_gpu",
+     "how": "Transform 4x4 input tiles and the 3x3 filters (G g G^T), batched elementwise products over channels, inverse transform to 2x2 outputs."
+    }
+   ]
+  },
+  {
+   "id": "grouped_conv_batched_gemm",
+   "level": "universal",
+   "aliases": [],
+   "mechanism": "a grouped conv is G independent small GEMMs: batch them in one launch with per-group tiles",
+   "predicts": {
+    "parallel_fill": "up_or_flat",
+    "compute_util": "up"
+   },
+   "risks": [],
+   "states": [],
+   "op_classes": [
+    "conv"
+   ],
+   "op_kinds": [
+    "conv2d_grouped"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.08,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "node:simt_gpu",
+     "how": "Grid over (group, M tile, N tile); each block runs an implicit-GEMM tile of its group (K = IC/G * KH * KW)."
+    }
+   ]
+  },
+  {
+   "id": "small_matrix_batched_gemm",
+   "level": "universal",
+   "aliases": [
+    "batched_gemm"
+   ],
+   "mechanism": "many small GEMMs (bmm, per-head attention matrices): one block per matrix (or several per block) instead of tiling a single matrix",
+   "predicts": {
+    "parallel_fill": "up",
+    "occupancy": "up"
+   },
+   "risks": [],
+   "states": [],
+   "op_classes": [
+    "gemm",
+    "attention"
+   ],
+   "op_kinds": [
+    "bmm",
+    "matmul"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.08,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "node:simt_gpu",
+     "how": "Grid over the batch (and tiles when matrices are large); for tiny matrices pack several per block and keep them entirely on chip."
+    }
+   ]
+  },
+  {
+   "id": "transposed_operand_layout",
+   "level": "universal",
+   "aliases": [
+    "operand_transpose_handling"
+   ],
+   "mechanism": "pick the loop order / tile load pattern for the operand that is transposed (matmul_ta / matmul_tb), so both operands load coalesced",
+   "predicts": {
+    "bw_util": "up",
+    "uncoalesced": "down"
+   },
+   "risks": [],
+   "states": [],
+   "op_classes": [
+    "gemm"
+   ],
+   "op_kinds": [
+    "matmul_ta",
+    "matmul_tb",
+    "linear"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.06,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "node:simt_gpu",
+     "how": "Load the transposed operand's tile with threads along its contiguous dimension and transpose while storing into on-chip memory (pad to avoid bank conflicts)."
+    }
+   ]
+  },
+  {
+   "id": "fold_transpose_into_load",
+   "level": "universal",
+   "aliases": [
+    "strided_operand_gemm",
+    "layout_folding",
+    "transpose_free_gemm"
+   ],
+   "mechanism": "read GEMM operands and write its result through their real strides (transposed / per-head views of a fused buffer) instead of materialising permute/split copies: each folded copy is a full read + write of an operand that disappears",
+   "predicts": {
+    "bw_util": "down_or_flat",
+    "launch_frac": "down"
+   },
+   "risks": [
+    "a column-major operand loaded row-wise is uncoalesced: switch the tile loader (ldmatrix.trans) instead",
+    "two batch levels: index b0*s0 + b1*s1, not a flat batch stride"
+   ],
+   "states": [],
+   "op_classes": [
+    "gemm"
+   ],
+   "op_kinds": [
+    "bmm_strided",
+    "bmm_strided_f16"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.15,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "node:simt_gpu",
+     "how": "Pick the tile loader per operand from the unit stride: a_sk==1 row-major A tile, a_sm==1 transposed load; same for B (b_sn / b_sk) and the C store (c_sn / c_sm). The composite seed's strided_copy calls and their workspace are then deleted. The hand seed (kernel_bmm_strided_f16: 64x64x32 tiles, mma.sync m16n8k16 + ldmatrix, 16-byte loads along the unit stride when aligned, scalar for tails) already does this; go further with multi-stage global->shared buffering, bigger / per-shape tiles and vectorized C stores."
+    },
+    {
+     "scope": "target:cuda:sm_80+",
+     "how": "cp.async 16-byte chunks along the unit-stride dimension into swizzled smem, ldmatrix (unit stride along K) or ldmatrix.trans (unit stride along M/N) into mma.sync.m16n8k16 fragments; epilogue through smem so C rows with c_sm != N are still stored as full 16-byte segments."
+    }
+   ]
+  }
+ ]
+}

@@ -1,0 +1,122 @@
+{
+ "_doc": "Curated technique seeds (knowledge_architecture.md section 5), one file per area. Fields: id, level + scope (a scope node or universal), aliases (v1 / technique-DB / footer names folded in), mechanism, preconditions (predicate DSL), predicts (canonical metric -> up|down|flat|up_or_flat|down_or_flat), risks (pitfalls), states / op_classes / op_kinds gates (empty = any), slot (offered by the multi-slot agent), prior {mean, n}: a seed prior with a low pseudo-count that evidence overrides, realizations by scope (target:<key> | target:<backend>:sm_NN+ | target:<backend> | node:<id> | universal). Loaded by Ontology.seed(); scripts/seed_knowledge.py builds a knowledge.db from these files.",
+ "techniques": [
+  {
+   "id": "scratchpad_tiling",
+   "level": "node",
+   "scope": "gemmini",
+   "aliases": [
+    "gemmini_tiling"
+   ],
+   "mechanism": "choose tile_I/J/K so A and B tiles fit the scratchpad and the C tile fits the accumulator, maximising reuse per DMA",
+   "predicts": {
+    "bw_util": "down",
+    "compute_util": "up"
+   },
+   "risks": [],
+   "states": [],
+   "op_classes": [
+    "gemm",
+    "conv"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.15,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "node:gemmini",
+     "how": "tiled_matmul_auto / tiled_matmul with explicit tile_I, tile_J, tile_K in multiples of DIM (16) such that (I*K + K*J) * DIM^2 bytes <= 256 KiB scratchpad and I*J*DIM^2*4 bytes <= 64 KiB accumulator."
+    }
+   ]
+  },
+  {
+   "id": "accumulator_resident_output",
+   "level": "node",
+   "scope": "gemmini",
+   "aliases": [
+    "gemmini_accumulate"
+   ],
+   "mechanism": "keep partial sums in the accumulator across the K loop and apply scale / bias / ReLU on mvout",
+   "predicts": {
+    "bw_util": "down"
+   },
+   "risks": [],
+   "states": [],
+   "op_classes": [
+    "gemm",
+    "conv"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.08,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "node:gemmini",
+     "how": "preload with accumulate=1 over k tiles; mvout from the accumulator with the activation and scale fields (no separate elementwise pass)."
+    }
+   ]
+  },
+  {
+   "id": "dataflow_selection",
+   "level": "node",
+   "scope": "gemmini",
+   "aliases": [
+    "weight_stationary",
+    "output_stationary"
+   ],
+   "mechanism": "weight-stationary vs output-stationary: pick the dataflow that keeps the larger reused operand in the array",
+   "predicts": {
+    "compute_util": "up"
+   },
+   "risks": [],
+   "states": [],
+   "op_classes": [
+    "gemm",
+    "conv"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.04,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "node:gemmini",
+     "how": "WS when the weight tile is reused across many input rows (large M), OS when K is long and outputs are few; dataflow argument of tiled_matmul."
+    }
+   ]
+  },
+  {
+   "id": "im2col_on_accelerator",
+   "level": "node",
+   "scope": "gemmini",
+   "aliases": [
+    "gemmini_conv"
+   ],
+   "mechanism": "let the convolution engine generate im2col rows from the scratchpad instead of materialising them in DRAM",
+   "predicts": {
+    "bw_util": "down"
+   },
+   "risks": [],
+   "states": [],
+   "op_classes": [
+    "conv"
+   ],
+   "slot": true,
+   "prior": {
+    "mean": 0.1,
+    "n": 1.0
+   },
+   "realizations": [
+    {
+     "scope": "node:gemmini",
+     "how": "tiled_conv_auto (hardware im2col) with input in NHWC; fall back to tiled_matmul on a host-side im2col only for unsupported strides."
+    }
+   ]
+  }
+ ]
+}

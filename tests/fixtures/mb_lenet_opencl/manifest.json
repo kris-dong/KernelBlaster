@@ -1,0 +1,669 @@
+{
+ "format": "mb-kb-problem/1",
+ "name": "lenet__conv1__fc3",
+ "source_ir": "/path/to/BlasterMerge/gpu_eval/ir/lenet",
+ "ir_name": "lenet",
+ "partition": {
+  "strategy": "custom",
+  "op_names": [
+   "conv1",
+   "relu",
+   "pool1",
+   "conv2",
+   "relu_1",
+   "pool2",
+   "flatten",
+   "fc1",
+   "relu_2",
+   "fc2",
+   "relu_3",
+   "fc3"
+  ],
+  "op_indices": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5,
+   6,
+   7,
+   8,
+   9,
+   10,
+   11
+  ],
+  "is_whole_graph": true
+ },
+ "target": "opencl",
+ "dtype": "fp32",
+ "tolerance": {
+  "output_rel": 0.001,
+  "output_abs": 1e-05,
+  "slot_rel": 0.001,
+  "slot_abs": 0.0
+ },
+ "assembly": {
+  "head": "walker_head.cpp",
+  "tail": "walker_tail.cpp",
+  "namespace_prefix": "mbslot_",
+  "order": [
+   "conv2d",
+   "relu",
+   "maxpool2d",
+   "linear"
+  ]
+ },
+ "driver": "driver.cpp",
+ "data": "data.bin",
+ "data_sha1": "37917cd61c8b78b3a8e8a638e31ccf7d58d02b18",
+ "slots": [
+  {
+   "id": "conv2d",
+   "op": "conv2d",
+   "ops": [
+    "conv2d"
+   ],
+   "op_class": "conv",
+   "entry": "kernel_conv2d",
+   "signature": "void kernel_conv2d(const float *input, const float *weight, const float *bias, float *output, int N, int IC, int IH, int IW, int OC, int KH, int KW, int SH, int SW, int PH, int PW, int DH, int DW)",
+   "file": "slots/conv2d.cpp",
+   "reference_file": "slots/conv2d.ref.c",
+   "semantics": "2D convolution matching torch.nn.Conv2d semantics with groups=1 and dilation (DH, DW).\nLayout (row-major, NCHW for activations / OIHW for weights):\n  input:  [N, IC, IH, IW]\n  weight: [OC, IC, KH, KW]\n  bias:   [OC] (may be NULL \u2014 treat as zeros)\n  output: [N, OC, OH, OW]  with\n    OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1\n    OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1\nDefinition (zero-padding implied by PH, PW):\n  output[n, oc, oh, ow] = bias[oc] + sum over ic, kh, kw of\n    input[n, ic, oh*SH - PH + kh*DH, ow*SW - PW + kw*DW]\n    * weight[oc, ic, kh, kw]\n  with input reads outside [0, IH) x [0, IW) treated as 0.\nAll tensors are float32.",
+   "seed_source": "hand",
+   "instances": [
+    {
+     "op_name": "conv1",
+     "op": "conv2d",
+     "index": 0,
+     "shape": {
+      "N": 1,
+      "IC": 1,
+      "IH": 28,
+      "IW": 28,
+      "OC": 6,
+      "OH": 24,
+      "OW": 24,
+      "KH": 5,
+      "KW": 5,
+      "SH": 1,
+      "SW": 1,
+      "PH": 0,
+      "PW": 0,
+      "DH": 1,
+      "DW": 1
+     }
+    },
+    {
+     "op_name": "conv2",
+     "op": "conv2d",
+     "index": 3,
+     "shape": {
+      "N": 1,
+      "IC": 6,
+      "IH": 12,
+      "IW": 12,
+      "OC": 16,
+      "OH": 8,
+      "OW": 8,
+      "KH": 5,
+      "KW": 5,
+      "SH": 1,
+      "SW": 1,
+      "PH": 0,
+      "PW": 0,
+      "DH": 1,
+      "DW": 1
+     }
+    }
+   ]
+  },
+  {
+   "id": "relu",
+   "op": "relu",
+   "ops": [
+    "relu"
+   ],
+   "op_class": "elementwise",
+   "entry": "kernel_relu",
+   "signature": "void kernel_relu(const float *input, float *output, int n)",
+   "file": "slots/relu.cpp",
+   "reference_file": "slots/relu.ref.c",
+   "semantics": "Elementwise ReLU on a contiguous float32 buffer:\n  output[i] = max(0.0f, input[i])  for i in [0, n)\nIt must be safe for `input` and `output` to alias.",
+   "seed_source": "template",
+   "instances": [
+    {
+     "op_name": "relu",
+     "op": "relu",
+     "index": 1,
+     "shape": {
+      "n": 3456
+     }
+    },
+    {
+     "op_name": "relu_1",
+     "op": "relu",
+     "index": 4,
+     "shape": {
+      "n": 1024
+     }
+    },
+    {
+     "op_name": "relu_2",
+     "op": "relu",
+     "index": 7,
+     "shape": {
+      "n": 120
+     }
+    },
+    {
+     "op_name": "relu_3",
+     "op": "relu",
+     "index": 9,
+     "shape": {
+      "n": 84
+     }
+    }
+   ]
+  },
+  {
+   "id": "maxpool2d",
+   "op": "maxpool2d",
+   "ops": [
+    "maxpool2d"
+   ],
+   "op_class": "reduction",
+   "entry": "kernel_maxpool2d",
+   "signature": "void kernel_maxpool2d(const float *input, float *output, int N, int C, int IH, int IW, int KH, int KW, int SH, int SW, int PH, int PW, int DH, int DW)",
+   "file": "slots/maxpool2d.cpp",
+   "reference_file": "slots/maxpool2d.ref.c",
+   "semantics": "2D max pooling matching torch.nn.MaxPool2d semantics with padding\nand dilation.\nLayout (NCHW, row-major):\n  input:  [N, C, IH, IW]\n  output: [N, C, OH, OW]  with\n    OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1\n    OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1\n  output[n, c, oh, ow] = max over kh in [0,KH), kw in [0,KW) of\n    val(n, c, oh*SH - PH + kh*DH, ow*SW - PW + kw*DW)\n  where val(...) returns input[n, c, ih, iw] when 0<=ih<IH and\n  0<=iw<IW, else -INF (out-of-bounds lanes never win the max).\nAll tensors are float32. PH/PW are zero-padding amounts on the\nspatial dims; DH/DW are kernel-element strides (dilation).",
+   "seed_source": "hand",
+   "instances": [
+    {
+     "op_name": "pool1",
+     "op": "maxpool2d",
+     "index": 2,
+     "shape": {
+      "N": 1,
+      "C": 6,
+      "IH": 24,
+      "IW": 24,
+      "OH": 12,
+      "OW": 12,
+      "KH": 2,
+      "KW": 2,
+      "SH": 2,
+      "SW": 2,
+      "PH": 0,
+      "PW": 0,
+      "DH": 1,
+      "DW": 1
+     }
+    },
+    {
+     "op_name": "pool2",
+     "op": "maxpool2d",
+     "index": 5,
+     "shape": {
+      "N": 1,
+      "C": 16,
+      "IH": 8,
+      "IW": 8,
+      "OH": 4,
+      "OW": 4,
+      "KH": 2,
+      "KW": 2,
+      "SH": 2,
+      "SW": 2,
+      "PH": 0,
+      "PW": 0,
+      "DH": 1,
+      "DW": 1
+     }
+    }
+   ]
+  },
+  {
+   "id": "linear",
+   "op": "linear",
+   "ops": [
+    "linear"
+   ],
+   "op_class": "gemm",
+   "entry": "kernel_linear",
+   "signature": "void kernel_linear(const float *input, const float *weight, const float *bias, float *output, int M, int K, int N)",
+   "file": "slots/linear.cpp",
+   "reference_file": "slots/linear.ref.c",
+   "semantics": "Computes a fully-connected (matmul + bias) layer matching PyTorch nn.Linear semantics:\n  output[m, n] = bias[n] + sum_{k=0..K-1} input[m, k] * weight[n, k]\nShapes (row-major contiguous):\n  input:  [M, K]\n  weight: [N, K]   (note: out_features outer, in_features inner \u2014 PyTorch's storage order)\n  bias:   [N]      (may be NULL \u2014 treat as zeros)\n  output: [M, N]\nAll tensors are float32.",
+   "seed_source": "hand",
+   "instances": [
+    {
+     "op_name": "fc1",
+     "op": "linear",
+     "index": 6,
+     "shape": {
+      "M": 1,
+      "K": 256,
+      "N": 120
+     }
+    },
+    {
+     "op_name": "fc2",
+     "op": "linear",
+     "index": 8,
+     "shape": {
+      "M": 1,
+      "K": 120,
+      "N": 84
+     }
+    },
+    {
+     "op_name": "fc3",
+     "op": "linear",
+     "index": 10,
+     "shape": {
+      "M": 1,
+      "K": 84,
+      "N": 10
+     }
+    }
+   ]
+  }
+ ],
+ "ops": [
+  {
+   "index": 0,
+   "name": "conv1",
+   "op": "conv2d",
+   "slot": "conv2d",
+   "inputs": [
+    0
+   ],
+   "outputs": [
+    1
+   ]
+  },
+  {
+   "index": 1,
+   "name": "relu",
+   "op": "relu",
+   "slot": "relu",
+   "inputs": [
+    1
+   ],
+   "outputs": [
+    2
+   ]
+  },
+  {
+   "index": 2,
+   "name": "pool1",
+   "op": "maxpool2d",
+   "slot": "maxpool2d",
+   "inputs": [
+    2
+   ],
+   "outputs": [
+    3
+   ]
+  },
+  {
+   "index": 3,
+   "name": "conv2",
+   "op": "conv2d",
+   "slot": "conv2d",
+   "inputs": [
+    3
+   ],
+   "outputs": [
+    4
+   ]
+  },
+  {
+   "index": 4,
+   "name": "relu_1",
+   "op": "relu",
+   "slot": "relu",
+   "inputs": [
+    4
+   ],
+   "outputs": [
+    5
+   ]
+  },
+  {
+   "index": 5,
+   "name": "pool2",
+   "op": "maxpool2d",
+   "slot": "maxpool2d",
+   "inputs": [
+    5
+   ],
+   "outputs": [
+    6
+   ]
+  },
+  {
+   "index": 6,
+   "name": "fc1",
+   "op": "linear",
+   "slot": "linear",
+   "inputs": [
+    12
+   ],
+   "outputs": [
+    7
+   ]
+  },
+  {
+   "index": 7,
+   "name": "relu_2",
+   "op": "relu",
+   "slot": "relu",
+   "inputs": [
+    7
+   ],
+   "outputs": [
+    8
+   ]
+  },
+  {
+   "index": 8,
+   "name": "fc2",
+   "op": "linear",
+   "slot": "linear",
+   "inputs": [
+    8
+   ],
+   "outputs": [
+    9
+   ]
+  },
+  {
+   "index": 9,
+   "name": "relu_3",
+   "op": "relu",
+   "slot": "relu",
+   "inputs": [
+    9
+   ],
+   "outputs": [
+    10
+   ]
+  },
+  {
+   "index": 10,
+   "name": "fc3",
+   "op": "linear",
+   "slot": "linear",
+   "inputs": [
+    10
+   ],
+   "outputs": [
+    11
+   ]
+  }
+ ],
+ "buffers": [
+  {
+   "name": "x",
+   "kind": "input",
+   "dtype": "f32",
+   "numel": 784,
+   "alias": null,
+   "ref": [
+    0,
+    3136
+   ]
+  },
+  {
+   "name": "conv1",
+   "kind": "intermediate",
+   "dtype": "f32",
+   "numel": 3456,
+   "alias": null,
+   "ref": [
+    3328,
+    13824
+   ]
+  },
+  {
+   "name": "relu",
+   "kind": "intermediate",
+   "dtype": "f32",
+   "numel": 3456,
+   "alias": null,
+   "ref": [
+    17152,
+    13824
+   ]
+  },
+  {
+   "name": "pool1",
+   "kind": "intermediate",
+   "dtype": "f32",
+   "numel": 864,
+   "alias": null,
+   "ref": [
+    30976,
+    3456
+   ]
+  },
+  {
+   "name": "conv2",
+   "kind": "intermediate",
+   "dtype": "f32",
+   "numel": 1024,
+   "alias": null,
+   "ref": [
+    34560,
+    4096
+   ]
+  },
+  {
+   "name": "relu_1",
+   "kind": "intermediate",
+   "dtype": "f32",
+   "numel": 1024,
+   "alias": null,
+   "ref": [
+    38656,
+    4096
+   ]
+  },
+  {
+   "name": "pool2",
+   "kind": "intermediate",
+   "dtype": "f32",
+   "numel": 256,
+   "alias": null,
+   "ref": [
+    42752,
+    1024
+   ]
+  },
+  {
+   "name": "fc1",
+   "kind": "intermediate",
+   "dtype": "f32",
+   "numel": 120,
+   "alias": null,
+   "ref": [
+    43776,
+    480
+   ]
+  },
+  {
+   "name": "relu_2",
+   "kind": "intermediate",
+   "dtype": "f32",
+   "numel": 120,
+   "alias": null,
+   "ref": [
+    44288,
+    480
+   ]
+  },
+  {
+   "name": "fc2",
+   "kind": "intermediate",
+   "dtype": "f32",
+   "numel": 84,
+   "alias": null,
+   "ref": [
+    44800,
+    336
+   ]
+  },
+  {
+   "name": "relu_3",
+   "kind": "intermediate",
+   "dtype": "f32",
+   "numel": 84,
+   "alias": null,
+   "ref": [
+    45312,
+    336
+   ]
+  },
+  {
+   "name": "fc3",
+   "kind": "output",
+   "dtype": "f32",
+   "numel": 10,
+   "alias": null,
+   "ref": [
+    45824,
+    40
+   ]
+  },
+  {
+   "name": "flatten",
+   "kind": "intermediate",
+   "dtype": "f32",
+   "numel": 256,
+   "alias": {
+    "base": 6,
+    "offset": 0
+   },
+   "ref": null
+  },
+  {
+   "name": "w:conv1.weight",
+   "kind": "weight",
+   "dtype": "f32",
+   "numel": 150,
+   "alias": null,
+   "ref": [
+    46080,
+    600
+   ]
+  },
+  {
+   "name": "w:conv1.bias",
+   "kind": "weight",
+   "dtype": "f32",
+   "numel": 6,
+   "alias": null,
+   "ref": [
+    46848,
+    24
+   ]
+  },
+  {
+   "name": "w:conv2.weight",
+   "kind": "weight",
+   "dtype": "f32",
+   "numel": 2400,
+   "alias": null,
+   "ref": [
+    47104,
+    9600
+   ]
+  },
+  {
+   "name": "w:conv2.bias",
+   "kind": "weight",
+   "dtype": "f32",
+   "numel": 16,
+   "alias": null,
+   "ref": [
+    56832,
+    64
+   ]
+  },
+  {
+   "name": "w:fc1.weight",
+   "kind": "weight",
+   "dtype": "f32",
+   "numel": 30720,
+   "alias": null,
+   "ref": [
+    57088,
+    122880
+   ]
+  },
+  {
+   "name": "w:fc1.bias",
+   "kind": "weight",
+   "dtype": "f32",
+   "numel": 120,
+   "alias": null,
+   "ref": [
+    179968,
+    480
+   ]
+  },
+  {
+   "name": "w:fc2.weight",
+   "kind": "weight",
+   "dtype": "f32",
+   "numel": 10080,
+   "alias": null,
+   "ref": [
+    180480,
+    40320
+   ]
+  },
+  {
+   "name": "w:fc2.bias",
+   "kind": "weight",
+   "dtype": "f32",
+   "numel": 84,
+   "alias": null,
+   "ref": [
+    220928,
+    336
+   ]
+  },
+  {
+   "name": "w:fc3.weight",
+   "kind": "weight",
+   "dtype": "f32",
+   "numel": 840,
+   "alias": null,
+   "ref": [
+    221440,
+    3360
+   ]
+  },
+  {
+   "name": "w:fc3.bias",
+   "kind": "weight",
+   "dtype": "f32",
+   "numel": 10,
+   "alias": null,
+   "ref": [
+    225024,
+    40
+   ]
+  }
+ ],
+ "inputs": [
+  0
+ ],
+ "outputs": [
+  11
+ ]
+}

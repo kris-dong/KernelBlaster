@@ -1,0 +1,66 @@
+FROM ubuntu:22.04
+
+WORKDIR /kernelblaster
+
+# Prevent interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install system dependencies for OpenCL development
+RUN apt-get update && apt-get -y install \
+    sudo \
+    wget \
+    curl \
+    unzip \
+    cmake \
+    build-essential \
+    python3 \
+    python3-pip \
+    python3-dev \
+    # OpenCL ICD loader
+    ocl-icd-opencl-dev \
+    ocl-icd-libopencl1 \
+    clinfo \
+    && rm -rf /var/lib/apt/lists/*
+
+# Make python3 the default python
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3 1
+
+# Install Qualcomm Adreno GPU SDK
+ENV QUALCOMM_SDK_ROOT=/opt/qualcomm/adreno-gpu-sdk
+RUN mkdir -p /opt/qualcomm
+COPY docker_qualcomm/sdk/Adreno_OpenCL_SDK*.zip /tmp/adreno-sdk.zip
+RUN unzip -q /tmp/adreno-sdk.zip -d /opt/qualcomm/adreno-gpu-sdk && \
+    rm /tmp/adreno-sdk.zip
+
+# Install Adreno OpenCL headers system-wide
+RUN cp -r ${QUALCOMM_SDK_ROOT}/opencl-sdk/inc/CL /usr/include/CL
+
+# Set up OpenCL environment
+ENV ADRENO_SDK_ROOT=${QUALCOMM_SDK_ROOT}
+ENV OPENCL_INCLUDE_DIR=/usr/include/CL
+ENV LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:${LD_LIBRARY_PATH}
+
+# Copy requirements and install Python dependencies
+COPY docker_qualcomm/requirements.txt /tmp/requirements.txt
+RUN python -m pip install --no-cache-dir -U pip setuptools wheel && \
+    python -m pip install --no-cache-dir -r /tmp/requirements.txt && \
+    python -m pip install --no-cache-dir 'anthropic[bedrock]>=0.40.0' && \
+    python -m pip install --no-cache-dir pyopencl
+
+# Create user after all system installations
+RUN useradd -G sudo kernelblaster
+
+# Copy the entire source code (filtered by .dockerignore)
+COPY . /kernelblaster/
+
+# Create output directory
+RUN mkdir -p /tmp/kernelblaster
+
+# Switch to non-root user only at the end
+USER kernelblaster
+
+# Expose the compilation server port
+EXPOSE 2002
+
+# Run the GPU server (compilation service for Adreno OpenCL kernels)
+CMD ["python", "-m", "src.kernelblaster.servers.gpu", "--host", "0.0.0.0", "--port", "2002", "--target", "adreno"]
