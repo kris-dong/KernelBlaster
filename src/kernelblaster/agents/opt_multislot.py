@@ -511,6 +511,10 @@ class TargetProfile:
                 sd = {s.dtype: s.tolerance for s in problem.slots.values()}
                 return system_prompt("mixed", problem.tolerance, arch, slot_dtypes=sd)
             return system_prompt(problem.dtype, problem.tolerance, arch)
+        if self.name == "opencl":                     # dtype rule + tolerance + hardware block (multislot_opencl.opencl_system_prompt)
+            from .multislot_opencl import opencl_system_prompt
+            return opencl_system_prompt(problem.dtype if problem.dtype in ("fp16", "fp32") else "fp32",
+                                        problem.tolerance, arch)
         return self.system_prompt
 
     def arch_label(self, arch: str) -> str:
