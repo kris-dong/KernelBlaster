@@ -1,0 +1,7 @@
+#!/bin/bash
+# the L2 sweep (needs ops/tunnel.sh running in another shell): optimized path + cascade fallbacks, board runs under the board lock
+cd "$(dirname "$0")/.."
+. "${TVM_VENV:-/Users/krisd/Documents/ModelBlaster-clone/l3_farm/qrb_a6/tvm_baseline/venv}/bin/activate"
+export TVM_XCC=$PWD/ops/xcc_zig.sh
+export TVM_OUT_DIR=${TVM_OUT_DIR:-/Users/krisd/Documents/ModelBlaster-clone/l3_farm/qrb_a6/tvm_baseline}
+exec python run_tvm_opencl_baseline_l2.py "$@"
